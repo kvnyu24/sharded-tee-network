@@ -6,4 +6,5 @@ edition = "2021"
 [lib]
 name = "teeshard_protocol"
 
-[dependencies] 
+[dependencies]
+rand = "0.8" 
