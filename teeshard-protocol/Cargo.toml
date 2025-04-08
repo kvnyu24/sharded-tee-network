@@ -1,0 +1,9 @@
+[package]
+name = "teeshard-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "teeshard_protocol"
+
+[dependencies] 

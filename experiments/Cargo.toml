@@ -1,0 +1,11 @@
+[package]
+name = "experiments"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "experiments"
+path = "src/main.rs"
+
+[dependencies]
+teeshard-protocol = { path = "../teeshard-protocol" } 
