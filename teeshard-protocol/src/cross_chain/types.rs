@@ -3,6 +3,8 @@
 use crate::data_structures::LockInfo;
 // Import the actual Signature type
 use crate::tee_logic::types::Signature;
+// Import TEEIdentity
+use crate::data_structures::TEEIdentity;
 
 // Represents a proof from a shard that a resource has been locked
 #[derive(Clone, Debug, PartialEq, Eq)] // Signature derives these
@@ -10,6 +12,8 @@ pub struct LockProof {
     pub tx_id: String,       // The global transaction ID
     pub shard_id: usize,     // ID of the shard providing the proof
     pub lock_info: LockInfo, // Details of the lock (account, asset, amount)
+    // Need to include the identity of the TEE that signed this proof
+    pub signer_identity: TEEIdentity,
     // Signature or attestation from the shard's TEE consensus group
     // proving the lock is valid according to their replicated state.
     // pub attestation_or_sig: Vec<u8>, // Placeholder - could be a Signature struct or complex attestation
@@ -38,9 +42,12 @@ pub enum SwapOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_structures::{AccountId, AssetId};
-    use ed25519_dalek::{Signer, SigningKey};
+    use crate::data_structures::{AccountId, AssetId, LockInfo, TEEIdentity};
+    use ed25519_dalek::Signer;
+    use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    // Import key generation for dummy TEE
+    use crate::tee_logic::crypto_sim::generate_keypair;
     // Import the actual Signature type for tests
     use crate::tee_logic::types::Signature;
 
@@ -63,11 +70,18 @@ mod tests {
         let lock_info = create_test_lock_info();
         // Create a dummy signature for the test
         let dummy_sig = create_dummy_sig(b"test_data_for_sig");
+        // Create a dummy TEE identity for the signer field
+        let dummy_keypair = generate_keypair();
+        let dummy_tee = TEEIdentity {
+            id: 99, // Dummy ID
+            public_key: dummy_keypair.verifying_key(),
+        };
+
         let proof = LockProof {
             tx_id: "swap001".to_string(),
             shard_id: 2,
             lock_info: lock_info.clone(),
-            // attestation_or_sig: vec![2, 100], // Dummy data
+            signer_identity: dummy_tee.clone(), // Add the signer identity
             attestation_or_sig: dummy_sig,
         };
 

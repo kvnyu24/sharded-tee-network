@@ -4,8 +4,7 @@ use crate::data_structures::TEEIdentity;
 use crate::liveness::types::{AttestationResponse, VerificationStatus, Nonce};
 use std::collections::HashMap;
 // Import crypto sim and types
-use crate::tee_logic::crypto_sim::{verify, PublicKey, SecretKey, generate_keypair};
-use crate::tee_logic::types::Signature;
+use crate::tee_logic::crypto_sim::verify;
 
 // Represents a TEE node acting as an aggregator
 pub struct Aggregator {
@@ -107,42 +106,46 @@ mod tests {
 
     #[test]
     fn verify_attestations_placeholder() {
-        let aggregator_id = create_test_tee(50);
         let (aggregator_id_tee, _) = create_test_tee(50);
         let mut aggregator = Aggregator::new(aggregator_id_tee);
 
-        let (tee1_id, _) = create_test_tee(1);
-        let sim1 = EnclaveSim::new(tee1_id.id);
+        // Destructure the tuple from create_test_tee
+        let (tee1_id, tee1_key) = create_test_tee(1);
+        // Create EnclaveSim using the specific keypair for tee1
+        let sim1 = EnclaveSim::new(tee1_id.id, Some(tee1_key));
         let nonce1: Nonce = 111;
         let report1 = sim1.generate_remote_attestation(&nonce1.to_ne_bytes());
         let resp1 = AttestationResponse {
-            responding_tee: tee1_id.clone(),
+            responding_tee: tee1_id.clone(), // Use the ID with the correct public key
             nonce: nonce1,
             report: report1,
         };
 
-        let tee2 = create_test_tee(2);
-        let (tee2_id, _) = create_test_tee(2);
-        let sim2 = EnclaveSim::new(tee2_id.id);
+         // Destructure the tuple from create_test_tee
+        let (tee2_id, tee2_key) = create_test_tee(2);
+         // Create EnclaveSim using the specific keypair for tee2
+        let sim2 = EnclaveSim::new(tee2_id.id, Some(tee2_key));
         let nonce2: Nonce = 222;
         let report2 = sim2.generate_remote_attestation(&nonce2.to_ne_bytes());
         let resp2_bad_nonce = AttestationResponse {
-            responding_tee: tee2_id.clone(),
-            nonce: 999,
+            responding_tee: tee2_id.clone(), // Use the ID with the correct public key
+            nonce: 999, // Incorrect nonce
             report: report2.clone(),
         };
 
-        let tee3 = create_test_tee(3);
+        // Destructure the tuple from create_test_tee
         let (tee3_id, _) = create_test_tee(3);
         let nonce3: Nonce = 333;
+         // Create a signature that won't verify for the report data
          let dummy_key = generate_keypair();
          let bad_sig = crate::tee_logic::crypto_sim::sign(b"wrong data", &dummy_key);
          let resp3_bad_sig = AttestationResponse {
-            responding_tee: tee3_id.clone(),
+            responding_tee: tee3_id.clone(), // Use the ID with the correct public key
             nonce: nonce3,
-            report: AttestationReport { report_data: vec![1], signature: bad_sig },
+            report: AttestationReport { report_data: vec![1], signature: bad_sig }, // Bad signature
         };
 
+        // Aggregator expects these nonces, associated with the correct TEEIdentities
         aggregator.expect_nonce(tee1_id.clone(), nonce1);
         aggregator.expect_nonce(tee2_id.clone(), nonce2);
          aggregator.expect_nonce(tee3_id.clone(), nonce3);
@@ -150,6 +153,7 @@ mod tests {
         let results = aggregator.verify_attestations(&[resp1, resp2_bad_nonce, resp3_bad_sig]);
 
         assert_eq!(results.len(), 3);
+        // Now the first result should be Valid
         assert_eq!(results[0], (tee1_id, VerificationStatus::Valid));
         assert_eq!(results[1], (tee2_id, VerificationStatus::InvalidNonce));
         assert_eq!(results[2], (tee3_id, VerificationStatus::InvalidSignature));

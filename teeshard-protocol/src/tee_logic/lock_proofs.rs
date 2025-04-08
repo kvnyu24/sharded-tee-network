@@ -10,7 +10,7 @@ pub fn generate_lock_proof(
     tx_id: &str,
     shard_id: usize,
     lock_info: &LockInfo,
-    signing_tee: &TEEIdentity, // The TEE generating this proof
+    signing_tee: &TEEIdentity, // Use the signing_tee identity
     // Need the actual signing key for the TEE
     signing_key: &ed25519_dalek::SigningKey,
 ) -> LockProof {
@@ -41,6 +41,7 @@ pub fn generate_lock_proof(
         tx_id: tx_id.to_string(),
         shard_id,
         lock_info: lock_info.clone(),
+        signer_identity: signing_tee.clone(), // Store the signer's identity
         // Dummy signature or attestation data
         attestation_or_sig: signature,
     }

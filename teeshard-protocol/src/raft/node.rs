@@ -591,9 +591,13 @@ mod tests {
 
     // Helper function to create a TEEIdentity
     fn create_identity(id: u64) -> TEEIdentity {
-        // Create TEEIdentity with usize ID and a real public key
-        let keypair = generate_keypair(); // Generate Ed25519 key
-        TEEIdentity { id: id as usize, public_key: keypair.verifying_key() }
+        let keypair = generate_keypair();
+        // Use the helper that generates a key internally, or pass None explicitly
+        let enclave = EnclaveSim::new_with_generated_key(id as usize);
+        TEEIdentity {
+            id: id as usize,
+            public_key: enclave.identity.public_key.clone(),
+        }
     }
 
     // Helper function to deliver messages between nodes
@@ -668,7 +672,7 @@ mod tests {
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
             // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(id.id);
+            let enclave = EnclaveSim::new(id.id, None);
             // Pass the enclave to the RaftNode constructor
             let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
@@ -805,7 +809,7 @@ mod tests {
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
             // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(id.id);
+            let enclave = EnclaveSim::new(id.id, None);
             // Pass the enclave to the RaftNode constructor
             let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));

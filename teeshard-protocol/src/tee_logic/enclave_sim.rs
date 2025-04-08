@@ -16,12 +16,17 @@ pub struct EnclaveSim {
 }
 
 impl EnclaveSim {
-    pub fn new(id: usize) -> Self {
-        // Generate a real keypair for this enclave
-        let keypair = generate_keypair();
+    pub fn new(id: usize, existing_keypair: Option<SecretKey>) -> Self {
+        // Generate a real keypair for this enclave if not provided
+        let keypair = existing_keypair.unwrap_or_else(generate_keypair);
         let public_key = keypair.verifying_key();
         let identity = TEEIdentity { id, public_key };
         EnclaveSim { identity, keypair }
+    }
+
+    // Helper for tests or scenarios where only ID is known
+    pub fn new_with_generated_key(id: usize) -> Self {
+        Self::new(id, None)
     }
 
     // Simulate generating a remote attestation report containing the nonce
@@ -65,7 +70,8 @@ mod tests {
 
     // Helper to create EnclaveSim for testing
     fn create_test_enclave(id: usize) -> EnclaveSim {
-        EnclaveSim::new(id)
+        // Use the helper that generates a key
+        EnclaveSim::new_with_generated_key(id)
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // Placeholder for Raft persistent storage logic
 
-use crate::raft::state::{LogEntry};
+use crate::raft::state::LogEntry;
 use crate::data_structures::TEEIdentity;
  // Import key generation
 

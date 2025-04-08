@@ -61,16 +61,15 @@ impl CrossChainCoordinator {
         let swap = self.active_swaps.get_mut(&tx_id)
             .ok_or_else(|| AbortReason::Other("Swap not found".to_string()))?;
 
-        // 1. Verify the proof (placeholder)
-        // We need the public key of the TEE that supposedly generated the proof.
-        // This info isn't currently stored in LockProof or passed here.
-        // For now, assuming we can get the signer ID from the proof somehow (needs refactor)
-        // Or, pass the expected signer TEEIdentity into handle_lock_proof.
-        // Let's assume handle_lock_proof receives the sender identity.
         // TODO: Refactor LockProof or handle_lock_proof to include signer identity for verification.
         // Placeholder: Using coordinator's own key for verification temporarily.
-        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof, &self.identity.public_key) { // Placeholder pubkey
-            println!("Coordinator ({}): Lock proof verification failed for swap {} (Placeholder verification used)", self.identity.id, tx_id);
+        // Re-enable verification check using a placeholder key (e.g., coordinator's key)
+        // Verify using the public key from the signer_identity field in the proof
+        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof, &proof.signer_identity.public_key) {
+            println!(
+                "Coordinator ({}): Lock proof verification failed for swap {} from signer {}",
+                self.identity.id, tx_id, proof.signer_identity.id
+            );
             // TODO: Trigger GlobalAbort
             return Err(AbortReason::LockProofVerificationFailed);
         }
@@ -111,7 +110,7 @@ impl CrossChainCoordinator {
              // TODO: Coordinator needs access to signing capability (e.g., its own EnclaveSim)
              // For now, generate a dummy signature
              let dummy_key = generate_keypair();
-             let final_signature: Signature = sign(&data_to_sign, &dummy_key);
+             let _final_signature: Signature = sign(&data_to_sign, &dummy_key);
 
             // TODO: Send RELEASE_INSTR or ABORT_INSTR to all relevant shards
             for shard_id in swap.relevant_shards {
@@ -180,6 +179,7 @@ mod tests {
             tx_id: tx_id.to_string(),
             shard_id,
             lock_info,
+            signer_identity: signing_tee.clone(),
             attestation_or_sig: signature,
         }
     }
@@ -241,7 +241,7 @@ mod tests {
 
      #[test]
     fn coordinator_handle_lock_proof_fail_verification() {
-        let (tee_id, coord_key) = create_test_tee(100);
+        let (tee_id, _coord_key) = create_test_tee(100);
         let (shard0_id, shard0_key) = create_test_tee(0);
         let config = create_test_config();
         let mut coordinator = CrossChainCoordinator::new(tee_id.clone(), config);
