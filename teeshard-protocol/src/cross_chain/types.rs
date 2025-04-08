@@ -1,16 +1,19 @@
 // Define types related to Cross-Chain Swap Execution (Algorithm 2)
 
 use crate::data_structures::LockInfo;
+// Import the actual Signature type
+use crate::tee_logic::types::Signature;
 
 // Represents a proof from a shard that a resource has been locked
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)] // Signature derives these
 pub struct LockProof {
     pub tx_id: String,       // The global transaction ID
     pub shard_id: usize,     // ID of the shard providing the proof
     pub lock_info: LockInfo, // Details of the lock (account, asset, amount)
     // Signature or attestation from the shard's TEE consensus group
     // proving the lock is valid according to their replicated state.
-    pub attestation_or_sig: Vec<u8>, // Placeholder - could be a Signature struct or complex attestation
+    // pub attestation_or_sig: Vec<u8>, // Placeholder - could be a Signature struct or complex attestation
+    pub attestation_or_sig: Signature, // Use the real signature type
 }
 
 // Reasons why a cross-chain swap might be aborted
@@ -36,6 +39,10 @@ pub enum SwapOutcome {
 mod tests {
     use super::*;
     use crate::data_structures::{AccountId, AssetId};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+    // Import the actual Signature type for tests
+    use crate::tee_logic::types::Signature;
 
     fn create_test_lock_info() -> LockInfo {
         LockInfo {
@@ -45,20 +52,29 @@ mod tests {
         }
     }
 
+     // Helper to create a dummy signature for tests
+     fn create_dummy_sig(data: &[u8]) -> Signature {
+        let key = SigningKey::generate(&mut OsRng);
+        key.sign(data)
+    }
+
     #[test]
     fn lock_proof_creation() {
         let lock_info = create_test_lock_info();
+        // Create a dummy signature for the test
+        let dummy_sig = create_dummy_sig(b"test_data_for_sig");
         let proof = LockProof {
             tx_id: "swap001".to_string(),
             shard_id: 2,
             lock_info: lock_info.clone(),
-            attestation_or_sig: vec![2, 100], // Dummy data
+            // attestation_or_sig: vec![2, 100], // Dummy data
+            attestation_or_sig: dummy_sig,
         };
 
         assert_eq!(proof.tx_id, "swap001");
         assert_eq!(proof.shard_id, 2);
         assert_eq!(proof.lock_info, lock_info);
-        assert_eq!(proof.attestation_or_sig, vec![2, 100]);
+        assert_eq!(proof.attestation_or_sig.to_bytes().len(), 64);
     }
 
     #[test]

@@ -3,6 +3,9 @@
 use crate::data_structures::TEEIdentity;
 use crate::liveness::types::{AttestationResponse, VerificationStatus, Nonce};
 use std::collections::HashMap;
+// Import crypto sim and types
+use crate::tee_logic::crypto_sim::{verify, PublicKey, SecretKey, generate_keypair};
+use crate::tee_logic::types::Signature;
 
 // Represents a TEE node acting as an aggregator
 pub struct Aggregator {
@@ -59,9 +62,10 @@ impl Aggregator {
 
         // 2. Verify the attestation report signature (dummy check)
         // Real verification needs the TEE's public key and crypto library
-        let expected_sig_data: Vec<u8> = resp.report.report_data.iter().map(|&x| x.wrapping_add(1)).collect();
-        if resp.report.signature.0 != expected_sig_data {
-             println!("Aggregator: Invalid signature for TEE {}.", resp.responding_tee.id);
+        // Use crypto_sim::verify
+        if !verify(&resp.report.report_data, &resp.report.signature, &resp.responding_tee.public_key) {
+             println!("Aggregator: Invalid signature for TEE {}. Report Data: {:?}, Sig: {:?}",
+                      resp.responding_tee.id, resp.report.report_data, resp.report.signature);
             return VerificationStatus::InvalidSignature;
         }
 
@@ -83,14 +87,18 @@ mod tests {
     use super::*;
     use crate::tee_logic::types::{Signature, AttestationReport};
     use crate::tee_logic::enclave_sim::EnclaveSim; // Need this to generate valid responses
+    use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 
-    fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+    // Update test helper
+    fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
+        let keypair = generate_keypair();
+        let identity = TEEIdentity { id, public_key: keypair.verifying_key() };
+        (identity, keypair)
     }
 
     #[test]
     fn aggregator_creation() {
-        let tee_id = create_test_tee(50);
+        let (tee_id, _) = create_test_tee(50);
         let aggregator = Aggregator::new(tee_id.clone());
         assert_eq!(aggregator.identity, tee_id);
         assert!(aggregator.expected_nonces.is_empty());
@@ -99,47 +107,51 @@ mod tests {
     #[test]
     fn verify_attestations_placeholder() {
         let aggregator_id = create_test_tee(50);
-        let mut aggregator = Aggregator::new(aggregator_id);
+        let (aggregator_id_tee, _) = create_test_tee(50);
+        let mut aggregator = Aggregator::new(aggregator_id_tee);
 
-        let tee1 = create_test_tee(1);
-        let sim1 = EnclaveSim::new(tee1.clone());
+        let (tee1_id, _) = create_test_tee(1);
+        let sim1 = EnclaveSim::new(tee1_id.id);
         let nonce1: Nonce = 111;
         let report1 = sim1.generate_remote_attestation(&nonce1.to_ne_bytes());
         let resp1 = AttestationResponse {
-            responding_tee: tee1.clone(),
+            responding_tee: tee1_id.clone(),
             nonce: nonce1,
             report: report1,
         };
 
         let tee2 = create_test_tee(2);
-        let sim2 = EnclaveSim::new(tee2.clone());
+        let (tee2_id, _) = create_test_tee(2);
+        let sim2 = EnclaveSim::new(tee2_id.id);
         let nonce2: Nonce = 222;
         let report2 = sim2.generate_remote_attestation(&nonce2.to_ne_bytes());
         let resp2_bad_nonce = AttestationResponse {
-            responding_tee: tee2.clone(),
-            nonce: 999, // Incorrect nonce
+            responding_tee: tee2_id.clone(),
+            nonce: 999,
             report: report2.clone(),
         };
 
         let tee3 = create_test_tee(3);
+        let (tee3_id, _) = create_test_tee(3);
         let nonce3: Nonce = 333;
+         let dummy_key = generate_keypair();
+         let bad_sig = crate::tee_logic::crypto_sim::sign(b"wrong data", &dummy_key);
          let resp3_bad_sig = AttestationResponse {
-            responding_tee: tee3.clone(),
+            responding_tee: tee3_id.clone(),
             nonce: nonce3,
-            report: AttestationReport { report_data: vec![1], signature: Signature(vec![0])}, // Bad signature
+            report: AttestationReport { report_data: vec![1], signature: bad_sig },
         };
 
-        // Aggregator expects these nonces
-        aggregator.expect_nonce(tee1.clone(), nonce1);
-        aggregator.expect_nonce(tee2.clone(), nonce2);
-         aggregator.expect_nonce(tee3.clone(), nonce3);
+        aggregator.expect_nonce(tee1_id.clone(), nonce1);
+        aggregator.expect_nonce(tee2_id.clone(), nonce2);
+         aggregator.expect_nonce(tee3_id.clone(), nonce3);
 
         let results = aggregator.verify_attestations(&[resp1, resp2_bad_nonce, resp3_bad_sig]);
 
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0], (tee1, VerificationStatus::Valid));
-        assert_eq!(results[1], (tee2, VerificationStatus::InvalidNonce));
-        assert_eq!(results[2], (tee3, VerificationStatus::InvalidSignature));
+        assert_eq!(results[0], (tee1_id, VerificationStatus::Valid));
+        assert_eq!(results[1], (tee2_id, VerificationStatus::InvalidNonce));
+        assert_eq!(results[2], (tee3_id, VerificationStatus::InvalidSignature));
 
     }
 } 

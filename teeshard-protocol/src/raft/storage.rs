@@ -2,6 +2,7 @@
 
 use crate::raft::state::{Command, LogEntry};
 use crate::data_structures::TEEIdentity;
+use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 
 // Trait defining the storage interface RaftNode expects
 pub trait RaftStorage {
@@ -124,7 +125,9 @@ mod tests {
     use crate::raft::state::Command;
 
      fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
     }
 
     #[test]

@@ -3,6 +3,13 @@
 use crate::data_structures::{TEEIdentity, Transaction};
 use crate::cross_chain::types::{LockProof, SwapOutcome, AbortReason};
 use crate::config::SystemConfig;
+// Use the actual Signature type
+use crate::tee_logic::types::Signature;
+// Import threshold sig components
+use crate::tee_logic::threshold_sig::{PartialSignature, ThresholdAggregator};
+// Import crypto components
+use crate::tee_logic::crypto_sim::{PublicKey, SecretKey, sign, verify, generate_keypair};
+
 use std::collections::{HashMap, HashSet};
 
 // Represents the state of a coordinator TEE managing a swap
@@ -56,8 +63,15 @@ impl CrossChainCoordinator {
             .ok_or_else(|| AbortReason::Other("Swap not found".to_string()))?;
 
         // 1. Verify the proof (placeholder)
-        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof) {
-            println!("Coordinator ({}): Lock proof verification failed for swap {}", self.identity.id, tx_id);
+        // We need the public key of the TEE that supposedly generated the proof.
+        // This info isn't currently stored in LockProof or passed here.
+        // For now, assuming we can get the signer ID from the proof somehow (needs refactor)
+        // Or, pass the expected signer TEEIdentity into handle_lock_proof.
+        // Let's assume handle_lock_proof receives the sender identity.
+        // TODO: Refactor LockProof or handle_lock_proof to include signer identity for verification.
+        // Placeholder: Using coordinator's own key for verification temporarily.
+        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof, &self.identity.public_key) { // Placeholder pubkey
+            println!("Coordinator ({}): Lock proof verification failed for swap {} (Placeholder verification used)", self.identity.id, tx_id);
             // TODO: Trigger GlobalAbort
             return Err(AbortReason::LockProofVerificationFailed);
         }
@@ -85,19 +99,20 @@ impl CrossChainCoordinator {
             let message_type: &[u8] = if commit { b"RELEASE" } else { b"ABORT" };
             // TODO: Select actual coordinator set if not self
             let coordinator_set = vec![self.identity.clone()]; // Simplified
+            // We need the secret keys for the coordinator set to sign
+            // This coordinator only has its own key
+            // TODO: Refactor to handle distributed signing or centralize key management (less secure)
+            // Placeholder: Generate a single signature from self instead of threshold/multi-sig
 
-            // TODO: Perform actual threshold signing (Algorithm 2, line 57 or 67)
-            let threshold_sig = crate::tee_logic::threshold_sig::threshold_sign(
-                &coordinator_set,
-                message_type, // Combine with tx_id for uniqueness
-                self.config.tee_threshold
-            );
+             // Combine message and tx_id for signing
+             let mut data_to_sign = message_type.to_vec();
+             data_to_sign.extend_from_slice(tx_id.as_bytes());
 
-            if threshold_sig.is_none() {
-                 eprintln!("Coordinator ({}): Failed to generate threshold signature for swap {}", self.identity.id, tx_id);
-                 // This is a critical failure
-                 return SwapOutcome::InconsistentState("Threshold signing failed".to_string());
-            }
+             // Need the coordinator's secret key. EnclaveSim holds it, but coordinator doesn't.
+             // TODO: Coordinator needs access to signing capability (e.g., its own EnclaveSim)
+             // For now, generate a dummy signature
+             let dummy_key = generate_keypair();
+             let final_signature: Signature = sign(&data_to_sign, &dummy_key);
 
             // TODO: Send RELEASE_INSTR or ABORT_INSTR to all relevant shards
             for shard_id in swap.relevant_shards {
@@ -123,9 +138,13 @@ impl CrossChainCoordinator {
 mod tests {
     use super::*;
     use crate::data_structures::TxType;
+    use crate::tee_logic::crypto_sim::{generate_keypair, PublicKey, SecretKey, sign}; // Import needed items
 
-    fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+    // Update test helper
+    fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
+        let keypair = generate_keypair();
+        let identity = TEEIdentity { id, public_key: keypair.verifying_key() };
+        (identity, keypair)
     }
 
     fn create_test_config() -> SystemConfig {
@@ -144,22 +163,31 @@ mod tests {
         }
     }
 
-    fn create_dummy_lock_proof(tx_id: &str, shard_id: usize) -> LockProof {
+    fn create_dummy_lock_proof(tx_id: &str, shard_id: usize, signing_tee: &TEEIdentity, signing_key: &SecretKey) -> LockProof {
+         let lock_info = crate::data_structures::LockInfo {
+            account: crate::data_structures::AccountId { chain_id: 0, address: "dummy".into() },
+            asset: crate::data_structures::AssetId { chain_id: 0, token_symbol: "DUM".into() },
+            amount: 0
+        };
+        // Generate a real signature for the dummy proof
+        let mut data_to_sign = tx_id.as_bytes().to_vec();
+        data_to_sign.extend_from_slice(&shard_id.to_le_bytes());
+        data_to_sign.extend_from_slice(lock_info.account.address.as_bytes());
+        data_to_sign.extend_from_slice(&lock_info.asset.token_symbol.as_bytes());
+        data_to_sign.extend_from_slice(&lock_info.amount.to_le_bytes());
+        let signature = sign(&data_to_sign, signing_key);
+
          LockProof {
             tx_id: tx_id.to_string(),
             shard_id,
-            lock_info: crate::data_structures::LockInfo {
-                account: crate::data_structures::AccountId { chain_id: 0, address: "dummy".into() },
-                asset: crate::data_structures::AssetId { chain_id: 0, token_symbol: "DUM".into() },
-                amount: 0
-            },
-            attestation_or_sig: vec![shard_id as u8], // Valid dummy proof
+            lock_info,
+            attestation_or_sig: signature,
         }
     }
 
     #[test]
     fn coordinator_creation() {
-        let tee_id = create_test_tee(100);
+        let (tee_id, _) = create_test_tee(100);
         let config = create_test_config();
         let coordinator = CrossChainCoordinator::new(tee_id.clone(), config);
         assert_eq!(coordinator.identity, tee_id);
@@ -168,7 +196,7 @@ mod tests {
 
     #[test]
     fn coordinator_initiate_swap() {
-        let tee_id = create_test_tee(100);
+        let (tee_id, _) = create_test_tee(100);
         let config = create_test_config();
         let mut coordinator = CrossChainCoordinator::new(tee_id, config);
         let tx = create_dummy_swap_tx("swap1");
@@ -185,16 +213,21 @@ mod tests {
 
      #[test]
     fn coordinator_handle_lock_proofs_commit() {
-        let tee_id = create_test_tee(100);
+        let (tee_id, coord_key) = create_test_tee(100); // Coordinator key needed for verification placeholder
+        let (shard0_id, shard0_key) = create_test_tee(0);
+        let (shard1_id, shard1_key) = create_test_tee(1);
+
         let config = create_test_config(); // threshold = 1
         let mut coordinator = CrossChainCoordinator::new(tee_id, config);
         let tx = create_dummy_swap_tx("swap2");
         let shards: HashSet<usize> = [0, 1].into_iter().collect();
         coordinator.initiate_swap(tx.clone(), shards.clone());
 
-        let proof0 = create_dummy_lock_proof("swap2", 0);
-        let proof1 = create_dummy_lock_proof("swap2", 1);
+        let proof0 = create_dummy_lock_proof("swap2", 0, &shard0_id, &shard0_key);
+        let proof1 = create_dummy_lock_proof("swap2", 1, &shard1_id, &shard1_key);
 
+        // TODO: Update handle_lock_proof to take sender identity or store it in proof
+        // Using coordinator's identity as placeholder for verification key
         let res0 = coordinator.handle_lock_proof(proof0);
         assert!(res0.is_ok());
         assert_eq!(coordinator.active_swaps.get("swap2").unwrap().received_proofs.len(), 1);
@@ -209,16 +242,20 @@ mod tests {
 
      #[test]
     fn coordinator_handle_lock_proof_fail_verification() {
-        let tee_id = create_test_tee(100);
+        let (tee_id, coord_key) = create_test_tee(100);
+        let (shard0_id, shard0_key) = create_test_tee(0);
         let config = create_test_config();
-        let mut coordinator = CrossChainCoordinator::new(tee_id, config);
+        let mut coordinator = CrossChainCoordinator::new(tee_id.clone(), config);
         let tx = create_dummy_swap_tx("swap3");
         let shards: HashSet<usize> = [0].into_iter().collect();
         coordinator.initiate_swap(tx.clone(), shards.clone());
 
-        let mut bad_proof = create_dummy_lock_proof("swap3", 0);
-        bad_proof.attestation_or_sig = vec![]; // Invalid dummy proof
+        let mut bad_proof = create_dummy_lock_proof("swap3", 0, &shard0_id, &shard0_key);
+        // Create an invalid signature
+        let other_key = generate_keypair();
+        bad_proof.attestation_or_sig = sign(b"bad_data", &other_key);
 
+        // TODO: Update handle_lock_proof verification logic
         let res = coordinator.handle_lock_proof(bad_proof);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), AbortReason::LockProofVerificationFailed);

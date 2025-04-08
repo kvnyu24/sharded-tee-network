@@ -5,6 +5,7 @@ use crate::liveness::types::{NonceChallenge, AttestationResponse};
 use crate::cross_chain::types::LockProof;
 use crate::tee_logic::Signature;
 use crate::data_structures::TEEIdentity;
+use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 
 // Represents messages exchanged between TEE nodes or with external entities
 #[derive(Clone, Debug)] // PartialEq might be tricky with all variants
@@ -57,7 +58,9 @@ mod tests {
     use crate::raft::messages::RequestVoteArgs;
 
      fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
     }
 
     #[test]

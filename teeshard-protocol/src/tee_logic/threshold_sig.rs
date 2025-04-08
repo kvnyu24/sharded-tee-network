@@ -1,98 +1,279 @@
-// Placeholder for Threshold Signature generation and verification
+// Threshold Signature generation and verification
 
 use crate::data_structures::TEEIdentity;
+// Use the real Signature type
 use crate::tee_logic::types::Signature;
+use std::collections::{HashMap, BTreeMap}; // Use BTreeMap for deterministic iteration
+// Import crypto sim components
+use crate::tee_logic::crypto_sim::{self, PublicKey, verify};
 
-// Simulate generating a threshold signature from a set of TEEs
-pub fn threshold_sign(
-    tee_nodes: &[TEEIdentity],
-    message: &[u8],
-    threshold: usize,
-) -> Option<Signature> {
-    if tee_nodes.len() < threshold {
-        println!("ThresholdSign: Not enough TEE nodes ({}) to meet threshold ({})", tee_nodes.len(), threshold);
-        return None;
-    }
-    println!("ThresholdSign: {} TEEs signing message {:?} with threshold {}", tee_nodes.len(), message, threshold);
-    // In a real implementation, this would involve a distributed key generation (DKG)
-    // protocol and a threshold signing scheme (TSS) like FROST or Gennaro-Goldfeder.
-    // For simulation, we just combine the first `threshold` node IDs with the message.
-    let mut combined_sig_data = message.to_vec();
-    for i in 0..threshold {
-        combined_sig_data.push(tee_nodes[i].id as u8);
-    }
-    Some(Signature(combined_sig_data))
+// Represents a signature share from a single TEE
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialSignature {
+    pub signer_id: TEEIdentity,
+    // Store the actual Ed25519 signature
+    pub signature_data: Signature,
 }
 
-// Simulate verifying a threshold signature
-pub fn verify_threshold_signature(
-    _public_key_info: &(), // Placeholder for combined public key or individual keys
+// Aggregates partial signatures to form a final threshold signature
+#[derive(Debug)]
+pub struct ThresholdAggregator {
+    required_threshold: usize,
+    message: Vec<u8>, // Store the message being signed
+    // Store verified partial signatures: Map PublicKey bytes -> Signature
+    // Using BTreeMap for deterministic order if needed later.
+    verified_signatures: BTreeMap<Vec<u8>, (PublicKey, Signature)>,
+}
+
+impl ThresholdAggregator {
+    /// Creates a new aggregator for a given message and threshold.
+    pub fn new(message: &[u8], required_threshold: usize) -> Self {
+        ThresholdAggregator {
+            required_threshold,
+            message: message.to_vec(),
+            verified_signatures: BTreeMap::new(),
+        }
+    }
+
+    /// Adds and verifies a partial signature to the aggregator.
+    /// Returns Err if the signature is invalid or the signer has already added one.
+    pub fn add_partial_signature(&mut self, partial_sig: PartialSignature) -> Result<(), &'static str> {
+
+        // Verify the partial signature using the signer's public key
+        if !verify(&self.message, &partial_sig.signature_data, &partial_sig.signer_id.public_key) {
+             println!(
+                 "Aggregator: Partial signature verification failed for signer {}. Sig: {:?}, Msg: {:?}, Key: {:?}",
+                 partial_sig.signer_id.id,
+                 partial_sig.signature_data,
+                 self.message,
+                 partial_sig.signer_id.public_key
+             );
+            return Err("Partial signature verification failed");
+        }
+
+        let pk_bytes = partial_sig.signer_id.public_key.to_bytes().to_vec();
+        if self.verified_signatures.contains_key(&pk_bytes) {
+            // Note: We check based on public key bytes now, not TEEIdentity ID
+            return Err("Signer (key) has already provided a valid partial signature");
+        }
+
+        println!("Aggregator: Adding verified partial signature from signer ID {} (Key: {:?})",
+                partial_sig.signer_id.id, pk_bytes);
+        self.verified_signatures.insert(pk_bytes, (partial_sig.signer_id.public_key, partial_sig.signature_data));
+        Ok(())
+    }
+
+    /// Checks if the threshold has been met.
+    pub fn has_reached_threshold(&self) -> bool {
+        self.verified_signatures.len() >= self.required_threshold
+    }
+
+    /// Attempts to finalize the threshold signature (simulated as multi-sig) if the threshold is met.
+    /// Returns None if the threshold is not met.
+    /// Returns a Vec of (PublicKey, Signature) pairs meeting the threshold.
+    pub fn finalize_multi_signature(&self) -> Option<Vec<(PublicKey, Signature)>> {
+        if !self.has_reached_threshold() {
+            println!("Aggregator: Threshold not met ({} < {})", self.verified_signatures.len(), self.required_threshold);
+            return None;
+        }
+
+        println!("Aggregator: Threshold met ({} >= {}). Finalizing multi-signature collection.",
+                 self.verified_signatures.len(), self.required_threshold);
+
+        // In this multi-signature simulation, "finalizing" just means returning the collection
+        // of verified signatures that meet the threshold.
+        // We take the first `required_threshold` signatures based on the BTreeMap iteration order (sorted by PK bytes).
+        let multi_sig: Vec<(PublicKey, Signature)> = self.verified_signatures.values().cloned().take(self.required_threshold).collect();
+
+        // Double-check we collected enough (should always be true if threshold was met)
+        if multi_sig.len() == self.required_threshold {
+             Some(multi_sig)
+        } else {
+            eprintln!("Error: Could not collect enough signatures ({}) for threshold ({}) during finalization.", multi_sig.len(), self.required_threshold);
+            None
+        }
+    }
+
+    // Remove old finalize_signature which simulated a single hash output
+    // pub fn finalize_signature(&self) -> Option<Signature> { ... }
+}
+
+
+// Verify a multi-signature collection produced by the aggregator
+pub fn verify_multi_signature(
     message: &[u8],
-    signature: &Signature,
-    _num_participants: usize, // Total number of TEEs in the group
-    threshold: usize,
+    // The collection of signatures to verify
+    multi_sig: &[(PublicKey, Signature)],
+    required_threshold: usize,
 ) -> bool {
-     println!("VerifyThresholdSig: Verifying signature {:?} for message {:?} with threshold {}", signature.0, message, threshold);
-    // Real verification depends heavily on the TSS scheme used.
-    // Placeholder: Check if the signature seems to contain the message and roughly `threshold` bytes more.
-    signature.0.len() >= message.len() && signature.0.starts_with(message)
-    // A slightly better simulation check (matching the dummy sign)
-    // signature.0.len() == message.len() + threshold && signature.0.starts_with(message)
-}
+    println!("VerifyMultiSig: Verifying {} signatures for message {:?} against threshold {}",
+              multi_sig.len(), message, required_threshold);
 
+    if multi_sig.len() < required_threshold {
+        println!("VerifyMultiSig: Not enough signatures provided ({}) to meet threshold ({})",
+                 multi_sig.len(), required_threshold);
+        return false;
+    }
+
+    // Check if we have *at least* `required_threshold` valid signatures in the collection.
+    // We also need to ensure no duplicate public keys are counted.
+    let mut verified_keys = std::collections::HashSet::new();
+    let mut valid_sig_count = 0;
+
+    for (public_key, signature) in multi_sig {
+        if verify(message, signature, public_key) {
+            // Only count if the public key hasn't been seen before in this verification set
+             if verified_keys.insert(public_key.to_bytes()) { // Diffs PublicKey by bytes
+                valid_sig_count += 1;
+            }
+        } else {
+            println!("VerifyMultiSig: Found invalid signature for key {:?}", public_key);
+            // Depending on policy, finding even one invalid signature might invalidate the whole set.
+            // For threshold, we just need enough valid ones.
+        }
+    }
+
+    println!("VerifyMultiSig: Found {} valid unique signatures.", valid_sig_count);
+    valid_sig_count >= required_threshold
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tee_logic::crypto_sim::{generate_keypair, sign, PublicKey};
+    use crate::data_structures::TEEIdentity; // Import TEEIdentity
 
-    fn create_test_tees(count: usize) -> Vec<TEEIdentity> {
-        (0..count).map(|i| TEEIdentity { id: i, public_key: vec![i as u8] }).collect()
+    // Helper to create a TEEIdentity with a real key
+    fn create_real_tee(id: usize) -> (TEEIdentity, ed25519_dalek::SigningKey) {
+        let keypair = generate_keypair();
+        let identity = TEEIdentity { id, public_key: keypair.verifying_key() };
+        (identity, keypair)
+    }
+
+    // Helper to create a valid partial signature
+    fn create_valid_partial_sig(identity: &TEEIdentity, keypair: &ed25519_dalek::SigningKey, message: &[u8]) -> PartialSignature {
+        let signature_data = sign(message, keypair);
+        PartialSignature {
+            signer_id: identity.clone(),
+            signature_data,
+        }
     }
 
     #[test]
-    fn test_threshold_sign_success() {
-        let tees = create_test_tees(5);
-        let message = b"commit_tx123";
-        let threshold = 3;
-        let signature = threshold_sign(&tees, message, threshold).expect("Signing failed");
+    fn test_aggregator_flow_success() {
+        let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
+        let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
+        let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
 
-        // Check dummy signature structure
-        let mut expected_data = message.to_vec();
-        expected_data.push(tees[0].id as u8); // ID 0
-        expected_data.push(tees[1].id as u8); // ID 1
-        expected_data.push(tees[2].id as u8); // ID 2
-        assert_eq!(signature.0, expected_data);
+        let message = b"approve_step_1";
+        let threshold = 3;
+
+        let mut aggregator = ThresholdAggregator::new(message, threshold);
+
+        assert!(!aggregator.has_reached_threshold());
+        assert!(aggregator.finalize_multi_signature().is_none());
+
+        // Add valid partial signatures from 3 TEEs (0, 2, 4)
+        let partial_sig_0 = create_valid_partial_sig(&identities[0], keypairs[0], message);
+        let partial_sig_2 = create_valid_partial_sig(&identities[2], keypairs[2], message);
+        let partial_sig_4 = create_valid_partial_sig(&identities[4], keypairs[4], message);
+
+        assert!(aggregator.add_partial_signature(partial_sig_0).is_ok());
+        assert_eq!(aggregator.verified_signatures.len(), 1);
+        assert!(!aggregator.has_reached_threshold());
+        assert!(aggregator.add_partial_signature(partial_sig_4).is_ok());
+        assert_eq!(aggregator.verified_signatures.len(), 2);
+        assert!(!aggregator.has_reached_threshold());
+        assert!(aggregator.add_partial_signature(partial_sig_2).is_ok());
+        assert_eq!(aggregator.verified_signatures.len(), 3);
+        assert!(aggregator.has_reached_threshold());
+
+        // Finalize (get multi-sig collection)
+        let multi_sig = aggregator.finalize_multi_signature().expect("Finalization failed");
+        assert_eq!(multi_sig.len(), threshold);
+
+        // Verify the multi-signature collection
+        let is_valid = verify_multi_signature(message, &multi_sig, threshold);
+        assert!(is_valid, "Multi-signature verification failed");
+
+        // Test verification with lower threshold (should still pass)
+        assert!(verify_multi_signature(message, &multi_sig, threshold - 1));
+
+        // Test verification with higher threshold (should fail)
+        assert!(!verify_multi_signature(message, &multi_sig, threshold + 1));
+
+        // Test verification with wrong message
+        assert!(!verify_multi_signature(b"wrong_message", &multi_sig, threshold));
+
+        // Test verification with a manually constructed invalid signature in the set
+        let (invalid_id, invalid_kp) = create_real_tee(99);
+        let invalid_sig = sign(b"different_message", &invalid_kp);
+        let mut multi_sig_with_invalid = multi_sig.clone();
+        multi_sig_with_invalid[0] = (invalid_id.public_key, invalid_sig);
+        // Should fail if threshold requires all original 3
+        assert!(!verify_multi_signature(message, &multi_sig_with_invalid, threshold));
+        // Should pass if threshold is low enough (e.g., 2) to tolerate one invalid sig
+        assert!(verify_multi_signature(message, &multi_sig_with_invalid, threshold - 1));
+
     }
 
     #[test]
-    fn test_threshold_sign_insufficient_nodes() {
-        let tees = create_test_tees(2);
-        let message = b"commit_tx456";
-        let threshold = 3;
-        let signature = threshold_sign(&tees, message, threshold);
-        assert!(signature.is_none());
-    }
+    fn test_aggregator_add_duplicate_signer() {
+        let (identity0, keypair0) = create_real_tee(0);
+        let message = b"message";
+        let threshold = 1;
+        let mut aggregator = ThresholdAggregator::new(message, threshold);
 
-    #[test]
-    fn test_verify_threshold_signature_placeholder_success() {
-        let tees = create_test_tees(5);
-        let message = b"release_funds";
-        let threshold = 3;
-        let signature = threshold_sign(&tees, message, threshold).unwrap();
+        let partial_sig_0 = create_valid_partial_sig(&identity0, &keypair0, message);
+        let partial_sig_0_again = partial_sig_0.clone();
 
-        // Use placeholder verification
-        let is_valid = verify_threshold_signature(&(), message, &signature, tees.len(), threshold);
-        assert!(is_valid);
+        assert!(aggregator.add_partial_signature(partial_sig_0).is_ok());
+        let result = aggregator.add_partial_signature(partial_sig_0_again);
+        assert!(result.is_err());
+        // Error message updated
+        assert_eq!(result.unwrap_err(), "Signer (key) has already provided a valid partial signature");
+        assert_eq!(aggregator.verified_signatures.len(), 1);
     }
 
      #[test]
-    fn test_verify_threshold_signature_placeholder_fail_bad_sig() {
-        let message = b"abort_everything";
-        let threshold = 2;
-        let bad_signature = Signature(vec![1, 2, 3]); // Doesn't match message
+    fn test_aggregator_add_invalid_signature() {
+        let (identity0, _) = create_real_tee(0);
+        let (_, keypair1) = create_real_tee(1); // Key doesn't match identity0
+        let message = b"test_message";
+        let threshold = 1;
+        let mut aggregator = ThresholdAggregator::new(message, threshold);
 
-        let is_valid = verify_threshold_signature(&(), message, &bad_signature, 5, threshold);
-        assert!(!is_valid);
+        // Create signature with keypair1 but claim it's from identity0
+        let invalid_sig_data = sign(message, &keypair1);
+        let invalid_partial_sig = PartialSignature {
+            signer_id: identity0.clone(), // Claiming to be from ID 0
+            signature_data: invalid_sig_data,
+        };
+
+        let result = aggregator.add_partial_signature(invalid_partial_sig);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Partial signature verification failed");
+        assert!(aggregator.verified_signatures.is_empty());
+    }
+
+    #[test]
+    fn test_aggregator_threshold_not_met() {
+        let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
+        let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
+        let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
+
+        let message = b"another_message";
+        let threshold = 3;
+        let mut aggregator = ThresholdAggregator::new(message, threshold);
+
+        let partial_sig_1 = create_valid_partial_sig(&identities[1], keypairs[1], message);
+        let partial_sig_3 = create_valid_partial_sig(&identities[3], keypairs[3], message);
+
+        aggregator.add_partial_signature(partial_sig_1).unwrap();
+        aggregator.add_partial_signature(partial_sig_3).unwrap();
+
+        assert!(!aggregator.has_reached_threshold());
+        assert!(aggregator.finalize_multi_signature().is_none());
     }
 
 } 

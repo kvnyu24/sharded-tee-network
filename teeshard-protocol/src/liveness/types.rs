@@ -45,9 +45,20 @@ pub enum VerificationStatus {
 mod tests {
     use super::*;
     use crate::tee_logic::types::Signature;
+    use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+    use ed25519_dalek::{Signer, SigningKey}; // Import signing components
+    use rand::rngs::OsRng; // Import OsRng
 
     fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
+    }
+
+    // Helper to create a dummy signature for tests
+    fn create_dummy_sig(data: &[u8]) -> Signature {
+        let key = SigningKey::generate(&mut OsRng);
+        key.sign(data)
     }
 
     #[test]
@@ -79,7 +90,7 @@ mod tests {
         let tee = create_test_tee(2);
         let report = AttestationReport {
             report_data: vec![1, 2, 3],
-            signature: Signature(vec![4, 5]),
+            signature: create_dummy_sig(&[1, 2, 3]), // Use helper
         };
         let response = AttestationResponse {
             responding_tee: tee.clone(),

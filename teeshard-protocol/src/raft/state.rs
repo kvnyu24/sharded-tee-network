@@ -2,6 +2,7 @@
 
 use crate::data_structures::TEEIdentity;
 use std::collections::HashMap;
+use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 
 // Represents the role of a Raft node
 #[derive(Clone, Debug, PartialEq, Eq, Copy)] // Copy for simple state transitions
@@ -65,7 +66,9 @@ mod tests {
     use super::*;
 
     fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use crate::data_structures::TEEIdentity;
 use crate::raft::state::LogEntry;
+use crate::tee_logic::crypto_sim::generate_keypair;
 
 // Sent by candidates to gather votes
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +36,11 @@ pub struct AppendEntriesArgs {
 pub struct AppendEntriesReply {
     pub term: u64,
     pub success: bool,
-    // Optional: Used for fast log backtracking if success is false
+    // On success, contains the index of the last log entry known to be replicated on the follower.
+    // On failure, this is None.
+    pub match_index: Option<u64>,
+    // On failure, can contain a hint for the leader's next attempt.
+    // On success, this is None.
     pub mismatch_index: Option<u64>,
 }
 
@@ -53,9 +58,11 @@ pub enum RaftMessage {
 mod tests {
     use super::*;
     use crate::raft::state::Command;
+    use crate::data_structures::TEEIdentity; // Ensure TEEIdentity is in scope
 
     fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
     }
 
     #[test]
@@ -97,11 +104,17 @@ mod tests {
 
     #[test]
     fn append_entries_reply_creation() {
-        let reply_success = AppendEntriesReply { term: 2, success: true, mismatch_index: None };
-        let reply_fail = AppendEntriesReply { term: 2, success: false, mismatch_index: Some(2) };
+        let reply_success = AppendEntriesReply { term: 2, success: true, match_index: Some(5), mismatch_index: None };
+        let reply_fail = AppendEntriesReply { term: 2, success: false, match_index: None, mismatch_index: Some(2) };
         assert!(reply_success.success);
+        assert!(reply_success.match_index.is_some());
+        assert_eq!(reply_success.match_index.unwrap(), 5);
+        assert!(reply_success.mismatch_index.is_none());
+
         assert!(!reply_fail.success);
-        assert_eq!(reply_fail.mismatch_index, Some(2));
+        assert!(reply_fail.match_index.is_none());
+        assert!(reply_fail.mismatch_index.is_some());
+        assert_eq!(reply_fail.mismatch_index.unwrap(), 2);
     }
 
     #[test]

@@ -83,6 +83,9 @@ impl EscrowCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Import crypto helpers
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
 
      fn create_test_account(chain_id: u64, addr: &str) -> AccountId {
         AccountId { chain_id, address: addr.to_string() }
@@ -96,7 +99,12 @@ mod tests {
     fn escrow_call_creation() {
         let acc1 = create_test_account(1, "a1");
         let asset1 = create_test_asset(1, "AST");
-        let sig = Signature(vec![1,2,3]);
+        // let sig = Signature(vec![1,2,3]); // Old
+        // Create a valid dummy signature
+        let sig = {
+            let key = SigningKey::generate(&mut OsRng);
+            key.sign(b"dummy escrow data")
+        };
 
         let lock_call = EscrowCall::Lock {
             chain_id: 1,

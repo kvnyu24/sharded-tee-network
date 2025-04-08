@@ -1,4 +1,6 @@
-// Main RaftNode implementation (Algorithm 3)
+// Placeholder for the main RaftNode implementation (Algorithm 3)
+
+// This file will eventually contain the RaftNode struct and its methods
 // for handling timers, messages, and state transitions.
 
 use crate::raft::messages::*;
@@ -6,6 +8,8 @@ use crate::raft::state::{Command, LogEntry, RaftNodeState, RaftRole};
 use crate::data_structures::TEEIdentity;
 use crate::config::SystemConfig;
 use crate::raft::storage::{RaftStorage, InMemoryStorage}; // Add InMemoryStorage for test
+use crate::tee_logic::enclave_sim::EnclaveSim;
+use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use rand::Rng;
@@ -29,8 +33,10 @@ pub struct RaftNode {
     last_heartbeat_sent: Instant, // Only relevant for leader
     // Votes received in the current term (for candidates)
     votes_received: HashSet<TEEIdentity>,
-    // TODO: Add interface for network communication (sending messages)
-    // TODO: Add interface for applying committed entries to state machine
+    // Simulated TEE enclave for this node
+    pub enclave: EnclaveSim,
+    // Interface for network communication handled via RaftEvent::SendMessage / BroadcastMessage
+    // Interface for applying committed entries handled via RaftEvent::ApplyToStateMachine
 }
 
 // Manual Debug implementation
@@ -46,6 +52,8 @@ impl fmt::Debug for RaftNode {
          .field("heartbeat_interval", &self.heartbeat_interval)
          .field("last_heartbeat_sent", &self.last_heartbeat_sent)
          .field("votes_received", &self.votes_received)
+         // Add enclave (uses its own Debug impl)
+         .field("enclave", &self.enclave)
          .finish()
     }
 }
@@ -60,7 +68,7 @@ pub enum RaftEvent {
 }
 
 impl RaftNode {
-    pub fn new(id: TEEIdentity, peers: Vec<TEEIdentity>, config: SystemConfig, storage: Box<dyn RaftStorage>) -> Self {
+    pub fn new(id: TEEIdentity, peers: Vec<TEEIdentity>, config: SystemConfig, storage: Box<dyn RaftStorage>, enclave: EnclaveSim) -> Self {
         // Load persistent state using new storage methods
         let current_term = storage.get_term();
         let voted_for = storage.get_voted_for();
@@ -91,6 +99,7 @@ impl RaftNode {
             heartbeat_interval: Duration::from_millis(config.raft_heartbeat_ms),
             last_heartbeat_sent: Instant::now(), // Reset for followers/candidates
             votes_received: HashSet::new(),
+            enclave, // Store the provided enclave instance
         };
         node.randomize_election_timeout();
         node
@@ -123,7 +132,7 @@ impl RaftNode {
             RaftRole::Leader => {
                 if self.last_heartbeat_sent.elapsed() >= self.heartbeat_interval {
                     // println!("Node {}: Sending heartbeats (Term {}).", self.state.id.id, self.state.current_term);
-                    events.extend(self.send_heartbeats());
+                    events.extend(self.send_append_entries());
                     self.last_heartbeat_sent = Instant::now();
                 }
             }
@@ -195,31 +204,14 @@ impl RaftNode {
             self.state.match_index.insert(peer.clone(), 0);
         }
         self.last_heartbeat_sent = Instant::now(); // Send initial heartbeats immediately
-        self.send_heartbeats() // Return initial heartbeat events
+        self.send_append_entries() // Return initial heartbeat events
     }
 
     // Send AppendEntries (heartbeats or with entries) to peers
-    fn send_heartbeats(&mut self) -> Vec<RaftEvent> {
+    fn send_append_entries(&mut self) -> Vec<RaftEvent> {
         let mut events = Vec::new();
         for peer in &self.peers {
-             // For heartbeats, send empty entries
-             // TODO: Proper log matching - this is simplified for heartbeats
-             let prev_log_index = self.state.next_index.get(peer).map_or(0, |&idx| idx - 1);
-             let prev_log_term = if prev_log_index > 0 {
-                 self.state.log.get(prev_log_index as usize - 1).map_or(0, |e| e.term)
-             } else {
-                 0
-             };
-
-            let args = AppendEntriesArgs {
-                term: self.state.current_term,
-                leader_id: self.state.id.clone(),
-                prev_log_index,
-                prev_log_term,
-                entries: vec![], // Empty for heartbeat
-                leader_commit: self.state.commit_index,
-            };
-            events.push(RaftEvent::SendMessage(peer.clone(), RaftMessage::AppendEntries(args)));
+            events.extend(self.send_append_entries_to_peer(peer));
         }
         events
     }
@@ -320,6 +312,7 @@ impl RaftNode {
     fn handle_append_entries(&mut self, leader_id: TEEIdentity, args: AppendEntriesArgs) -> Vec<RaftEvent> {
         let mut success = false;
         let mut mismatch_index: Option<u64> = None;
+        let mut match_index: Option<u64> = None;
         let mut events = Vec::new();
 
         if args.term < self.state.current_term {
@@ -395,6 +388,9 @@ impl RaftNode {
                      }
                 }
 
+                // Set match_index to the last replicated entry
+                match_index = Some(args.prev_log_index + args.entries.len() as u64);
+
                 // Update commit index
                 if args.leader_commit > self.state.commit_index {
                     let old_commit_index = self.state.commit_index;
@@ -410,8 +406,6 @@ impl RaftNode {
                     self.state.commit_index = std::cmp::min(args.leader_commit, last_new_entry_index);
                     if self.state.commit_index > old_commit_index {
                         println!("Node {}: Updated commitIndex from {} to {}", self.state.id.id, old_commit_index, self.state.commit_index);
-                        // Trigger application check in the next tick()
-                        // events.push(self.apply_committed_entries()); // Don't do this here, let tick handle it
                     }
                 }
             }
@@ -420,6 +414,7 @@ impl RaftNode {
         let reply = AppendEntriesReply {
             term: self.state.current_term,
             success,
+            match_index,
             mismatch_index,
         };
         events.push(RaftEvent::SendMessage(leader_id, RaftMessage::AppendEntriesReply(reply)));
@@ -431,7 +426,7 @@ impl RaftNode {
         if self.state.role != RaftRole::Leader {
              return vec![RaftEvent::Noop];
         }
-         if reply.term > self.state.current_term {
+        if reply.term > self.state.current_term {
              println!("Node {}: AppendEntries reply from {} has higher term ({} > {}). Becoming follower.", self.state.id.id, follower_id.id, reply.term, self.state.current_term);
             self.become_follower(reply.term);
             return vec![RaftEvent::Noop];
@@ -440,41 +435,91 @@ impl RaftNode {
              return vec![RaftEvent::Noop];
         }
 
-        // Get the assumed state when the corresponding AE was sent
-        // NOTE: This is a simplification. A real implementation needs to track inflight AEs.
-        let assumed_next_idx = self.state.next_index.get(&follower_id).copied().unwrap_or(1);
-        let assumed_prev_log_idx = assumed_next_idx - 1;
-        // TODO: Need to know how many entries were sent in the original AE
-        let assumed_num_entries_sent = 0; // Placeholder - crucial for correct update
-
         if reply.success {
-            // Update based on the indices assumed to be replicated by this successful reply
-            let new_match_index = assumed_prev_log_idx + assumed_num_entries_sent;
-            let new_next_index = new_match_index + 1;
-
-            // Only update if it increases (monotonicity)
-            let current_match = self.state.match_index.get(&follower_id).copied().unwrap_or(0);
-            if new_match_index > current_match {
-                self.state.match_index.insert(follower_id.clone(), new_match_index);
-                self.state.next_index.insert(follower_id.clone(), new_next_index);
-                println!("Node {}: AppendEntries success from {}. Updated matchIndex={}, nextIndex={}.",
-                         self.state.id.id, follower_id.id, new_match_index, new_next_index);
-                 // Potentially update commit index now that matchIndex has advanced
-                 self.update_commit_index();
-            } else {
-                 println!("Node {}: AppendEntries success from {} but new_match_index ({}) <= current ({}), no update.",
-                          self.state.id.id, follower_id.id, new_match_index, current_match);
+            // Use the match_index from the reply to update our state
+            if let Some(new_match_index) = reply.match_index {
+                // Only update if it increases (monotonicity)
+                let current_match = self.state.match_index.get(&follower_id).copied().unwrap_or(0);
+                if new_match_index > current_match {
+                    self.state.match_index.insert(follower_id.clone(), new_match_index);
+                    self.state.next_index.insert(follower_id.clone(), new_match_index + 1);
+                    println!("Node {}: AppendEntries success from {}. Updated matchIndex={}, nextIndex={}.",
+                             self.state.id.id, follower_id.id, new_match_index, new_match_index + 1);
+                     // Potentially update commit index now that matchIndex has advanced
+                     self.update_commit_index();
+                }
             }
         } else {
-             // Use hint if available, otherwise just decrement
-             let new_next_index = reply.mismatch_index.unwrap_or_else(|| std::cmp::max(1, assumed_next_idx.saturating_sub(1)));
-             self.state.next_index.insert(follower_id.clone(), new_next_index);
-             println!("Node {}: AppendEntries failed from {}. Decrementing nextIndex to {}. Will retry.",
-                      self.state.id.id, follower_id.id, new_next_index);
-            // TODO: Resend AppendEntries immediately?
+            // Use hint if available, otherwise just decrement
+            let new_next_index = reply.mismatch_index.unwrap_or_else(|| {
+                let current_next = self.state.next_index.get(&follower_id).copied().unwrap_or(1);
+                std::cmp::max(1, current_next.saturating_sub(1))
+            });
+            self.state.next_index.insert(follower_id.clone(), new_next_index);
+            println!("Node {}: AppendEntries failed from {}. Updated nextIndex to {}. Resending immediately.",
+                     self.state.id.id, follower_id.id, new_next_index);
+            
+            // Resend AppendEntries immediately
+            return self.send_append_entries_to_peer(&follower_id);
         }
 
         vec![RaftEvent::Noop]
+    }
+
+    // Helper function to send AppendEntries to a specific peer
+    fn send_append_entries_to_peer(&self, peer: &TEEIdentity) -> Vec<RaftEvent> {
+        let next_idx = self.state.next_index.get(peer).copied().unwrap_or(1);
+        let prev_log_index = next_idx - 1;
+        let prev_log_term = if prev_log_index > 0 {
+            self.state.log.get(prev_log_index as usize - 1).map_or(0, |e| e.term)
+        } else {
+            0
+        };
+
+        // Get entries to send starting from next_idx
+        let entries = if next_idx <= self.state.last_log_index() {
+            self.state.log[(next_idx - 1) as usize..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let args = AppendEntriesArgs {
+            term: self.state.current_term,
+            leader_id: self.state.id.clone(),
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit: self.state.commit_index,
+        };
+
+        vec![RaftEvent::SendMessage(peer.clone(), RaftMessage::AppendEntries(args))]
+    }
+
+    // Leader proposes a command to be replicated
+    // Returns the index of the new log entry if successful
+    pub fn propose_command(&mut self, command: Command) -> Result<u64, &'static str> {
+        if self.state.role != RaftRole::Leader {
+            return Err("Node is not the leader");
+        }
+
+        let new_entry = LogEntry {
+            term: self.state.current_term,
+            command,
+        };
+        self.state.log.push(new_entry.clone());
+        self.storage.append_log_entries(&[new_entry]); // Persist the new entry
+
+        let new_log_index = self.state.last_log_index();
+        println!("Node {}: Leader proposed command, new log index {}", self.state.id.id, new_log_index);
+
+        // Update leader's own match index
+        self.state.match_index.insert(self.state.id.clone(), new_log_index);
+
+        // Immediately send AppendEntries to replicate the new entry
+        // Note: This might be redundant if a heartbeat is due soon, but ensures faster replication
+        // self.send_append_entries(); // Consider if sending immediately is always best
+
+        Ok(new_log_index)
     }
 
     // Update commit index based on majority matchIndex (Leader only)
@@ -498,7 +543,6 @@ impl RaftNode {
                     if entry.term == self.state.current_term {
                         println!("Node {}: Updating commitIndex to {} based on majority match.", self.state.id.id, n);
                         self.state.commit_index = n;
-                         // TODO: Trigger application of newly committed entries
                     } else {
                         println!("Node {}: Cannot update commitIndex to {} because log term is different ({})", self.state.id.id, n, entry.term);
                     }
@@ -537,6 +581,7 @@ mod tests {
     use super::*;
     use crate::config::SystemConfig;
     use crate::data_structures::TEEIdentity;
+    use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
     // Try absolute path from crate root
     use crate::raft::storage::InMemoryStorage;
     use std::collections::{HashMap, VecDeque};
@@ -546,8 +591,9 @@ mod tests {
 
     // Helper function to create a TEEIdentity
     fn create_identity(id: u64) -> TEEIdentity {
-        // Create TEEIdentity with usize ID and empty public key
-        TEEIdentity { id: id as usize, public_key: vec![] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair(); // Generate Ed25519 key
+        TEEIdentity { id: id as usize, public_key: keypair.verifying_key() }
     }
 
     // Helper function to deliver messages between nodes
@@ -621,7 +667,10 @@ mod tests {
             // Use TEEIdentity
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
-            let node = RaftNode::new(id.clone(), peers, config.clone(), storage);
+            // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
+            let enclave = EnclaveSim::new(id.id);
+            // Pass the enclave to the RaftNode constructor
+            let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
             network.insert(id.clone(), VecDeque::new());
         }
@@ -743,5 +792,225 @@ mod tests {
             }
             None 
         }
+    }
+
+    #[test]
+    fn test_log_replication_and_commit() {
+        let node_ids: Vec<TEEIdentity> = (1..=3).map(create_identity).collect();
+        let mut nodes: HashMap<TEEIdentity, Arc<Mutex<RaftNode>>> = HashMap::new();
+        let mut network: HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>> = HashMap::new();
+        let config = SystemConfig::default();
+
+        for id in &node_ids {
+            let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
+            let storage = Box::new(InMemoryStorage::new());
+            // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
+            let enclave = EnclaveSim::new(id.id);
+            // Pass the enclave to the RaftNode constructor
+            let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
+            nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
+            network.insert(id.clone(), VecDeque::new());
+        }
+
+        println!("Running simulation until a leader is elected...");
+        let mut leader_id_opt: Option<TEEIdentity> = None;
+        let mut outgoing_messages: Vec<(TEEIdentity, TEEIdentity, RaftMessage)> = Vec::new();
+        for tick in 0..30 { // Increased ticks for election stability
+            let mut current_tick_outgoing = Vec::new();
+            deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
+
+            for id in &node_ids {
+                current_tick_outgoing.extend(process_network_queue(id, &mut nodes, &mut network));
+            }
+
+            for id in &node_ids {
+                if let Some(node_arc) = nodes.get(id) {
+                    let mut node = node_arc.lock().unwrap();
+                    let events = node.tick();
+                    for event in events {
+                        match event {
+                            RaftEvent::SendMessage(recipient, message) => {
+                                current_tick_outgoing.push((id.clone(), recipient, message));
+                            }
+                            RaftEvent::BroadcastMessage(message) => {
+                                for peer_id in node.peers.iter().cloned() {
+                                    if &peer_id != id {
+                                        current_tick_outgoing.push((id.clone(), peer_id, message.clone()));
+                                    }
+                                }
+                            }
+                            RaftEvent::ApplyToStateMachine(commands) => {
+                                println!("Node {}: Applied {} commands during election tick {}", id.id, commands.len(), tick);
+                            }
+                            RaftEvent::Noop => {}
+                        }
+                    }
+                }
+            }
+            outgoing_messages.extend(current_tick_outgoing);
+            leader_id_opt = find_leader(&nodes);
+            if leader_id_opt.is_some() {
+                println!("Leader found at tick {}: {:?}", tick, leader_id_opt.as_ref().unwrap().id);
+                // Run a few more ticks to stabilize heartbeats
+                for _ in 0..3 {
+                     let mut stabilization_outgoing = Vec::new();
+                     deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
+                     for id in &node_ids {
+                         stabilization_outgoing.extend(process_network_queue(id, &mut nodes, &mut network));
+                     }
+                      for id in &node_ids {
+                         if let Some(node_arc) = nodes.get(id) {
+                              let mut node = node_arc.lock().unwrap();
+                              let events = node.tick();
+                              // Process events just for message generation
+                               for event in events {
+                                     match event {
+                                         RaftEvent::SendMessage(recipient, message) => {
+                                             stabilization_outgoing.push((id.clone(), recipient, message));
+                                         }
+                                         RaftEvent::BroadcastMessage(message) => {
+                                             for peer_id in node.peers.iter().cloned() {
+                                                 if &peer_id != id {
+                                                     stabilization_outgoing.push((id.clone(), peer_id, message.clone()));
+                                                 }
+                                             }
+                                         }
+                                          RaftEvent::ApplyToStateMachine(commands) => {
+                                              println!("Node {}: Applied {} commands during stabilization", id.id, commands.len());
+                                          }
+                                         _ => {}
+                                     }
+                                 }
+                         }
+                     }
+                     outgoing_messages.extend(stabilization_outgoing);
+                     thread::sleep(Duration::from_millis(config.raft_heartbeat_ms / 2));
+                }
+                 // Final delivery before proposing
+                 deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
+                 for id in &node_ids {
+                     process_network_queue(id, &mut nodes, &mut network);
+                 }
+                 leader_id_opt = find_leader(&nodes); // Re-confirm leader
+                 if leader_id_opt.is_some() { break; } else { println!("Leader lost during stabilization, continuing..."); }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(leader_id_opt.is_some(), "No stable leader elected.");
+        let leader_id = leader_id_opt.unwrap();
+
+        // Propose a command to the leader
+        let proposed_log_index;
+        let command_to_propose = Command(Vec::new()); // Fix 1: Use struct constructor for empty command
+        {
+            let leader_node_arc = nodes.get(&leader_id).unwrap();
+            let mut leader_node = leader_node_arc.lock().unwrap();
+            assert_eq!(leader_node.state.role, RaftRole::Leader, "Node designated as leader is not in Leader role.");
+            proposed_log_index = leader_node.propose_command(command_to_propose.clone()).expect("Leader failed to propose command");
+             println!("Leader {} proposed command at index {}", leader_id.id, proposed_log_index);
+             // Fix 2: Process events from send_append_entries
+             let initial_append_events = leader_node.send_append_entries();
+             for event in initial_append_events {
+                 match event {
+                     RaftEvent::SendMessage(recipient, message) => {
+                         outgoing_messages.push((leader_id.clone(), recipient, message));
+                     }
+                     RaftEvent::BroadcastMessage(message) => { // Should not happen from send_append_entries, but handle defensively
+                         for peer_id in leader_node.peers.iter().cloned() {
+                             if &peer_id != &leader_id {
+                                 outgoing_messages.push((leader_id.clone(), peer_id, message.clone()));
+                             }
+                         }
+                     }
+                     _ => {} // Ignore Noop/ApplyToStateMachine from this context
+                 }
+             }
+        }
+        assert!(proposed_log_index > 0, "Proposed log index should be positive");
+
+         println!("Running simulation for replication and commit...");
+         // Run simulation enough times for replication, commit, and application
+         for tick in 0..10 {
+             let mut current_tick_outgoing = Vec::new();
+             deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
+
+             for id in &node_ids {
+                 current_tick_outgoing.extend(process_network_queue(id, &mut nodes, &mut network));
+             }
+
+             for id in &node_ids {
+                 if let Some(node_arc) = nodes.get(id) {
+                     let mut node = node_arc.lock().unwrap();
+                     let events = node.tick(); // Ticking handles applying committed entries
+                     for event in events {
+                         match event {
+                             RaftEvent::SendMessage(recipient, message) => {
+                                 current_tick_outgoing.push((id.clone(), recipient, message));
+                             }
+                             RaftEvent::BroadcastMessage(message) => {
+                                 for peer_id in node.peers.iter().cloned() {
+                                     if &peer_id != id {
+                                         current_tick_outgoing.push((id.clone(), peer_id, message.clone()));
+                                     }
+                                 }
+                             }
+                             RaftEvent::ApplyToStateMachine(commands) => {
+                                 println!("Node {}: Applied {} commands during replication tick {}", id.id, commands.len(), tick);
+                                  // Check if the specific command we sent is being applied
+                                  if node.state.last_applied >= proposed_log_index {
+                                       let applied_entry = &node.state.log[proposed_log_index as usize - 1];
+                                       assert_eq!(applied_entry.command, command_to_propose, "Applied command mismatch on Node {}", id.id);
+                                  }
+                             }
+                             RaftEvent::Noop => {}
+                         }
+                     }
+                 }
+             }
+             outgoing_messages.extend(current_tick_outgoing);
+             thread::sleep(Duration::from_millis(config.raft_heartbeat_ms / 2));
+
+             // Check if commit index has advanced on the leader
+             let leader_commit_index = nodes.get(&leader_id).unwrap().lock().unwrap().state.commit_index;
+             if leader_commit_index >= proposed_log_index {
+                  println!("Leader commit index {} reached proposed index {}. Checking followers.", leader_commit_index, proposed_log_index);
+                  // Check if followers have also committed
+                  let mut all_committed = true;
+                  for id in &node_ids {
+                      if nodes.get(id).unwrap().lock().unwrap().state.commit_index < proposed_log_index {
+                           all_committed = false;
+                           break;
+                      }
+                  }
+                  if all_committed {
+                       println!("All nodes have committed the entry at index {}. Stopping simulation early.", proposed_log_index);
+                       break; // Exit loop once committed everywhere
+                  }
+             }
+         }
+
+         // Final state assertions
+         let leader_node = nodes.get(&leader_id).unwrap().lock().unwrap();
+         assert!(leader_node.state.commit_index >= proposed_log_index, "Leader commit index ({}) did not reach proposed index ({})", leader_node.state.commit_index, proposed_log_index);
+         assert!(leader_node.state.last_applied >= proposed_log_index, "Leader last_applied ({}) did not reach proposed index ({})", leader_node.state.last_applied, proposed_log_index);
+         assert_eq!(leader_node.state.log[proposed_log_index as usize - 1].command, command_to_propose, "Leader log entry mismatch");
+
+         for id in &node_ids {
+             if id == &leader_id { continue; } // Skip leader, already checked
+             let follower_node = nodes.get(id).unwrap().lock().unwrap();
+             assert_eq!(follower_node.state.role, RaftRole::Follower, "Node {} should be Follower", id.id);
+             assert!(follower_node.state.log.len() >= proposed_log_index as usize, "Follower {} log too short ({})", id.id, follower_node.state.log.len());
+             assert_eq!(follower_node.state.log[proposed_log_index as usize - 1].command, command_to_propose, "Follower {} log entry mismatch", id.id);
+             assert!(follower_node.state.commit_index >= proposed_log_index, "Follower {} commit index ({}) did not reach proposed index ({})", id.id, follower_node.state.commit_index, proposed_log_index);
+             assert!(follower_node.state.last_applied >= proposed_log_index, "Follower {} last_applied ({}) did not reach proposed index ({})", id.id, follower_node.state.last_applied, proposed_log_index);
+
+             // Check leader's view of this follower
+             let leader_next_index = leader_node.state.next_index.get(id).copied().unwrap_or(0);
+             let leader_match_index = leader_node.state.match_index.get(id).copied().unwrap_or(0);
+             assert!(leader_match_index >= proposed_log_index, "Leader match_index for follower {} ({}) is less than proposed index ({})", id.id, leader_match_index, proposed_log_index);
+             assert!(leader_next_index == leader_match_index + 1, "Leader next_index for follower {} ({}) should be match_index + 1 ({})", id.id, leader_next_index, leader_match_index + 1);
+         }
+         println!("Log replication and commit test passed.");
     }
 } 

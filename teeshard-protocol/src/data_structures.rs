@@ -1,5 +1,7 @@
 use std::hash::{Hash, Hasher};
 use std::collections::HashSet;
+// Import the PublicKey type
+use crate::tee_logic::crypto_sim::PublicKey; // VerifyingKey re-exported as PublicKey
 
 // Represent a user account on some chain
 #[derive(Clone, Debug, Eq)]
@@ -77,16 +79,36 @@ pub struct GraphEdge {
 }
 
 // Represents a TEE Node Identity
-// Could include public key, attestation details, etc. later
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+// Now using a real cryptographic public key type
+#[derive(Clone, Debug)] // Remove Eq, Hash temporarily
 pub struct TEEIdentity {
     pub id: usize, // Simple numeric ID for now
-    pub public_key: Vec<u8>, // Placeholder for cryptographic key material
+    // pub public_key: Vec<u8>, // Placeholder for cryptographic key material
+    pub public_key: PublicKey,
+}
+
+// Implement PartialEq manually because PublicKey doesn't derive Eq fully (uses constant time eq)
+impl PartialEq for TEEIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.public_key == other.public_key
+    }
+}
+
+// Implement Eq manually
+impl Eq for TEEIdentity {}
+
+// Implement Hash manually using the public key bytes
+impl Hash for TEEIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.public_key.as_bytes().hash(state);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*; // Import items from the parent module (data_structures)
+    use crate::tee_logic::crypto_sim::generate_keypair;
 
     #[test]
     fn account_id_equality_and_hash() {
@@ -190,21 +212,27 @@ mod tests {
 
     #[test]
     fn tee_identity_creation() {
-        let tee1 = TEEIdentity { id: 1, public_key: vec![1, 2, 3] };
-        let tee2 = TEEIdentity { id: 1, public_key: vec![1, 2, 3] };
-        let tee3 = TEEIdentity { id: 2, public_key: vec![4, 5, 6] };
+        let keypair1 = generate_keypair();
+        let keypair2 = generate_keypair();
+        let tee1 = TEEIdentity { id: 1, public_key: keypair1.verifying_key() };
+        let tee2 = TEEIdentity { id: 1, public_key: keypair1.verifying_key() }; // Same ID and Key
+        let tee3 = TEEIdentity { id: 2, public_key: keypair2.verifying_key() }; // Different ID and Key
+        let tee4 = TEEIdentity { id: 1, public_key: keypair2.verifying_key() }; // Same ID, different Key
 
         assert_eq!(tee1, tee2);
         assert_ne!(tee1, tee3);
+        assert_ne!(tee1, tee4);
         assert_eq!(tee1.id, 1);
-        assert_eq!(tee3.public_key, vec![4, 5, 6]);
+        assert_eq!(tee3.public_key.as_bytes(), keypair2.verifying_key().as_bytes());
 
         let mut set = HashSet::new();
         set.insert(tee1.clone());
         set.insert(tee2.clone()); // Dupe
         set.insert(tee3.clone());
-        assert_eq!(set.len(), 2);
+        set.insert(tee4.clone()); // Different key, should be added
+        assert_eq!(set.len(), 3);
         assert!(set.contains(&tee1));
         assert!(set.contains(&tee3));
+        assert!(set.contains(&tee4));
     }
 } 

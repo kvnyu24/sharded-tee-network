@@ -1,6 +1,7 @@
 use crate::config::SystemConfig;
 use crate::data_structures::{AccountId, Transaction, GraphNode, GraphEdge, TEEIdentity, TxType};
 use std::collections::{HashMap, HashSet};
+use crate::tee_logic::crypto_sim::generate_keypair;
 
 // Represents the mapping from AccountId to shard ID
 pub type PartitionMapping = HashMap<AccountId, usize>;
@@ -281,7 +282,10 @@ mod tests {
     }
 
     fn create_test_tees(count: usize) -> Vec<TEEIdentity> {
-        (0..count).map(|i| TEEIdentity { id: i, public_key: vec![i as u8] }).collect()
+        (0..count).map(|i| {
+            let keypair = generate_keypair();
+            TEEIdentity { id: i, public_key: keypair.verifying_key() }
+        }).collect()
     }
 
     fn create_test_account(chain_id: u64, addr_id: usize) -> AccountId {
@@ -425,7 +429,8 @@ mod tests {
     // ... (rest of existing tests: shard_partition_creation, shard_manager_new, assign_tee_nodes_*) ...
      #[test]
     fn shard_partition_creation() {
-        let tee1 = TEEIdentity { id: 1, public_key: vec![1] };
+        let keypair1 = generate_keypair();
+        let tee1 = TEEIdentity { id: 1, public_key: keypair1.verifying_key() };
         let acc1 = create_test_account(1, 1);
         let acc2 = create_test_account(1, 2);
         let mut accounts = HashSet::new();

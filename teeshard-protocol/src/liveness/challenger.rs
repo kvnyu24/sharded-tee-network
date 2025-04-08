@@ -3,6 +3,7 @@
 use crate::data_structures::TEEIdentity;
 use crate::liveness::types::{Nonce, NonceChallenge};
 use rand::Rng;
+use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
 
 // Represents a TEE node acting as a challenger
 pub struct Challenger {
@@ -36,7 +37,9 @@ mod tests {
     use super::*;
 
     fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8] }
+        // Create TEEIdentity with usize ID and a real public key
+        let keypair = generate_keypair();
+        TEEIdentity { id, public_key: keypair.verifying_key() }
     }
 
     #[test]

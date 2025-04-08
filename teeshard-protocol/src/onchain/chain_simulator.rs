@@ -126,6 +126,9 @@ impl ChainSimulator {
 mod tests {
     use super::*;
     use crate::tee_logic::Signature;
+    // Import crypto helpers
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
 
     fn create_test_account(chain_id: u64, addr: &str) -> AccountId {
         AccountId { chain_id, address: addr.to_string() }
@@ -189,7 +192,12 @@ mod tests {
             account: acc1.clone(),
             asset: asset1.clone(),
             amount: 100,
-            tee_signature: Signature(vec![]), // Dummy sig
+            // tee_signature: Signature(vec![]), // Dummy sig // Old
+            // Create a valid dummy signature
+            tee_signature: {
+                 let key = SigningKey::generate(&mut OsRng);
+                 key.sign(b"dummy release data")
+            },
          };
          sim.apply_escrow_call(release_call.clone());
          sim.finalize_next_block(); // Mined in block 4

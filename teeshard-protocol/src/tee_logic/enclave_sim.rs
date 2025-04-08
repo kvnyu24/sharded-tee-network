@@ -1,91 +1,119 @@
-// Placeholder for TEE Enclave Simulation logic
+// TEE Enclave Simulation logic
 
 use crate::data_structures::TEEIdentity;
 use crate::tee_logic::types::{AttestationReport, Signature};
+// Import the new PartialSignature struct
+use crate::tee_logic::threshold_sig::PartialSignature;
+// Import the crypto sim components we need
+use crate::tee_logic::crypto_sim::{self, SecretKey, PublicKey, generate_keypair};
 
 // Simulate a TEE enclave environment
+#[derive(Debug)]
 pub struct EnclaveSim {
     pub identity: TEEIdentity,
-    // Simulate internal state, keys, etc.
+    // Use a real Ed25519 keypair for the enclave
+    keypair: SecretKey,
 }
 
 impl EnclaveSim {
-    pub fn new(identity: TEEIdentity) -> Self {
-        EnclaveSim { identity }
+    pub fn new(id: usize) -> Self {
+        // Generate a real keypair for this enclave
+        let keypair = generate_keypair();
+        let public_key = keypair.verifying_key();
+        let identity = TEEIdentity { id, public_key };
+        EnclaveSim { identity, keypair }
     }
 
     // Simulate generating a remote attestation report containing the nonce
     pub fn generate_remote_attestation(&self, nonce: &[u8]) -> AttestationReport {
         println!("EnclaveSim ({}): Generating attestation for nonce {:?}", self.identity.id, nonce);
-        // In reality, this involves complex interaction with TEE hardware/runtime
-        // For simulation, create a dummy report
+        // Simulates the TEE creating a report containing the nonce and its identity (public key),
+        // signed using its attestation key (simulated here by the enclave's main keypair).
+        // Real attestation involves complex interaction with TEE hardware/runtime.
         let mut report_data = Vec::new();
         report_data.extend_from_slice(nonce);
-        report_data.extend_from_slice(&self.identity.public_key);
-        // Dummy signature using the nonce itself (replace with actual crypto)
-        let signature_data = report_data.iter().map(|&x| x.wrapping_add(1)).collect();
+        report_data.extend_from_slice(self.identity.public_key.as_bytes());
+        // Sign the report data with the enclave's key
+        let signature = crypto_sim::sign(&report_data, &self.keypair);
 
         AttestationReport {
             report_data,
-            signature: Signature(signature_data),
+            signature,
         }
     }
 
-    // Simulate threshold signing (placeholder)
-    pub fn sign_threshold(&self, msg: &[u8]) -> Signature {
-         println!("EnclaveSim ({}): Performing threshold sign on msg {:?}", self.identity.id, msg);
-        // Dummy signature
-        Signature(msg.iter().map(|&x| x.wrapping_add(self.identity.id as u8)).collect())
-    }
+    /// Generates a partial signature share for the given message.
+    pub fn generate_partial_signature(&self, message: &[u8]) -> PartialSignature {
+         println!("EnclaveSim ({}): Generating partial signature for msg {:?}", self.identity.id, message);
+         // Simulates the TEE using its threshold secret key share to sign the message.
+         // Since we aren't implementing DKG/TSS, we use the enclave's main keypair for this.
+         // In a real TSS, this would use a share derived from a group key.
+         let signature_data = crypto_sim::sign(message, &self.keypair);
 
-    // Simulate threshold verification (placeholder)
-    pub fn verify_threshold(&self, _msg: &[u8], _sigs: &[Signature], _threshold: usize) -> bool {
-        println!("EnclaveSim ({}): Verifying threshold signature (placeholder)", self.identity.id);
-        // Always return true for now
-        true
+         PartialSignature {
+             signer_id: self.identity.clone(),
+             // Store the actual Ed25519 signature
+             signature_data,
+         }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tee_logic::crypto_sim::{verify, PublicKey};
 
-    fn create_test_tee(id: usize) -> TEEIdentity {
-        TEEIdentity { id, public_key: vec![id as u8, (id + 1) as u8] }
+    // Helper to create EnclaveSim for testing
+    fn create_test_enclave(id: usize) -> EnclaveSim {
+        EnclaveSim::new(id)
     }
 
     #[test]
-    fn enclave_sim_creation() {
-        let tee_id = create_test_tee(5);
-        let sim = EnclaveSim::new(tee_id.clone());
-        assert_eq!(sim.identity, tee_id);
+    fn enclave_sim_creation_with_key() {
+        let sim = create_test_enclave(5);
+        assert_eq!(sim.identity.id, 5);
+        // Check that the public key in identity matches the keypair
+        assert_eq!(sim.identity.public_key, sim.keypair.verifying_key());
     }
 
     #[test]
     fn enclave_sim_attestation() {
-        let tee_id = create_test_tee(2);
-        let sim = EnclaveSim::new(tee_id.clone());
+        let sim = create_test_enclave(2);
         let nonce = vec![100, 101, 102];
         let report = sim.generate_remote_attestation(&nonce);
 
-        // Check if nonce and pubkey are in report data (simple check)
+        // Check if nonce and pubkey bytes are in report data (simple check)
         assert!(report.report_data.windows(nonce.len()).any(|w| w == nonce));
-        assert!(report.report_data.windows(tee_id.public_key.len()).any(|w| w == tee_id.public_key));
-        // Check dummy signature logic
-        let expected_sig_data: Vec<u8> = report.report_data.iter().map(|&x| x.wrapping_add(1)).collect();
-        assert_eq!(report.signature.0, expected_sig_data);
+        let pk_bytes = sim.identity.public_key.as_bytes();
+        assert!(report.report_data.windows(pk_bytes.len()).any(|w| w == pk_bytes));
+
+        // Verify the signature using the enclave's public key
+        assert!(verify(&report.report_data, &report.signature, &sim.identity.public_key));
     }
 
      #[test]
-    fn enclave_sim_sign_verify_placeholder() {
-        let tee_id = create_test_tee(3);
-        let sim = EnclaveSim::new(tee_id.clone());
-        let msg = b"hello threshold";
-        let sig = sim.sign_threshold(msg);
-        let expected_sig: Vec<u8> = msg.iter().map(|&x| x.wrapping_add(3)).collect();
-        assert_eq!(sig.0, expected_sig);
+    fn enclave_sim_generate_partial_sig() {
+        let sim = create_test_enclave(3);
+        let msg = b"message for partial sig";
 
-        // Verification is just a placeholder
-        assert!(sim.verify_threshold(msg, &[sig], 1));
+        let partial_sig = sim.generate_partial_signature(msg);
+
+        assert_eq!(partial_sig.signer_id, sim.identity);
+
+        // Verify the signature using the enclave's public key
+        assert!(verify(msg, &partial_sig.signature_data, &sim.identity.public_key));
+    }
+
+    #[test]
+    fn enclave_sim_partial_sig_verify_fail_wrong_key() {
+        let sim1 = create_test_enclave(10);
+        let sim2 = create_test_enclave(11); // Different enclave with different key
+        let msg = b"another message";
+
+        // Sign with sim1's key
+        let partial_sig = sim1.generate_partial_signature(msg);
+
+        // Try to verify with sim2's public key (should fail)
+        assert!(!verify(msg, &partial_sig.signature_data, &sim2.identity.public_key));
     }
 } 
