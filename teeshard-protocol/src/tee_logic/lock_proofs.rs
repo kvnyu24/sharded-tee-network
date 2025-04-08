@@ -44,20 +44,8 @@ pub fn verify_lock_proof(proof: &LockProof) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_structures::{AccountId, AssetId};
-
-    // We need a dummy LockProof definition accessible here if it's in another module
-    // Re-declaring temporarily for the test to compile.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct TempLockProof {
-        pub tx_id: String,
-        pub shard_id: usize,
-        pub lock_info: LockInfo,
-        pub attestation_or_sig: Vec<u8>,
-    }
-    // Alias LockProof to TempLockProof for the test functions
-    use TempLockProof as LockProof;
-
+    use crate::data_structures::{AccountId, AssetId, LockInfo, TEEIdentity};
+    use crate::cross_chain::types::LockProof;
 
     fn create_test_lock_info() -> LockInfo {
         LockInfo {

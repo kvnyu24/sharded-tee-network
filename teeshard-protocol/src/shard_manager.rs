@@ -76,15 +76,18 @@ impl ShardManager {
                  all_available_tees.len(), self.config.nodes_per_shard);
         // TODO: Implement TEE assignment logic (Algorithm 1, lines 70-73)
         // Basic round-robin or load-based assignment
-        let mut tee_iter = all_available_tees.iter().cycle();
+        // Use a non-cycling iterator to avoid over-assigning
+        let mut tee_iter = all_available_tees.iter();
         for partition in self.partitions.iter_mut() {
             partition.tee_nodes.clear();
             for _ in 0..self.config.nodes_per_shard {
                 if let Some(tee) = tee_iter.next() {
                     partition.tee_nodes.push(tee.clone());
                 } else {
-                    eprintln!("Warning: Not enough TEE nodes available to assign {} per shard.", self.config.nodes_per_shard);
-                    break;
+                    eprintln!("Warning: Ran out of TEE nodes while assigning {} per shard.", self.config.nodes_per_shard);
+                    // Stop assigning to this partition and move to the next
+                    // (or potentially break the outer loop if desired)
+                    break; // Stop assigning to this specific partition
                 }
             }
         }
@@ -100,7 +103,6 @@ impl ShardManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_structures::TxType;
 
     fn create_test_config() -> SystemConfig {
         SystemConfig::default()

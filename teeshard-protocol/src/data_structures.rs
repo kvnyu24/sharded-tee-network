@@ -87,7 +87,6 @@ pub struct TEEIdentity {
 #[cfg(test)]
 mod tests {
     use super::*; // Import items from the parent module (data_structures)
-    use std::collections::HashSet;
 
     #[test]
     fn account_id_equality_and_hash() {

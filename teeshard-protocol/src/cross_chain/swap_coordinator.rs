@@ -2,7 +2,6 @@
 
 use crate::data_structures::{TEEIdentity, Transaction};
 use crate::cross_chain::types::{LockProof, SwapOutcome, AbortReason};
-use crate::tee_logic::Signature;
 use crate::config::SystemConfig;
 use std::collections::{HashMap, HashSet};
 

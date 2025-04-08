@@ -115,7 +115,7 @@ mod tests {
         let sim2 = EnclaveSim::new(tee2.clone());
         let nonce2: Nonce = 222;
         let report2 = sim2.generate_remote_attestation(&nonce2.to_ne_bytes());
-        let mut resp2_bad_nonce = AttestationResponse {
+        let resp2_bad_nonce = AttestationResponse {
             responding_tee: tee2.clone(),
             nonce: 999, // Incorrect nonce
             report: report2.clone(),

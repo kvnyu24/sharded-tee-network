@@ -1,7 +1,6 @@
 // Define types related to Cross-Chain Swap Execution (Algorithm 2)
 
 use crate::data_structures::LockInfo;
-use crate::tee_logic::Signature; // Re-use signature type
 
 // Represents a proof from a shard that a resource has been locked
 #[derive(Clone, Debug, PartialEq, Eq)]

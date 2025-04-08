@@ -61,7 +61,7 @@ impl ChainSimulator {
 
         // Process calls added in blocks that are now final
         let (finalized_now, still_pending): (Vec<_>, Vec<_>) = self.pending_calls.drain(..)
-            .partition(|(block_added, _call)| *block_added <= finalized_block_cutoff);
+            .partition(|(block_added, _call)| *block_added < finalized_block_cutoff);
 
         for (_block_added, call) in finalized_now {
             println!("ChainSim {}: Finalizing call in block {}: {:?}",
