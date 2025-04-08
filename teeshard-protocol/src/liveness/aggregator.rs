@@ -85,9 +85,10 @@ impl Aggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tee_logic::types::{Signature, AttestationReport};
+    use crate::tee_logic::types::{AttestationReport};
     use crate::tee_logic::enclave_sim::EnclaveSim; // Need this to generate valid responses
-    use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+    // Add missing imports
+    use crate::tee_logic::crypto_sim::{SecretKey, generate_keypair};
 
     // Update test helper
     fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {

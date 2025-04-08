@@ -6,9 +6,8 @@ use crate::config::SystemConfig;
 // Use the actual Signature type
 use crate::tee_logic::types::Signature;
 // Import threshold sig components
-use crate::tee_logic::threshold_sig::{PartialSignature, ThresholdAggregator};
 // Import crypto components
-use crate::tee_logic::crypto_sim::{PublicKey, SecretKey, sign, verify, generate_keypair};
+use crate::tee_logic::crypto_sim::{sign, generate_keypair};
 
 use std::collections::{HashMap, HashSet};
 

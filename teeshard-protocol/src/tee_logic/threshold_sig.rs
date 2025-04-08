@@ -3,9 +3,9 @@
 use crate::data_structures::TEEIdentity;
 // Use the real Signature type
 use crate::tee_logic::types::Signature;
-use std::collections::{HashMap, BTreeMap}; // Use BTreeMap for deterministic iteration
+use std::collections::BTreeMap; // Use BTreeMap for deterministic iteration
 // Import crypto sim components
-use crate::tee_logic::crypto_sim::{self, PublicKey, verify};
+use crate::tee_logic::crypto_sim::{PublicKey, verify};
 
 // Represents a signature share from a single TEE
 #[derive(Clone, Debug, PartialEq, Eq)]

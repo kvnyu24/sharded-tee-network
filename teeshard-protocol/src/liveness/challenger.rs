@@ -3,7 +3,8 @@
 use crate::data_structures::TEEIdentity;
 use crate::liveness::types::{Nonce, NonceChallenge};
 use rand::Rng;
-use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+use crate::tee_logic::crypto_sim::generate_keypair;
+ // Import key generation
 
 // Represents a TEE node acting as a challenger
 pub struct Challenger {

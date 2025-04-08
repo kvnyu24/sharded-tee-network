@@ -5,7 +5,8 @@ use crate::liveness::types::{NonceChallenge, AttestationResponse};
 use crate::cross_chain::types::LockProof;
 use crate::tee_logic::Signature;
 use crate::data_structures::TEEIdentity;
-use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+use crate::tee_logic::crypto_sim::generate_keypair;
+ // Import key generation
 
 // Represents messages exchanged between TEE nodes or with external entities
 #[derive(Clone, Debug)] // PartialEq might be tricky with all variants

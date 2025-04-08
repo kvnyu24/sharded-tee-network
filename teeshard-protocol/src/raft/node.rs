@@ -7,9 +7,9 @@ use crate::raft::messages::*;
 use crate::raft::state::{Command, LogEntry, RaftNodeState, RaftRole};
 use crate::data_structures::TEEIdentity;
 use crate::config::SystemConfig;
-use crate::raft::storage::{RaftStorage, InMemoryStorage}; // Add InMemoryStorage for test
+use crate::raft::storage::RaftStorage; // Add InMemoryStorage for test
 use crate::tee_logic::enclave_sim::EnclaveSim;
-use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+ // Import key generation
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use rand::Rng;
@@ -229,7 +229,7 @@ impl RaftNode {
     // Algorithm 3, HandleRequestVote RPC
     fn handle_request_vote(&mut self, candidate_id: TEEIdentity, args: RequestVoteArgs) -> Vec<RaftEvent> {
         let mut vote_granted = false;
-        let mut persist_term = false;
+        let _persist_term = false; // Prefix unused variable
         let mut persist_vote = false;
 
         if args.term < self.state.current_term {
@@ -237,7 +237,7 @@ impl RaftNode {
         } else {
             if args.term > self.state.current_term {
                 println!("Node {}: Received RequestVote from {} with higher term ({} > {}). Becoming follower.", self.state.id.id, candidate_id.id, args.term, self.state.current_term);
-                let old_term = self.state.current_term;
+                let _old_term = self.state.current_term; // Prefix unused variable
                 self.become_follower(args.term);
                 // Persist needed only if term actually changed (handled in become_follower)
                 // persist_term = term > old_term;
@@ -599,7 +599,7 @@ mod tests {
     // Helper function to deliver messages between nodes
     // Use TEEIdentity
     fn deliver_messages(
-        nodes: &mut HashMap<TEEIdentity, Arc<Mutex<RaftNode>>>, // Use TEEIdentity
+        _nodes: &mut HashMap<TEEIdentity, Arc<Mutex<RaftNode>>>, // Prefix unused variable
         messages: Vec<(TEEIdentity, TEEIdentity, RaftMessage)>, // (sender, recipient, message)
         network: &mut HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>>, // Queue stores (sender, message)
     ) {

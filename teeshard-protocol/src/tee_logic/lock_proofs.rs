@@ -3,8 +3,7 @@
 use crate::data_structures::{LockInfo, TEEIdentity};
 use crate::cross_chain::types::LockProof; // Assuming LockProof is defined here
 // Import crypto sim components
-use crate::tee_logic::crypto_sim::{self, sign, verify};
-use crate::tee_logic::types::Signature;
+use crate::tee_logic::crypto_sim::{sign, verify};
 
 // Function to generate a lock proof (placeholder)
 pub fn generate_lock_proof(

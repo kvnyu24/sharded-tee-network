@@ -1,8 +1,8 @@
 // Placeholder for Raft persistent storage logic
 
-use crate::raft::state::{Command, LogEntry};
+use crate::raft::state::{LogEntry};
 use crate::data_structures::TEEIdentity;
-use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+ // Import key generation
 
 // Trait defining the storage interface RaftNode expects
 pub trait RaftStorage {
@@ -123,6 +123,7 @@ impl RaftStorage for InMemoryStorage {
 mod tests {
     use super::*;
     use crate::raft::state::Command;
+    use crate::tee_logic::crypto_sim::generate_keypair;
 
      fn create_test_tee(id: usize) -> TEEIdentity {
         // Create TEEIdentity with usize ID and a real public key

@@ -1,11 +1,11 @@
 // TEE Enclave Simulation logic
 
 use crate::data_structures::TEEIdentity;
-use crate::tee_logic::types::{AttestationReport, Signature};
+use crate::tee_logic::types::AttestationReport;
 // Import the new PartialSignature struct
 use crate::tee_logic::threshold_sig::PartialSignature;
 // Import the crypto sim components we need
-use crate::tee_logic::crypto_sim::{self, SecretKey, PublicKey, generate_keypair};
+use crate::tee_logic::crypto_sim::{self, SecretKey, generate_keypair};
 
 // Simulate a TEE enclave environment
 #[derive(Debug)]

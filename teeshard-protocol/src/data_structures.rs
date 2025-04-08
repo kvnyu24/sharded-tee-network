@@ -1,7 +1,8 @@
 use std::hash::{Hash, Hasher};
-use std::collections::HashSet;
 // Import the PublicKey type
 use crate::tee_logic::crypto_sim::PublicKey; // VerifyingKey re-exported as PublicKey
+// Import HashSet which was removed by cargo fix
+use std::collections::HashSet;
 
 // Represent a user account on some chain
 #[derive(Clone, Debug, Eq)]

@@ -2,7 +2,7 @@
 
 use crate::data_structures::TEEIdentity;
 use std::collections::HashMap;
-use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+use crate::tee_logic::crypto_sim::generate_keypair;
 
 // Represents the role of a Raft node
 #[derive(Clone, Debug, PartialEq, Eq, Copy)] // Copy for simple state transitions
