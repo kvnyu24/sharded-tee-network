@@ -78,6 +78,28 @@ pub mod mock_network {
         pub fn get_sent_messages(&self) -> Vec<NetworkMessage> {
             self.sent_messages.lock().unwrap().clone()
         }
+
+        /// Retrieves and removes messages destined for a specific recipient.
+        pub fn retrieve_messages_for(&self, recipient_id: &TEEIdentity) -> Vec<NetworkMessage> {
+            let mut messages = self.sent_messages.lock().unwrap();
+            let mut recipient_messages = Vec::new();
+
+            // Use Vec::retain which is efficient for removing multiple items.
+            // It keeps elements for which the closure returns true.
+            messages.retain(|msg| {
+                if &msg.receiver == recipient_id {
+                    // It's for our recipient. Clone it for the result...
+                    recipient_messages.push(msg.clone());
+                    // ...and return false to remove it from the main Vec.
+                    false
+                } else {
+                    // It's for someone else, keep it.
+                    true
+                }
+            });
+
+            recipient_messages
+        }
     }
 }
 

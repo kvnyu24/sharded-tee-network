@@ -16,6 +16,7 @@ use crate::network::{NetworkInterface, NetworkMessage, Message}; // Import netwo
 use std::collections::{HashMap, HashSet};
 use std::time::Duration; // For timeout
 use std::sync::Arc; // Import Arc
+use std::sync::Mutex;
 
 // Represents the state of a coordinator TEE managing a swap
 pub struct CrossChainCoordinator {
@@ -485,8 +486,7 @@ impl CrossChainCoordinator {
         finalized_decisions
     }
 
-    // --- Placeholder Helper Functions for Network Integration ---
-    // TODO: Replace with actual logic using config or service discovery
+    // --- Helper Functions for Network Integration ---
 
     /// Returns TEE identities responsible for a given shard using the stored assignment map.
     fn get_tee_identities_for_shard(&self, shard_id: usize) -> Vec<TEEIdentity> {
@@ -507,7 +507,7 @@ impl CrossChainCoordinator {
             .cloned()
             .collect()
     }
-    // --- End Placeholder Helper Functions ---
+    // --- End Helper Functions ---
 }
 
 #[cfg(test)]
@@ -860,15 +860,8 @@ mod tests {
          let swap_state = coordinator.active_swaps.get("swap3").unwrap();
          assert!(matches!(swap_state.status, SwapStatus::Aborted(AbortReason::LockProofVerificationFailed)), "Swap status should be Aborted");
 
-         // TODO: Optionally add a separate test case to verify that signing the ABORT decision
-         // can be finalized later if needed, after handle_lock_proof returned Err.
-         /* Example for separate test:
-         // After the above checks...
-         assert!(coordinator.add_local_signature_share("swap3", false).is_ok());
-         let decision_opt = coordinator.finalize_decision("swap3", false);
-         assert!(decision_opt.is_some());
-         assert!(!decision_opt.unwrap().commit);
-         */
+         // The ABORT signing flow is tested implicitly via process_proof_and_finalize_abort
+         // and check_timeouts tests.
 
      }
 
@@ -1025,6 +1018,158 @@ mod tests {
 
        // Swap should be removed from active list after finalization
        assert!(!coordinator.active_swaps.contains_key("swap_timeout"));
+    }
+
+    // Helper function for the dispatcher logic in multi-coordinator tests
+    fn dispatch_messages(
+        coordinators: &HashMap<TEEIdentity, Arc<Mutex<CrossChainCoordinator>>>,
+        shared_mock_network: &Arc<MockNetwork> // Use concrete MockNetwork to call retrieve
+    ) {
+        for (coord_id, coord_arc) in coordinators {
+            // Retrieve messages specifically for this coordinator from the mock network
+            let messages = shared_mock_network.retrieve_messages_for(coord_id);
+            if !messages.is_empty() {
+                // Lock the specific coordinator to process its messages
+                let mut coordinator = coord_arc.lock().unwrap();
+                for network_msg in messages {
+                     println!(" Dispatcher: Routing {:?} to {}", network_msg.message, coord_id.id);
+                     match network_msg.message {
+                         Message::CoordPartialSig { tx_id, commit, signature } => {
+                             // Call the handler on the coordinator instance
+                            if let Err(e) = coordinator.handle_partial_signature(signature, &tx_id, commit) {
+                                 eprintln!("   -> Dispatch Error handling PartialSig for {}: {}", coord_id.id, e);
+                             }
+                         }
+                         // Coordinators shouldn't receive lock requests directly in this model
+                         _ => eprintln!("   -> Dispatch Error: Unexpected msg type {:?} for coordinator {}", network_msg.message, coord_id.id),
+                     }
+                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_coordinator_signing() {
+        // 1. Setup - Identities & Config
+        let (coord100_id, coord100_key) = create_test_tee(100);
+        let (coord101_id, coord101_key) = create_test_tee(101);
+        let (coord102_id, coord102_key) = create_test_tee(102);
+        let coordinator_identities = vec![coord100_id.clone(), coord101_id.clone(), coord102_id.clone()];
+
+        // Use a config with threshold 2 for this test
+        let mut config = SystemConfig::default();
+        config.coordinator_identities = coordinator_identities.clone();
+        config.coordinator_threshold = 2;
+        config.nodes_per_shard = 2; // Keep consistent
+
+        let shard_assignments = HashMap::new(); // Keep simple, no lock requests needed here
+        let mock_network = Arc::new(MockNetwork::default());
+
+        // 2. Create Coordinators
+        let mut coordinators = HashMap::new();
+        coordinators.insert(coord100_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(
+            coord100_id.clone(), coord100_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, shard_assignments.clone()
+        ))));
+        coordinators.insert(coord101_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(
+            coord101_id.clone(), coord101_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, shard_assignments.clone()
+        ))));
+        coordinators.insert(coord102_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(
+            coord102_id.clone(), coord102_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, shard_assignments.clone()
+        ))));
+
+        // 3. Initiate Swap & Add First Signature
+        let tx_id = "multi_swap";
+        let tx = create_dummy_swap_tx(tx_id);
+        {
+            let mut coord100 = coordinators.get(&coord100_id).unwrap().lock().unwrap();
+            coord100.initiate_swap(tx, HashSet::new()); // Initiate (ignore LockRequests for this test)
+            coord100.add_local_signature_share(tx_id, true).expect("Coord 100 failed to add share");
+        } // Release lock
+
+        // **Crucial Fix**: Ensure all coordinators know about the swap *before* processing signatures
+        let initial_swap_state_template = { // Get structure from initiator
+             let coord100 = coordinators.get(&coord100_id).unwrap().lock().unwrap();
+             coord100.active_swaps.get(tx_id).expect("Swap should exist in initiator").clone()
+         };
+        for i in 1..coordinator_identities.len() { // Iterate over 101, 102
+            let coord_id = &coordinator_identities[i];
+            let coord_mutex = coordinators.get(coord_id).unwrap();
+            let mut coordinator = coord_mutex.lock().unwrap();
+
+            // Create the swap state if it doesn't exist
+            if !coordinator.active_swaps.contains_key(tx_id) {
+                 println!("Coordinator [{}]: Manually adding initial state for swap {}", coord_id.id, tx_id);
+                 let mut new_state = initial_swap_state_template.clone(); // Clone basic structure
+
+                 // Explicitly create new, empty aggregators with correct context
+                 use crate::tee_logic::crypto_sim::PublicKey; // For PublicKey type
+                 use std::collections::HashSet; // For HashSet type
+                 let all_coordinator_pks: HashSet<PublicKey> = config.coordinator_identities.iter()
+                                                                    .map(|id| id.public_key)
+                                                                    .collect();
+
+                 new_state.release_aggregator = Some(ThresholdAggregator::new(
+                     &CrossChainCoordinator::prepare_decision_message(tx_id, true),
+                     config.coordinator_threshold,
+                 ));
+                 new_state.abort_aggregator = Some(ThresholdAggregator::new(
+                     &CrossChainCoordinator::prepare_decision_message(tx_id, false),
+                     config.coordinator_threshold,
+                 ));
+
+                 coordinator.active_swaps.insert(tx_id.to_string(), new_state);
+            }
+        }
+
+        // 4. Simulate Dispatcher - Round 1
+        // Coord 100 sent its share to 101 and 102
+        println!("--- Dispatcher Round 1 ---");
+        dispatch_messages(&coordinators, &mock_network);
+
+        // 5. Add Second Signature
+        {
+            let mut coord101 = coordinators.get(&coord101_id).unwrap().lock().unwrap();
+            // It received 100's share. Now add its own.
+            assert!(coord101.active_swaps.contains_key(tx_id));
+            let release_agg = coord101.active_swaps[tx_id].release_aggregator.as_ref().expect("Aggregator missing");
+            assert_eq!(release_agg.signature_count(), 1, "Coord 101 should have 1 sig after dispatch");
+            coord101.add_local_signature_share(tx_id, true).expect("Coord 101 failed to add share");
+            // It should now have 2 signatures and reach threshold
+             let release_agg_after = coord101.active_swaps[tx_id].release_aggregator.as_ref().expect("Aggregator missing");
+             assert_eq!(release_agg_after.signature_count(), 2, "Coord 101 should have 2 sigs after adding its own");
+             assert!(release_agg_after.has_reached_threshold(), "Coord 101 aggregator should have reached threshold");
+        } // Release lock
+
+        // 6. Simulate Dispatcher - Round 2
+        // Coord 101 sent its share to 100 and 102
+        println!("--- Dispatcher Round 2 ---");
+        dispatch_messages(&coordinators, &mock_network);
+
+
+        // 7. Finalize and Verify
+        // Check Coord 100 (Received 101's sig, now has 2)
+        {
+            let coord100 = coordinators.get(&coord100_id).unwrap().lock().unwrap();
+            let decision100 = coord100.finalize_decision(tx_id, true);
+            assert!(decision100.is_some(), "Coord 100 failed to finalize");
+            assert_eq!(decision100.as_ref().unwrap().signature.len(), 2, "Coord 100 final sig count mismatch"); // Threshold is 2
+        }
+        // Check Coord 101 (Added its own, has 2)
+        {
+            let coord101 = coordinators.get(&coord101_id).unwrap().lock().unwrap();
+             let decision101 = coord101.finalize_decision(tx_id, true);
+            assert!(decision101.is_some(), "Coord 101 failed to finalize");
+             assert_eq!(decision101.as_ref().unwrap().signature.len(), 2, "Coord 101 final sig count mismatch");
+        }
+         // Check Coord 102 (Received 100's and 101's sigs, has 2)
+        {
+             let coord102 = coordinators.get(&coord102_id).unwrap().lock().unwrap();
+             let release_agg = coord102.active_swaps[tx_id].release_aggregator.as_ref().expect("Aggregator missing");
+             assert_eq!(release_agg.signature_count(), 2, "Coord 102 should have 2 sigs after dispatch");
+             let decision102 = coord102.finalize_decision(tx_id, true);
+             assert!(decision102.is_some(), "Coord 102 failed to finalize");
+             assert_eq!(decision102.as_ref().unwrap().signature.len(), 2, "Coord 102 final sig count mismatch");
+        }
     }
 
 } // end tests mod 
