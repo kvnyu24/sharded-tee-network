@@ -11,6 +11,16 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+# Foundry/Solidity specific
+/out/
+/cache/
+/broadcast/
+/artifacts/
+/forge-cache/
+/lib/
+*.sol.timestamp
+.env
+
 # IDE specific files
 .idea/
 .vscode/
@@ -20,3 +30,4 @@ Cargo.lock
 # OS specific files
 .DS_Store
 Thumbs.db
+

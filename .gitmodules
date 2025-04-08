@@ -1,0 +1,6 @@
+[submodule "teeshard-protocol/evm-simulation/lib/forge-std"]
+	path = teeshard-protocol/evm-simulation/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "teeshard-protocol/evm-simulation/lib/openzeppelin-contracts"]
+	path = teeshard-protocol/evm-simulation/lib/openzeppelin-contracts
+	url = https://github.com/openzeppelin/openzeppelin-contracts
