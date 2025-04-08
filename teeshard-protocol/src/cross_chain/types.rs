@@ -5,6 +5,8 @@ use crate::data_structures::LockInfo;
 use crate::tee_logic::types::Signature;
 // Import TEEIdentity
 use crate::data_structures::TEEIdentity;
+// Import PublicKey for SignedCoordinatorDecision
+use crate::tee_logic::crypto_sim::PublicKey;
 
 // Represents a proof from a shard that a resource has been locked
 #[derive(Clone, Debug, PartialEq, Eq)] // Signature derives these
@@ -16,8 +18,15 @@ pub struct LockProof {
     pub signer_identity: TEEIdentity,
     // Signature or attestation from the shard's TEE consensus group
     // proving the lock is valid according to their replicated state.
-    // pub attestation_or_sig: Vec<u8>, // Placeholder - could be a Signature struct or complex attestation
     pub attestation_or_sig: Signature, // Use the real signature type
+}
+
+// Request sent from Coordinator to Shard TEEs to lock resources
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockRequest {
+    pub tx_id: String,
+    pub lock_info: LockInfo,
+    // Potentially add coordinator identity or other metadata
 }
 
 // Reasons why a cross-chain swap might be aborted
@@ -37,6 +46,20 @@ pub enum SwapOutcome {
     GlobalAbortComplete(AbortReason), // All shards successfully reverted locks
     ImmediateAbort,             // Aborted early due to validation failure
     InconsistentState(String),  // Should not happen in correct implementation
+}
+
+// Represents the final, signed instruction from the coordinator(s)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignedCoordinatorDecision {
+    pub tx_id: String,
+    pub commit: bool, // true for Release, false for Abort
+    // Placeholder for Threshold Signature:
+    // The final implementation should replace this Vec with a structure representing
+    // a single, combined threshold signature verifiable against the coordinator group's
+    // public key. This might include the signature bytes and potentially metadata
+    // like the threshold level (k) or the set of participating signers.
+    // TODO: Implement a real threshold signature scheme and update this type.
+    pub signature: Vec<(PublicKey, Signature)>,
 }
 
 #[cfg(test)]

@@ -3,6 +3,8 @@ use std::collections::HashMap;
 // Assuming TxType is defined elsewhere, e.g., crate::data_structures::TxType
 // We'll need to make TxType Hashable and Eq later if not already.
 use crate::data_structures::TxType; // Placeholder import
+use crate::data_structures::TEEIdentity; // Added TEEIdentity
+use crate::tee_logic::crypto_sim::generate_keypair; // For default TEE identities
 
 #[derive(Clone, Debug)]
 pub struct SystemConfig {
@@ -39,6 +41,18 @@ pub struct SystemConfig {
 
     // Network Simulation / Assumptions
     pub network_delay_range_ms: (u64, u64), // Min/Max simulated network delay
+
+    // Required number of coordinator signatures for cross-chain decisions (multi-sig)
+    pub coordinator_threshold: usize,
+
+    // List of TEEs designated as coordinators
+    pub coordinator_identities: Vec<TEEIdentity>,
+}
+
+// Helper function to create TEEIdentity for default config
+fn create_default_tee(id: usize) -> TEEIdentity {
+    let keypair = generate_keypair();
+    TEEIdentity { id, public_key: keypair.verifying_key() }
 }
 
 impl Default for SystemConfig {
@@ -80,6 +94,16 @@ impl Default for SystemConfig {
 
             // Network
             network_delay_range_ms: (10, 50),
+
+            // Threshold for coordinator multi-signatures (e.g., 2 out of 3)
+            coordinator_threshold: 2, // Set default to 2 (matches default tee_threshold)
+
+            // Default coordinator identities
+            coordinator_identities: vec![
+                create_default_tee(100),
+                create_default_tee(101),
+                create_default_tee(102),
+            ],
         }
     }
 }
@@ -100,6 +124,9 @@ mod tests {
         assert_eq!(config.edge_weight_config.get(&TxType::CrossChainSwap), Some(&5.0));
         assert_eq!(config.liveness_max_consecutive_fails, 5);
         assert_eq!(config.nodes_per_shard, 3);
+        assert_eq!(config.coordinator_threshold, 2);
+        assert_eq!(config.coordinator_identities.len(), 3);
+        assert_eq!(config.coordinator_identities[0].id, 100);
         // Add more checks for other default fields
     }
 } 

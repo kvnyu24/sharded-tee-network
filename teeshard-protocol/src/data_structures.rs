@@ -49,7 +49,7 @@ pub enum TxType {
 }
 
 // Represent a single transaction
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Transaction {
     pub tx_id: String, // Unique transaction identifier
     pub tx_type: TxType,
@@ -61,6 +61,7 @@ pub struct Transaction {
     pub amounts: Vec<u64>,
     // List of resources that must be locked for this transaction to proceed (esp. for CrossChainSwap)
     pub required_locks: Vec<LockInfo>,
+    pub timeout: std::time::Duration, // Added timeout duration
     // Add other transaction details like timestamps, nonces, etc.
 }
 
@@ -179,6 +180,7 @@ mod tests {
             accounts: vec![acc_a1.clone(), acc_a2.clone(), acc_b1.clone(), acc_b2.clone()],
             amounts: vec![50, 30], // e.g., 50 units from a1->a2, 30 units from b1->b2
             required_locks: vec![lock1.clone(), lock2.clone()],
+            timeout: std::time::Duration::from_secs(0),
         };
 
         assert_eq!(tx_cross.tx_type, TxType::CrossChainSwap);

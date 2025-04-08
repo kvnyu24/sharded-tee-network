@@ -16,7 +16,7 @@ pub struct PartialSignature {
 }
 
 // Aggregates partial signatures to form a final threshold signature
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ThresholdAggregator {
     required_threshold: usize,
     message: Vec<u8>, // Store the message being signed
@@ -61,6 +61,16 @@ impl ThresholdAggregator {
                 partial_sig.signer_id.id, pk_bytes);
         self.verified_signatures.insert(pk_bytes, (partial_sig.signer_id.public_key, partial_sig.signature_data));
         Ok(())
+    }
+
+    /// Returns the number of verified signatures currently held.
+    pub fn signature_count(&self) -> usize {
+        self.verified_signatures.len()
+    }
+
+    /// Returns the required signature threshold.
+    pub fn get_required_threshold(&self) -> usize {
+        self.required_threshold
     }
 
     /// Checks if the threshold has been met.
