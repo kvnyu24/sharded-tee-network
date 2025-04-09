@@ -10,8 +10,8 @@
 use teeshard_protocol::{
     config::SystemConfig,
     cross_chain::{
-        swap_coordinator::{CrossChainCoordinator, SwapStatus},
-        types::{LockProof, AbortReason},
+        swap_coordinator::CrossChainCoordinator,
+        types::LockProof,
     },
     data_structures::{
         AccountId, AssetId, LockInfo, TEEIdentity, Transaction, TxType,
@@ -20,20 +20,19 @@ use teeshard_protocol::{
     network::{NetworkInterface, MockNetwork},
     onchain::{
         evm_relayer::{EvmRelayer, EvmRelayerConfig, ChainConfig},
-        interface::{BlockchainInterface, BlockchainError, SwapId, SignatureBytes, TransactionId},
+        interface::{BlockchainInterface, SwapId},
     },
     // Need crypto primitives for creating valid proofs/signatures
     tee_logic::{
-        crypto_sim::{sign, generate_keypair, SecretKey, PublicKey},
+        crypto_sim::{sign, SecretKey},
         types::Signature,
     },
 };
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     process::{Command as StdCommand, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::Duration,
 };
