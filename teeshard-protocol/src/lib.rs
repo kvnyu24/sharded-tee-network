@@ -13,6 +13,7 @@ pub mod tee_logic;
 pub mod liveness;
 pub mod cross_chain;
 pub mod onchain;
+pub mod simulation;
 
 // Potentially a module for network messages/simulation
 pub mod network;

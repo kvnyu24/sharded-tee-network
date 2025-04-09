@@ -24,8 +24,8 @@ pub struct RaftNode {
     // System configuration
     config: SystemConfig,
     // Persistent Storage Interface
-    // Use Box<dyn Trait> for dynamic dispatch
-    storage: Box<dyn RaftStorage>,
+    // Use Box<dyn Trait> for dynamic dispatch - Add Send + Sync bounds
+    storage: Box<dyn RaftStorage + Send + Sync>,
     // Timers
     election_timeout: Duration,
     last_activity: Instant, // Time of last heartbeat/vote received or granted vote
@@ -68,7 +68,7 @@ pub enum RaftEvent {
 }
 
 impl RaftNode {
-    pub fn new(id: TEEIdentity, peers: Vec<TEEIdentity>, config: SystemConfig, storage: Box<dyn RaftStorage>, enclave: EnclaveSim) -> Self {
+    pub fn new(id: TEEIdentity, peers: Vec<TEEIdentity>, config: SystemConfig, storage: Box<dyn RaftStorage + Send + Sync>, enclave: EnclaveSim) -> Self {
         // Load persistent state using new storage methods
         let current_term = storage.get_term();
         let voted_for = storage.get_voted_for();

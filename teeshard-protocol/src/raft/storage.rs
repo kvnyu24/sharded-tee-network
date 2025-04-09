@@ -2,10 +2,12 @@
 
 use crate::raft::state::LogEntry;
 use crate::data_structures::TEEIdentity;
+use crate::raft::state::Command;
  // Import key generation
 
-// Trait defining the storage interface RaftNode expects
-pub trait RaftStorage {
+/// Trait for Raft persistent storage.
+/// Implementors must be Send + Sync to be used across threads.
+pub trait RaftStorage: Send + Sync {
     // Removed load_state
     // fn load_state(&self) -> RaftNodeState;
 
@@ -35,8 +37,17 @@ pub trait RaftStorage {
 }
 
 // Example in-memory storage (for testing/simulation)
-#[derive(Debug, Clone, Default)]
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone)] // Clone needed if used in multiple places without Arc
 pub struct InMemoryStorage {
+    // Use Arc<Mutex<...>> for interior mutability safe across threads
+    data: Arc<Mutex<InMemoryStorageData>>,
+}
+
+#[derive(Debug, Default)] // Default for easy initialization
+struct InMemoryStorageData {
     current_term: u64,
     voted_for: Option<TEEIdentity>,
     log: Vec<LogEntry>,
@@ -44,7 +55,9 @@ pub struct InMemoryStorage {
 
 impl InMemoryStorage {
     pub fn new() -> Self {
-        Default::default()
+        InMemoryStorage {
+            data: Arc::new(Mutex::new(InMemoryStorageData::default())),
+        }
     }
 }
 
@@ -52,62 +65,62 @@ impl RaftStorage for InMemoryStorage {
     // Removed load_state implementation
 
     fn get_term(&self) -> u64 {
-        self.current_term
+        self.data.lock().unwrap().current_term
     }
 
     fn get_voted_for(&self) -> Option<TEEIdentity> {
-        self.voted_for.clone()
+        self.data.lock().unwrap().voted_for.clone()
     }
 
     fn get_log_entry(&self, index: u64) -> Option<LogEntry> {
-        if index == 0 || (index as usize) > self.log.len() {
+        if index == 0 || (index as usize) > self.data.lock().unwrap().log.len() {
             None
         } else {
-            self.log.get(index as usize - 1).cloned()
+            self.data.lock().unwrap().log.get(index as usize - 1).cloned()
         }
     }
 
     fn get_log_len(&self) -> u64 {
-        self.log.len() as u64
+        self.data.lock().unwrap().log.len() as u64
     }
 
      fn get_last_log_index(&self) -> u64 {
-        self.log.len() as u64 // 1-based index
+        self.data.lock().unwrap().log.len() as u64 // 1-based index
     }
 
     fn get_last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |entry| entry.term)
+        self.data.lock().unwrap().log.last().map_or(0, |entry| entry.term)
     }
 
     fn get_log_entries_from(&self, start_index: u64) -> Vec<LogEntry> {
-        if start_index == 0 || (start_index as usize) > self.log.len() {
+        if start_index == 0 || (start_index as usize) > self.data.lock().unwrap().log.len() {
             vec![]
         } else {
-            self.log[(start_index as usize - 1)..].to_vec()
+            self.data.lock().unwrap().log[(start_index as usize - 1)..].to_vec()
         }
     }
 
     fn save_term(&mut self, term: u64) {
-        self.current_term = term;
+        self.data.lock().unwrap().current_term = term;
         // In a real implementation, write to disk/DB
     }
 
     fn save_voted_for(&mut self, voted_for: Option<&TEEIdentity>) {
-        self.voted_for = voted_for.cloned();
+        self.data.lock().unwrap().voted_for = voted_for.cloned();
         // In a real implementation, write to disk/DB
     }
 
     fn append_log_entries(&mut self, entries: &[LogEntry]) {
-        self.log.extend_from_slice(entries);
+        self.data.lock().unwrap().log.extend_from_slice(entries);
         // In a real implementation, write to disk/DB (fsync recommended)
     }
 
     fn truncate_log(&mut self, from_index: u64) {
         if from_index == 0 {
-             self.log.clear();
-        } else if (from_index as usize) <= self.log.len() {
+             self.data.lock().unwrap().log.clear();
+        } else if (from_index as usize) <= self.data.lock().unwrap().log.len() {
             // from_index is 1-based, truncate needs 0-based length
-             self.log.truncate(from_index as usize - 1);
+             self.data.lock().unwrap().log.truncate(from_index as usize - 1);
         } else {
             // Index out of bounds, do nothing or log error?
             // Raft algorithm implies index might be beyond current log during conflicts,
