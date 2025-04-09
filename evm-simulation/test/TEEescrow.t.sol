@@ -14,17 +14,17 @@ contract TEEescrowTest is Test {
     TEEescrow public escrow;
     DummyERC20 public token;
 
-    address public user1 = makeAddr("user1");
+    address public user1 = vm.addr(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80);
     address public user2 = makeAddr("user2"); // Represents recipient on the other "chain"
 
-    // --- Dummy TEE Committee Setup ---
-    address public committeeMember1 = makeAddr("committee1");
-    address public committeeMember2 = makeAddr("committee2");
-    address public committeeMember3 = makeAddr("committee3");
-    uint256 public committeeMember1Pk = 0x123;
-    uint256 public committeeMember2Pk = 0x456; // Add key for member 2
-    uint256 public committeeMember3Pk = 0x789; // Add key for member 3
-    address[] public committee;
+    // --- Use real Anvil keys --- 
+    address public committeeMember1; // Address derived in setUp
+    address public committeeMember2;
+    address public committeeMember3;
+    uint256 public committeeMember1Pk = 0x59c6995e998f97a5300194dc6916aa8c096e6d7d7f81a78f05791c43177926b8;
+    uint256 public committeeMember2Pk = 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a;
+    uint256 public committeeMember3Pk = 0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6;
+    address[] public committee; // Populated in setUp
     uint256 public threshold = 2;
     // ---
 
@@ -35,13 +35,13 @@ contract TEEescrowTest is Test {
         // Deploy contracts
         token = new DummyERC20("Dummy Token", "DUM", INITIAL_SUPPLY);
 
-        // Set up committee using addresses derived from private keys
-        address derivedAddr1 = vm.addr(committeeMember1Pk);
-        address derivedAddr2 = vm.addr(committeeMember2Pk);
-        address derivedAddr3 = vm.addr(committeeMember3Pk);
-        committee.push(derivedAddr1);
-        committee.push(derivedAddr2);
-        committee.push(derivedAddr3);
+        // Set up committee using addresses derived from real private keys
+        committeeMember1 = vm.addr(committeeMember1Pk);
+        committeeMember2 = vm.addr(committeeMember2Pk);
+        committeeMember3 = vm.addr(committeeMember3Pk);
+        committee.push(committeeMember1);
+        committee.push(committeeMember2);
+        committee.push(committeeMember3);
 
         // Deploy escrow with committee and threshold
         escrow = new TEEescrow(committee, threshold);
@@ -109,7 +109,14 @@ contract TEEescrowTest is Test {
         assertEq(token.balanceOf(user2), 0);
 
         // --- Simulate TEE signing (need threshold=2 signatures) ---
-        bytes32 messageHash = escrow._hashTEEDecisionMessage(swapId, true);
+        bytes32 messageHash = escrow._hashTEEDecisionMessage(
+            swapId, 
+            true, // commit = true for RELEASE
+            address(token), 
+            lockAmountDecimals, 
+            user2, // recipient
+            address(0) // sender N/A for RELEASE
+        );
 
         // Get packed signatures using helper
         bytes memory sig1 = _getPackedSignature(committeeMember1Pk, messageHash);
@@ -120,18 +127,25 @@ contract TEEescrowTest is Test {
         console.log("Combined sigs length (Release Test):", combinedSigs.length);
         // --- End Simulation ---
 
-        escrow.release(swapId, combinedSigs);
+        escrow.release(
+            swapId, 
+            address(token), 
+            lockAmountDecimals, 
+            user2, // recipient
+            combinedSigs
+        );
 
         // Check balances after release
         assertEq(token.balanceOf(user1), (INITIAL_SUPPLY - LOCK_AMOUNT) * (10**token.decimals()));
         assertEq(token.balanceOf(address(escrow)), 0);
         assertEq(token.balanceOf(user2), lockAmountDecimals);
 
-        // Check lock state
-        (, , , , , , bool released, bool aborted) = escrow.locks(swapId); // Only need released/aborted state here
-        assertEq(released, true);
-        assertEq(aborted, false);
-        assertEq(escrow.teeDecisions(swapId), true); // Check TEE decision state
+        // Check lock state via locks mapping (we expect released to be false here)
+        (,,,,,, bool released, bool aborted) = escrow.locks(swapId);
+        assertEq(released, false, "Lock struct 'released' flag should NOT be set by release fn");
+        assertEq(aborted, false, "Lock should not be marked aborted");
+        // Check finalized state via isFinalized mapping
+        assertEq(escrow.isFinalized(swapId), true, "Swap should be finalized");
     }
 
     function testAbort() public {
@@ -150,7 +164,14 @@ contract TEEescrowTest is Test {
         assertEq(token.balanceOf(user2), 0);
 
          // --- Simulate TEE signing (need threshold=2 signatures) ---
-        bytes32 messageHash = escrow._hashTEEDecisionMessage(swapId, false); // false for ABORT
+        bytes32 messageHash = escrow._hashTEEDecisionMessage(
+            swapId, 
+            false, // commit = false for ABORT
+            address(token), 
+            lockAmountDecimals, 
+            address(0), // recipient N/A for ABORT
+            user1 // sender
+        );
 
         // Get packed signatures using helper
         bytes memory sig1 = _getPackedSignature(committeeMember1Pk, messageHash);
@@ -161,96 +182,231 @@ contract TEEescrowTest is Test {
         console.log("Combined sigs length (Abort Test):", combinedSigs.length);
         // --- End Simulation ---
 
-        escrow.abort(swapId, combinedSigs);
+        escrow.abort(
+            swapId, 
+            address(token),
+            lockAmountDecimals, 
+            user1, // sender
+            combinedSigs
+        );
 
         // Check balances after abort
         assertEq(token.balanceOf(user1), INITIAL_SUPPLY * (10**token.decimals())); // Back to initial
         assertEq(token.balanceOf(address(escrow)), 0);
         assertEq(token.balanceOf(user2), 0);
 
-        // Check lock state
-        (, , , , , , bool released, bool aborted) = escrow.locks(swapId); // Only need released/aborted state here
-        assertEq(released, false);
-        assertEq(aborted, true);
-        assertEq(escrow.teeDecisions(swapId), false); // Check TEE decision state
+        // Check lock state via locks mapping (8 fields in Lock struct)
+        (,,,,,, bool released, bool aborted) = escrow.locks(swapId); // 6 commas for 8 fields
+        assertEq(released, false, "Lock should not be marked released");
+        assertEq(aborted, true, "Lock should be marked aborted");
+        // Check finalized state via isFinalized mapping
+        assertEq(escrow.isFinalized(swapId), true, "Swap should be finalized");
     }
 
     // --- Test Failure Cases ---
 
     function test_RevertIf_ReleaseAlreadyReleased() public {
         bytes32 swapId = keccak256(abi.encodePacked("testFailRelease1", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
         vm.startPrank(user1);
-        token.approve(address(escrow), LOCK_AMOUNT * (10**token.decimals()));
-        escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
         vm.stopPrank();
 
         // First release needs valid signatures
-        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, true);
+        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
         bytes memory sig1_1 = _getPackedSignature(committeeMember1Pk, messageHash1);
         bytes memory sig1_2 = _getPackedSignature(committeeMember2Pk, messageHash1);
         bytes memory combinedSigs1 = abi.encodePacked(sig1_1, sig1_2);
-        escrow.release(swapId, combinedSigs1);
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs1);
+        assertEq(escrow.isFinalized(swapId), true, "First release should finalize"); 
 
-        // Revert back to vm.expectRevert
-        vm.expectRevert(TEEescrow.AlreadyDecided.selector);
-        escrow.release(swapId, combinedSigs1); // Pass same sigs again, check should hit first
+        // Use try/catch for debugging
+        bool caughtExpectedRevert = false;
+        try escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs1) {
+            // If it didn't revert, fail the test
+            fail();
+        } catch Error(string memory reason) {
+             // This shouldn't happen for custom errors
+            console.log("Caught unexpected Error(string):", reason);
+            fail();
+        } catch Panic(uint256 /*errorCode*/) {
+            // This shouldn't happen either
+            fail();
+        } catch (bytes memory lowLevelData) {
+            // Check if the lowLevelData matches our expected custom error
+            bytes4 expectedSelector = bytes4(keccak256("AlreadyFinalized()"));
+            bytes4 actualSelector;
+            
+            // Check if lowLevelData is exactly 4 bytes (the selector)
+            if (lowLevelData.length == 4) {
+                // Directly convert the bytes to bytes4
+                actualSelector = bytes4(lowLevelData);
+            } else {
+                // Handle cases where data might be longer or shorter (though typically just selector for simple errors)
+                console.log("Caught lowLevelData with unexpected length:", lowLevelData.length, "Data:", vm.toString(lowLevelData));
+                // You might choose to fail here or attempt extraction differently if needed
+                // For now, set actualSelector to something that won't match
+                actualSelector = bytes4(0x00000000);
+            }
+            
+            if (actualSelector == expectedSelector) {
+                console.log("Caught expected AlreadyFinalized() revert.");
+                caughtExpectedRevert = true;
+            } else {
+                console.log("Caught unexpected selector:", vm.toString(abi.encodePacked(actualSelector)), "Expected:", vm.toString(abi.encodePacked(expectedSelector)));
+                console.log("Raw lowLevelData:", vm.toString(lowLevelData));
+                fail();
+            }
+        }
+        assertTrue(caughtExpectedRevert, "Did not catch the expected AlreadyFinalized() revert");
     }
 
     function test_RevertIf_AbortAlreadyReleased() public {
         bytes32 swapId = keccak256(abi.encodePacked("testFailAbort1", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
         vm.startPrank(user1);
-        token.approve(address(escrow), LOCK_AMOUNT * (10**token.decimals()));
-        escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
         vm.stopPrank();
 
         // First release needs valid signatures
-        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, true);
+        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
         bytes memory sig1_1 = _getPackedSignature(committeeMember1Pk, messageHash1);
         bytes memory sig1_2 = _getPackedSignature(committeeMember2Pk, messageHash1);
         bytes memory combinedSigs1 = abi.encodePacked(sig1_1, sig1_2);
-        escrow.release(swapId, combinedSigs1);
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs1);
+        assertEq(escrow.isFinalized(swapId), true, "Release should finalize"); 
 
-        // Revert back to vm.expectRevert
-         vm.expectRevert(TEEescrow.AlreadyDecided.selector);
-         escrow.abort(swapId, combinedSigs1); // Pass same sigs again, check should hit first
+        // Prepare abort signatures (even though we expect revert before check)
+        bytes32 messageHashAbort = escrow._hashTEEDecisionMessage(swapId, false, address(token), lockAmountDecimals, address(0), user1);
+        bytes memory sigAbort1 = _getPackedSignature(committeeMember1Pk, messageHashAbort);
+        bytes memory sigAbort2 = _getPackedSignature(committeeMember2Pk, messageHashAbort);
+        bytes memory combinedSigsAbort = abi.encodePacked(sigAbort1, sigAbort2);
+
+        bool caughtExpectedRevert = false;
+        try escrow.abort(swapId, address(token), lockAmountDecimals, user1, combinedSigsAbort) {
+            fail(); // Should have reverted
+        } catch Error(string memory reason) {
+            console.log("Caught unexpected Error(string):", reason);
+            fail();
+        } catch Panic(uint256 /*errorCode*/) {
+            fail();
+        } catch (bytes memory lowLevelData) {
+            bytes4 expectedSelector = bytes4(keccak256("AlreadyFinalized()"));
+            bytes4 actualSelector;
+            if (lowLevelData.length == 4) {
+                actualSelector = bytes4(lowLevelData);
+            } else {
+                console.log("Caught lowLevelData with unexpected length:", lowLevelData.length, "Data:", vm.toString(lowLevelData));
+                actualSelector = bytes4(0x00000000);
+            }
+            if (actualSelector == expectedSelector) {
+                console.log("Caught expected AlreadyFinalized() revert.");
+                caughtExpectedRevert = true;
+            } else {
+                console.log("Caught unexpected selector:", vm.toString(abi.encodePacked(actualSelector)), "Expected:", vm.toString(abi.encodePacked(expectedSelector)));
+                console.log("Raw lowLevelData:", vm.toString(lowLevelData));
+                fail();
+            }
+        }
+        assertTrue(caughtExpectedRevert, "Did not catch the expected AlreadyFinalized() revert");
     }
 
     function test_RevertIf_ReleaseAlreadyAborted() public {
         bytes32 swapId = keccak256(abi.encodePacked("testFailRelease2", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
         vm.startPrank(user1);
-        token.approve(address(escrow), LOCK_AMOUNT * (10**token.decimals()));
-        escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
         vm.stopPrank();
 
         // First abort needs valid signatures
-        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, false); // false for abort
+        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, false, address(token), lockAmountDecimals, address(0), user1);
         bytes memory sig1_1 = _getPackedSignature(committeeMember1Pk, messageHash1);
         bytes memory sig1_2 = _getPackedSignature(committeeMember2Pk, messageHash1);
         bytes memory combinedSigs1 = abi.encodePacked(sig1_1, sig1_2);
-        escrow.abort(swapId, combinedSigs1);
+        escrow.abort(swapId, address(token), lockAmountDecimals, user1, combinedSigs1);
+        assertEq(escrow.isFinalized(swapId), true, "Abort should finalize");
 
-        // Revert back to vm.expectRevert
-        vm.expectRevert(TEEescrow.AlreadyDecided.selector);
-        escrow.release(swapId, combinedSigs1); // Pass same sigs again, check should hit first
+        // Prepare release signatures
+        bytes32 messageHashRelease = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
+        bytes memory sigRelease1 = _getPackedSignature(committeeMember1Pk, messageHashRelease);
+        bytes memory sigRelease2 = _getPackedSignature(committeeMember2Pk, messageHashRelease);
+        bytes memory combinedSigsRelease = abi.encodePacked(sigRelease1, sigRelease2);
+
+        bool caughtExpectedRevert = false;
+        try escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigsRelease) {
+            fail(); // Should have reverted
+        } catch Error(string memory reason) {
+            console.log("Caught unexpected Error(string):", reason);
+            fail();
+        } catch Panic(uint256 /*errorCode*/) {
+            fail();
+        } catch (bytes memory lowLevelData) {
+            bytes4 expectedSelector = bytes4(keccak256("AlreadyFinalized()"));
+            bytes4 actualSelector;
+            if (lowLevelData.length == 4) {
+                actualSelector = bytes4(lowLevelData);
+            } else {
+                console.log("Caught lowLevelData with unexpected length:", lowLevelData.length, "Data:", vm.toString(lowLevelData));
+                actualSelector = bytes4(0x00000000);
+            }
+            if (actualSelector == expectedSelector) {
+                console.log("Caught expected AlreadyFinalized() revert.");
+                caughtExpectedRevert = true;
+            } else {
+                console.log("Caught unexpected selector:", vm.toString(abi.encodePacked(actualSelector)), "Expected:", vm.toString(abi.encodePacked(expectedSelector)));
+                console.log("Raw lowLevelData:", vm.toString(lowLevelData));
+                fail();
+            }
+        }
+         assertTrue(caughtExpectedRevert, "Did not catch the expected AlreadyFinalized() revert");
     }
 
      function test_RevertIf_AbortAlreadyAborted() public {
         bytes32 swapId = keccak256(abi.encodePacked("testFailAbort2", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
         vm.startPrank(user1);
-        token.approve(address(escrow), LOCK_AMOUNT * (10**token.decimals()));
-        escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
         vm.stopPrank();
 
         // First abort needs valid signatures
-        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, false); // false for abort
+        bytes32 messageHash1 = escrow._hashTEEDecisionMessage(swapId, false, address(token), lockAmountDecimals, address(0), user1);
         bytes memory sig1_1 = _getPackedSignature(committeeMember1Pk, messageHash1);
         bytes memory sig1_2 = _getPackedSignature(committeeMember2Pk, messageHash1);
         bytes memory combinedSigs1 = abi.encodePacked(sig1_1, sig1_2);
-        escrow.abort(swapId, combinedSigs1);
+        escrow.abort(swapId, address(token), lockAmountDecimals, user1, combinedSigs1);
+        assertEq(escrow.isFinalized(swapId), true, "First abort should finalize"); 
 
-        // Revert back to vm.expectRevert
-        vm.expectRevert(TEEescrow.AlreadyDecided.selector);
-        escrow.abort(swapId, combinedSigs1); // Pass same sigs again, check should hit first
+        bool caughtExpectedRevert = false;
+        try escrow.abort(swapId, address(token), lockAmountDecimals, user1, combinedSigs1) {
+            fail(); // Should have reverted
+        } catch Error(string memory reason) {
+            console.log("Caught unexpected Error(string):", reason);
+            fail();
+        } catch Panic(uint256 /*errorCode*/) {
+            fail();
+        } catch (bytes memory lowLevelData) {
+            bytes4 expectedSelector = bytes4(keccak256("AlreadyFinalized()"));
+            bytes4 actualSelector;
+            if (lowLevelData.length == 4) {
+                actualSelector = bytes4(lowLevelData);
+            } else {
+                console.log("Caught lowLevelData with unexpected length:", lowLevelData.length, "Data:", vm.toString(lowLevelData));
+                actualSelector = bytes4(0x00000000);
+            }
+            if (actualSelector == expectedSelector) {
+                console.log("Caught expected AlreadyFinalized() revert.");
+                caughtExpectedRevert = true;
+            } else {
+                console.log("Caught unexpected selector:", vm.toString(abi.encodePacked(actualSelector)), "Expected:", vm.toString(abi.encodePacked(expectedSelector)));
+                console.log("Raw lowLevelData:", vm.toString(lowLevelData));
+                fail();
+            }
+        }
+        assertTrue(caughtExpectedRevert, "Did not catch the expected AlreadyFinalized() revert");
     }
 
      function test_RevertIf_LockSwapIdExists() public {
@@ -260,15 +416,13 @@ contract TEEescrowTest is Test {
         // First lock succeeds
         escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
 
-        // Expect revert on second lock with same ID using try...catch
-        // vm.expectRevert(stdError.assertionError);
-        // escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600);
         bool caughtCorrectError_LSIE = false;
         try escrow.lock(swapId, user2, address(token), LOCK_AMOUNT * (10**token.decimals()), block.timestamp + 3600) {
             fail(); // Should have reverted
         } catch Error(string memory reason) {
             // Check if the reason matches the expected require string
-            if (keccak256(bytes(reason)) == keccak256(bytes("Swap ID already used"))) {
+            // Use the EXACT string from the contract
+            if (keccak256(bytes(reason)) == keccak256(bytes("Swap ID already used for lock on this chain"))) { 
                  caughtCorrectError_LSIE = true;
             } else {
                 console.log("test_RevertIf_LockSwapIdExists: Caught unexpected string revert:", reason);

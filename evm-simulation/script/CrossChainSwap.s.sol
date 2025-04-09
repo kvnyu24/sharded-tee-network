@@ -100,10 +100,12 @@ contract CrossChainSwapScript is Script {
         // == Chain B Setup ==
         console.log("\n--- Setting up Chain B (%s) ---", RPC_URL_CHAIN_B);
         uint256 chainBId = vm.createSelectFork(RPC_URL_CHAIN_B); // Fork ID
-        // Ensure the fork's actual ID matches our detected ID (sanity check)
-        // require(vm.chainId() == actualChainBId, "Fork Chain B ID mismatch"); // REMOVED
-        // uint256 initialActualChainBId = vm.chainId(); // REMOVED
-        // console.log("Fork Chain B Actual ID:", initialActualChainBId); // REMOVED
+
+        // REMOVED: vm.deal seems ineffective here, funding from Rust test instead
+        // address relayerAddress = vm.addr(0x59c6995e998f97a5300194dc6916aa8c096e6d7d7f81a78f05791c43177926b8);
+        // uint256 initialRelayerBalance = 10 ether;
+        // vm.deal(relayerAddress, initialRelayerBalance);
+        // console.logString("Funded Relayer "); ... etc
 
         // Use a different deployer/funder for Chain B if needed, or User A again?
         // For simplicity, let User A deploy, but User B will receive funds.
