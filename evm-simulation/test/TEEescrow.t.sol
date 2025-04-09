@@ -454,4 +454,90 @@ contract TEEescrowTest is Test {
         assertTrue(caughtRevert_LIA, "Expected revert from transferFrom but none occurred");
         vm.stopPrank();
     }
+
+    // --- New Tests for Signature Verification (Phase 3, Step 6) ---
+
+    function test_RevertIf_ReleaseInsufficientSignatures() public {
+        bytes32 swapId = keccak256(abi.encodePacked("testInsuffSigRel", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
+        // Setup: Lock
+        vm.startPrank(user1);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
+        vm.stopPrank();
+
+        // Generate only 1 signature (threshold is 2)
+        bytes32 messageHash = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
+        bytes memory sig1 = _getPackedSignature(committeeMember1Pk, messageHash);
+        // Note: combinedSigs only contains sig1
+        bytes memory combinedSigs = sig1;
+
+        // Expect revert due to insufficient valid signatures
+        // The require message in release() is "Invalid TEE signature for RELEASE"
+        vm.expectRevert(bytes("Invalid TEE signature for RELEASE"));
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs);
+    }
+
+    function test_RevertIf_ReleaseInvalidSignature_WrongMessage() public {
+        bytes32 swapId = keccak256(abi.encodePacked("testWrongMsgRel", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
+        // Setup: Lock
+        vm.startPrank(user1);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
+        vm.stopPrank();
+
+        // Generate signatures for a *different* message (e.g., wrong swapId)
+        bytes32 wrongSwapId = keccak256("wrongSwapId");
+        bytes32 wrongMessageHash = escrow._hashTEEDecisionMessage(wrongSwapId, true, address(token), lockAmountDecimals, user2, address(0));
+        bytes memory sig1 = _getPackedSignature(committeeMember1Pk, wrongMessageHash);
+        bytes memory sig2 = _getPackedSignature(committeeMember2Pk, wrongMessageHash);
+        bytes memory combinedSigs = abi.encodePacked(sig1, sig2);
+
+        // Expect revert because signatures don't match the *correct* message for the release call
+        vm.expectRevert(bytes("Invalid TEE signature for RELEASE"));
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs);
+    }
+
+    function test_RevertIf_ReleaseInvalidSignature_NonMember() public {
+        bytes32 swapId = keccak256(abi.encodePacked("testNonMemberRel", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
+        // Setup: Lock
+        vm.startPrank(user1);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
+        vm.stopPrank();
+
+        // Generate 1 valid sig + 1 sig from a non-member
+        bytes32 messageHash = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
+        bytes memory sig1 = _getPackedSignature(committeeMember1Pk, messageHash);
+        uint256 nonMemberPk = 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef;
+        address nonMemberAddr = vm.addr(nonMemberPk);
+        assertFalse(escrow.isCommitteeMemberAddress(nonMemberAddr), "Addr should not be committee member"); // Use getter
+        bytes memory sigNonMember = _getPackedSignature(nonMemberPk, messageHash);
+        bytes memory combinedSigs = abi.encodePacked(sig1, sigNonMember);
+
+        // Expect revert because only 1 valid signature is provided (threshold 2)
+        vm.expectRevert(bytes("Invalid TEE signature for RELEASE"));
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs);
+    }
+
+     function test_RevertIf_ReleaseDuplicateSignatures() public {
+        bytes32 swapId = keccak256(abi.encodePacked("testDupSigRel", block.timestamp));
+        uint256 lockAmountDecimals = LOCK_AMOUNT * (10**token.decimals());
+        // Setup: Lock
+        vm.startPrank(user1);
+        token.approve(address(escrow), lockAmountDecimals);
+        escrow.lock(swapId, user2, address(token), lockAmountDecimals, block.timestamp + 3600);
+        vm.stopPrank();
+
+        // Generate 1 valid signature and duplicate it
+        bytes32 messageHash = escrow._hashTEEDecisionMessage(swapId, true, address(token), lockAmountDecimals, user2, address(0));
+        bytes memory sig1 = _getPackedSignature(committeeMember1Pk, messageHash);
+        bytes memory combinedSigs = abi.encodePacked(sig1, sig1); // Duplicate sig1
+
+        // Expect revert because only 1 unique valid signature is provided
+        vm.expectRevert(bytes("Invalid TEE signature for RELEASE"));
+        escrow.release(swapId, address(token), lockAmountDecimals, user2, combinedSigs);
+    }
 } 

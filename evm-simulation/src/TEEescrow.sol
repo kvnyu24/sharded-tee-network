@@ -66,6 +66,17 @@ contract TEEescrow {
         }
     }
 
+    // --- Getter Functions ---
+    
+    /**
+     * @notice Checks if a given address is part of the TEE committee.
+     */
+    function isCommitteeMemberAddress(address _addr) public view returns (bool) {
+        return isCommitteeMember[_addr];
+    }
+
+    // --- Core Logic ---
+
     /**
      * @notice Locks tokens for a swap *on this chain*.
      * @dev This is called on the source chain. Sender must approve this contract.
@@ -209,10 +220,9 @@ contract TEEescrow {
         address _recipient, // Only relevant for RELEASE hash
         address _sender,    // Only relevant for ABORT hash
         bytes memory _signatures
-    ) internal view returns (bool) { // Changed to view as it doesn't modify state directly
+    ) internal view returns (bool) { // Remains view as it doesn't modify *storage*
         bytes32 messageHash = _hashTEEDecisionMessage(_swapId, _commit, _token, _amount, _recipient, _sender);
         console.logString("Verifying Hash:"); console.logBytes32(messageHash);
-
 
         uint256 requiredSigs = signatureThreshold;
         uint256 validSigCount = 0;
@@ -223,14 +233,12 @@ contract TEEescrow {
         }
         uint256 numSigsProvided = signaturesLen / 65;
 
-        // Choose the correct mapping to check/prevent double-signing for this specific decision
-        // Note: This is checking view-only, state change happens in release/abort AFTER verification
-        mapping(address => bool) storage signedMap = _commit ? signedReleaseOnThisChain[_swapId] : signedAbortOnThisChain[_swapId];
-
+        // Use a memory array to track signers counted *within this specific call*
+        address[] memory countedSignersInThisCall = new address[](numSigsProvided); // Max size needed
+        uint countedSignerIndex = 0; // Keep track of actual count
 
         for (uint i = 0; i < numSigsProvided; i++) {
             bytes memory sig = new bytes(65);
-            // Extract the i-th signature (r, s, v)
             for (uint j = 0; j < 65; j++) {
                 sig[j] = _signatures[i * 65 + j];
             }
@@ -238,40 +246,47 @@ contract TEEescrow {
             bytes32 r;
             bytes32 s;
             uint8 v;
-
             assembly {
                 r := mload(add(sig, 0x20))
                 s := mload(add(sig, 0x40))
                 v := byte(0, mload(add(sig, 0x60)))
             }
-
             if (v < 27) { v += 27; }
-            if (v != 27 && v != 28) { continue; } // Skip invalid v
+            if (v != 27 && v != 28) { continue; } 
 
             address signer = ecrecover(messageHash, v, r, s);
             bool isMember = isCommitteeMember[signer];
-            // Check if already marked as signed in the mapping *for this decision*
-            bool alreadySigned = signedMap[signer];
 
             console.logString(" Signer:"); console.logAddress(signer);
             console.logString(" IsMember:"); console.logBool(isMember);
-            console.logString(" AlreadySigned:"); console.logBool(alreadySigned);
 
-
-            if (signer != address(0) && isMember && !alreadySigned) {
-                validSigCount++;
-                 // Temporarily mark in a local map to prevent double counting within this loop run
-                // This avoids needing signedMap to be non-view if we checked threshold inside loop
-                // Alternatively, could pass signedMap as storage ref if function wasn't view
-
-                if (validSigCount >= requiredSigs) {
-                     // Important: Actual state update (marking signers) happens *outside* this view function
-                     // in release/abort after successful verification.
-                    return true; // Threshold reached
+            if (signer != address(0) && isMember) {
+                // Check if this signer has already been counted in *this call*
+                bool alreadyCounted = false;
+                for (uint k = 0; k < countedSignerIndex; k++) { // Only check up to the current index
+                    if (countedSignersInThisCall[k] == signer) {
+                        alreadyCounted = true;
+                        break;
+                    }
                 }
-            }
+
+                console.logString(" AlreadyCountedLocally:"); console.logBool(alreadyCounted);
+
+                if (!alreadyCounted) {
+                    // Add to our temporary list for this call
+                    countedSignersInThisCall[countedSignerIndex] = signer;
+                    countedSignerIndex++;
+                    
+                    // Increment the valid count
+                    validSigCount++;
+
+                    if (validSigCount >= requiredSigs) {
+                        return true; // Threshold reached
+                    }
+                }
+            } 
         }
-         console.logString("Threshold check: Valid="); console.logUint(validSigCount); console.logString("Required="); console.logUint(requiredSigs);
+        console.logString("Threshold check: Valid="); console.logUint(validSigCount); console.logString("Required="); console.logUint(requiredSigs);
         return false; // Threshold not reached
     }
 
