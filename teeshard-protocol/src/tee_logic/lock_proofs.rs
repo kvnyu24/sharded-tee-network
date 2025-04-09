@@ -81,9 +81,9 @@ pub fn verify_lock_proof(
 mod tests {
     use super::*;
     use crate::data_structures::{AccountId, AssetId, LockInfo, TEEIdentity};
-    use crate::cross_chain::types::LockProof;
+    
     // Import crypto sim components
-    use crate::tee_logic::crypto_sim::{self, sign, verify, generate_keypair, PublicKey};
+    use crate::tee_logic::crypto_sim::{sign, generate_keypair};
 
     fn create_test_lock_info() -> LockInfo {
         LockInfo {

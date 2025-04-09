@@ -50,7 +50,7 @@ mod tests {
         // Verify with tampered signature
         // Create a valid signature, then tamper it
         let another_message = b"another message";
-        let mut tampered_signature = sign(another_message, &keypair);
+        let tampered_signature = sign(another_message, &keypair);
         // Ed25519 signatures are typically 64 bytes. Tamper the first byte.
         if tampered_signature.to_bytes().len() > 0 {
             // Unfortunately, Signature doesn't expose mutable bytes directly.

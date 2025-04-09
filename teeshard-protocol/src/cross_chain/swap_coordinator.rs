@@ -1,29 +1,26 @@
 // Placeholder for Cross-Chain Swap Coordinator logic (Algorithm 2)
 
-use crate::data_structures::{TEEIdentity, Transaction, LockInfo, AccountId, AssetId, TxType}; // Added LockInfo etc. for test helpers
-use crate::cross_chain::types::{LockProof, SwapOutcome, AbortReason, SignedCoordinatorDecision, LockRequest}; // Import new types
+use crate::data_structures::{TEEIdentity, Transaction, LockInfo}; // Added LockInfo etc. for test helpers
+use crate::cross_chain::types::{LockProof, AbortReason, SignedCoordinatorDecision, LockRequest}; // Import new types
 use crate::config::SystemConfig;
 // Use the actual Signature type
-use crate::tee_logic::types::Signature;
 // Import crypto components
-use crate::tee_logic::crypto_sim::{sign, generate_keypair, SecretKey, verify}; // Added SecretKey, verify
+use crate::tee_logic::crypto_sim::SecretKey; // Added SecretKey, verify
 // Import the Signer trait for the .sign() method
 use ed25519_dalek::Signer;
 // Import multi-sig aggregator components
 use crate::tee_logic::threshold_sig::{PartialSignature, ThresholdAggregator};
 use crate::network::{NetworkInterface, NetworkMessage, Message}; // Import network trait and types
 // Import the new BlockchainInterface
-use crate::onchain::interface::{BlockchainInterface, SwapId, SignatureBytes};
-use async_trait::async_trait;
-use std::sync::Mutex; // Use std Mutex for simple mock state
+use crate::onchain::interface::{BlockchainInterface, SignatureBytes};
+ // Use std Mutex for simple mock state
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration; // For timeout
+ // For timeout
 use std::sync::Arc; // Import Arc
-use std::str::FromStr;
 use hex;
 use tokio;
-use ed25519_dalek::{Signature as DalekSignature, VerifyingKey}; // Alias dalek::Signature
+ // Alias dalek::Signature
 
 // Represents the state of a coordinator TEE managing a swap
 pub struct CrossChainCoordinator {
@@ -672,16 +669,13 @@ impl CrossChainCoordinator {
 mod tests {
     use super::*;
     use crate::data_structures::{Transaction, AccountId, AssetId, TxType}; // Added missing imports
-    use crate::tee_logic::crypto_sim::{generate_keypair, sign, verify, PublicKey}; // Import PublicKey for verify call
+    use crate::tee_logic::crypto_sim::{generate_keypair, sign}; // Import PublicKey for verify call
     use crate::config::SystemConfig;
     use crate::cross_chain::types::LockProof; // Import LockProof
-    use crate::network::{MockNetwork, NetworkMessage, Message}; // Import MockNetwork directly from network module now
-    use crate::onchain::{
-        interface::{BlockchainInterface, BlockchainError, SwapId, SignatureBytes, TransactionId},
-        chain_simulator::ChainSimulator, // If used in tests
-    };
-    use crate::tee_logic::threshold_sig::PartialSignature; // Added
-    use crate::tee_logic::types::Signature; // Added
+    use crate::network::{MockNetwork, Message}; // Import MockNetwork directly from network module now
+    use crate::onchain::interface::{BlockchainInterface, BlockchainError, SwapId, SignatureBytes, TransactionId};
+     // Added
+     // Added
     use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -921,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_check_timeouts() {
         let num_coordinators = 3;
-        let threshold = 2;
+        let threshold = 1;
         let config = create_test_config(num_coordinators, threshold);
         let mock_network = Arc::new(MockNetwork::new());
         let mock_blockchain = Arc::new(MockBlockchainInterface);
@@ -958,18 +952,20 @@ mod tests {
 
         // Simulate timed-out swap
         let mut coordinator = coordinators.get_mut(&coord100_id).unwrap().lock().unwrap();
+        // Set initiation time far in the past to trigger timeout
+        let initiation_time_far_past = std::time::Instant::now().checked_sub(Duration::from_secs(tx_timeout.timeout.as_secs() + 10)).unwrap_or_else(std::time::Instant::now);
         coordinator.active_swaps.insert("swap_timeout".to_string(), SwapState {
             transaction: tx_timeout,
             relevant_shards: HashSet::new(),
             received_proofs: HashMap::new(),
-            initiation_time: std::time::Instant::now(),
+            initiation_time: initiation_time_far_past, // Use time in the past
             status: SwapStatus::Active,
             release_aggregator: None,
             abort_aggregator: None,
         });
 
-        // Check timeouts
+        // Check timeouts immediately after setup (should detect the old swap)
         let timed_out_swaps = coordinator.check_timeouts();
-        assert!(!timed_out_swaps.is_empty());
+        assert!(!timed_out_swaps.is_empty(), "Expected to find timed out swaps");
     }
 } // end tests mod 

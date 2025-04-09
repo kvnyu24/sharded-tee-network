@@ -66,7 +66,7 @@ impl EnclaveSim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tee_logic::crypto_sim::{verify, PublicKey};
+    use crate::tee_logic::crypto_sim::verify;
 
     // Helper to create EnclaveSim for testing
     fn create_test_enclave(id: usize) -> EnclaveSim {

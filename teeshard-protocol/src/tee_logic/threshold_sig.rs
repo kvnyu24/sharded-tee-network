@@ -150,7 +150,7 @@ pub fn verify_multi_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tee_logic::crypto_sim::{generate_keypair, sign, PublicKey};
+    use crate::tee_logic::crypto_sim::{generate_keypair, sign};
     use crate::data_structures::TEEIdentity; // Import TEEIdentity
 
     // Helper to create a TEEIdentity with a real key

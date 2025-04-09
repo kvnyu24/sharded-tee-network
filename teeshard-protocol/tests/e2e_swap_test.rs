@@ -203,7 +203,7 @@ fn generate_swap_id_bytes32(seed: &str) -> SwapId {
 // --- Main E2E Test ---\n
 
 #[tokio::test]
-#[ignore] // Ignore by default due to external dependencies (Anvil, forge script)
+// #[ignore] // Removed ignore to run the test
 async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("--- Starting E2E Coordinator <> Relayer Test ---");
     println!("Requires Anvil running on {} and {}", RPC_URL_A, RPC_URL_B);

@@ -4,7 +4,6 @@ use crate::raft::messages::{AppendEntriesArgs, AppendEntriesReply, RequestVoteAr
 use crate::liveness::types::{NonceChallenge, AttestationResponse};
 use crate::cross_chain::types::LockRequest;
 use crate::tee_logic::threshold_sig::PartialSignature;
-use crate::tee_logic::Signature;
 use crate::data_structures::TEEIdentity;
 use crate::tee_logic::crypto_sim::generate_keypair;
 use std::sync::Mutex;

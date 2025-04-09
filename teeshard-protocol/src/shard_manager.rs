@@ -1,5 +1,5 @@
 use crate::config::SystemConfig;
-use crate::data_structures::{AccountId, Transaction, GraphNode, GraphEdge, TEEIdentity, TxType, AssetId, LockInfo};
+use crate::data_structures::{AccountId, Transaction, GraphNode, GraphEdge, TEEIdentity, TxType, AssetId};
 use std::collections::{HashMap, HashSet};
 use crate::tee_logic::crypto_sim::generate_keypair;
 

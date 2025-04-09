@@ -1,5 +1,4 @@
 use crate::onchain::{
-    AccountId, AssetId, // Now using the re-exported types
     BlockchainError,
     BlockchainInterface,
     SignatureBytes,
@@ -7,15 +6,13 @@ use crate::onchain::{
     TransactionId,
 };
 use async_trait::async_trait;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 use hex;
 use std::collections::HashMap;
 use std::{
-    env,
-    process::{Command as StdCommand, Output as StdOutput},
+    process::Command as StdCommand,
     thread,
     time::Duration,
 };
@@ -136,6 +133,8 @@ impl BlockchainInterface for EvmRelayer {
            // Relayer authentication and chain selection
            .arg("--private-key")
            .arg(&self.config.relayer_private_key)
+           .arg("--gas-limit") // Add explicit gas limit
+           .arg("1000000") // Set a high gas limit (e.g., 1M)
            .arg("--rpc-url")
            .arg(rpc_url)
            .stdout(Stdio::piped())
@@ -203,11 +202,13 @@ impl BlockchainInterface for EvmRelayer {
            .arg(&swap_id_hex)
            .arg(&token_address)
            .arg(&amount_str)
-           .arg(&sender_address) // Pass sender address for abort
+           .arg(&sender_address) // Use sender address for abort
            .arg(&signatures_hex)
            // Relayer authentication and chain selection
            .arg("--private-key")
            .arg(&self.config.relayer_private_key)
+           .arg("--gas-limit") // Add explicit gas limit
+           .arg("1000000") // Set a high gas limit (e.g., 1M)
            .arg("--rpc-url")
            .arg(rpc_url)
            .stdout(Stdio::piped())

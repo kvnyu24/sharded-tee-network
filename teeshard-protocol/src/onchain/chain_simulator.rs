@@ -125,7 +125,7 @@ impl ChainSimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tee_logic::Signature;
+    
     // Import crypto helpers
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
