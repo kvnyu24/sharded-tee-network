@@ -1,9 +1,11 @@
 // Placeholder for Raft persistent storage logic
 
-use crate::raft::state::LogEntry;
-use crate::data_structures::TEEIdentity;
-use crate::raft::state::Command;
- // Import key generation
+use crate::{
+    data_structures::TEEIdentity,
+    // Correct: Command and LogEntry are defined in raft::state
+    raft::state::{Command, LogEntry},
+};
+// Import key generation
 
 /// Trait for Raft persistent storage.
 /// Implementors must be Send + Sync to be used across threads.
@@ -164,9 +166,9 @@ mod tests {
         assert!(storage.get_voted_for().is_none());
 
         let entries = vec![
-            LogEntry { term: 1, command: Command(vec![1]) },
-            LogEntry { term: 2, command: Command(vec![2]) },
-            LogEntry { term: 3, command: Command(vec![3]) },
+            LogEntry { term: 1, command: Command::Dummy },
+            LogEntry { term: 2, command: Command::Dummy },
+            LogEntry { term: 3, command: Command::Dummy },
         ];
         storage.append_log_entries(&entries);
         assert_eq!(storage.get_log_len(), 3);
@@ -191,8 +193,8 @@ mod tests {
          assert_eq!(storage.get_last_log_term(), 0);
 
          // Test appending again after truncation
-         let entries2 = vec![LogEntry { term: 4, command: Command(vec![4]) }];
-         storage.append_log_entries(&entries2);
+         let new_entries = vec![LogEntry { term: 4, command: Command::Dummy }];
+         storage.append_log_entries(&new_entries);
          assert_eq!(storage.get_log_len(), 1);
          assert_eq!(storage.get_last_log_index(), 1);
          assert_eq!(storage.get_last_log_term(), 4);

@@ -12,11 +12,13 @@ use tokio::process::Command;
 use hex;
 use std::collections::HashMap;
 use std::{
+    error::Error as StdError,
     process::Command as StdCommand,
     thread,
     time::Duration,
 };
 use regex::Regex;
+use ethers::types::U256;
 
 // Config for a single chain
 #[derive(Debug, Clone)]
@@ -52,6 +54,23 @@ impl EvmRelayer {
         self.config.chain_details.get(&chain_id)
             .ok_or_else(|| format!("Configuration not found for chain_id: {}", chain_id).into())
     }
+
+    // --- START: New Helper function for parsing tx hash ---
+    fn parse_transaction_hash_from_cast_output(&self, stdout: &str) -> Result<TransactionId, BlockchainError> {
+        // Look for the line starting with "transactionHash" (allow for varying whitespace)
+        if let Some(line) = stdout.lines().find(|line| line.trim_start().starts_with("transactionHash")) {
+            // Split the line by whitespace and get the last part (the hash)
+            if let Some(hash_part) = line.split_whitespace().last() {
+                if hash_part.starts_with("0x") && hash_part.len() == 66 {
+                    return Ok(hash_part.to_string());
+                }
+            }
+        }
+        // Fallback or additional checks if needed?
+        // For now, return error if specific format not found.
+        Err(format!("Failed to parse transaction hash from cast send output: {}", stdout).into())
+    }
+    // --- END: New Helper function ---
 }
 
 #[async_trait]
@@ -63,7 +82,7 @@ impl BlockchainInterface for EvmRelayer {
         chain_id: u64,
         account_address: String,
         token_address: String,
-    ) -> Result<u64, BlockchainError> {
+    ) -> Result<U256, BlockchainError> {
         let chain_config = self.get_chain_config(chain_id)?;
         let rpc_url = &chain_config.rpc_url;
 
@@ -90,12 +109,11 @@ impl BlockchainInterface for EvmRelayer {
         // cast call output is typically a hex string (0x...)
         let hex_output = stdout.trim();
         
-        // Remove 0x prefix and parse as u128 first to handle large balances, then try to fit into u64
-        let balance = u128::from_str_radix(hex_output.trim_start_matches("0x"), 16)
-            .map_err(|e| format!("Failed to parse cast output '{}' as hex: {}", hex_output, e))?;
+        // Parse directly into U256
+        let balance = U256::from_str_radix(hex_output.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("Failed to parse cast output '{}' as hex U256: {}", hex_output, e))?;
             
-        u64::try_from(balance)
-            .map_err(|_| format!("Balance {} exceeds u64::MAX", balance).into())
+        Ok(balance)
     }
 
 
@@ -103,38 +121,34 @@ impl BlockchainInterface for EvmRelayer {
     async fn submit_release(
         &self,
         chain_id: u64,
-        swap_id: SwapId, // [u8; 32]
+        swap_id: SwapId,
         token_address: String,
-        amount: u64,
+        amount: U256,
         recipient_address: String,
-        tee_signatures: SignatureBytes, // Vec<u8>
+        tee_signatures: SignatureBytes,
     ) -> Result<TransactionId, BlockchainError> {
         let chain_config = self.get_chain_config(chain_id)?;
         let rpc_url = &chain_config.rpc_url;
         let escrow_address = &chain_config.escrow_address;
 
         // Format arguments for cast send
-        // bytes32 needs 0x prefix
         let swap_id_hex = format!("0x{}", hex::encode(swap_id)); 
-        // bytes needs 0x prefix
         let signatures_hex = format!("0x{}", hex::encode(&tee_signatures));
-        let amount_str = amount.to_string(); // cast handles uint formatting
+        let amount_str = amount.to_string();
 
         let mut cmd = Command::new(&self.config.cast_path);
         cmd.arg("send")
            .arg(escrow_address) // Target contract
-           // Function signature and arguments
            .arg("release(bytes32,address,uint256,address,bytes)") 
            .arg(&swap_id_hex)
            .arg(&token_address)
            .arg(&amount_str)
            .arg(&recipient_address)
            .arg(&signatures_hex)
-           // Relayer authentication and chain selection
            .arg("--private-key")
            .arg(&self.config.relayer_private_key)
-           .arg("--gas-limit") // Add explicit gas limit
-           .arg("1000000") // Set a high gas limit (e.g., 1M)
+           .arg("--gas-limit") 
+           .arg("1000000") 
            .arg("--rpc-url")
            .arg(rpc_url)
            .stdout(Stdio::piped())
@@ -146,33 +160,11 @@ impl BlockchainInterface for EvmRelayer {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Try to parse stderr for common revert reasons if possible
             return Err(format!("cast send failed (release): Status: {}\nStderr: {}", output.status, stderr).into());
         }
 
-        // Parse stdout for transaction hash
         let stdout = String::from_utf8_lossy(&output.stdout);
-        
-        // Improved parsing: Look for a 0x-prefixed hash of the correct length
-        if let Some(hash_part) = stdout.lines()
-            .find(|line| line.contains("Transaction hash:"))
-            .and_then(|line| line.split(':').nth(1))
-            .map(|s| s.trim())
-        {
-            if hash_part.starts_with("0x") && hash_part.len() == 66 {
-                return Ok(hash_part.to_string());
-            }
-        }
-        
-        // Fallback: If specific parsing fails, check if the entire trimmed output might be the hash
-        let trimmed_stdout = stdout.trim();
-        if trimmed_stdout.starts_with("0x") && trimmed_stdout.len() == 66 {
-            return Ok(trimmed_stdout.to_string());
-        }
-
-        // If no valid hash found, return an error or the raw output
-        Err(format!("Failed to parse transaction hash from cast send output: {}", stdout).into())
-        // Or, optionally return the raw output: Ok(stdout.trim().to_string())
+        self.parse_transaction_hash_from_cast_output(&stdout)
     }
 
     // Implement submit_abort
@@ -181,15 +173,14 @@ impl BlockchainInterface for EvmRelayer {
         chain_id: u64,
         swap_id: SwapId,
         token_address: String,
-        amount: u64,
-        sender_address: String, // Original sender who locked funds
+        amount: U256,
+        sender_address: String,
         tee_signatures: SignatureBytes,
     ) -> Result<TransactionId, BlockchainError> {
         let chain_config = self.get_chain_config(chain_id)?;
         let rpc_url = &chain_config.rpc_url;
         let escrow_address = &chain_config.escrow_address;
 
-        // Format arguments for cast send
         let swap_id_hex = format!("0x{}", hex::encode(swap_id));
         let signatures_hex = format!("0x{}", hex::encode(&tee_signatures));
         let amount_str = amount.to_string();
@@ -197,18 +188,16 @@ impl BlockchainInterface for EvmRelayer {
         let mut cmd = Command::new(&self.config.cast_path);
         cmd.arg("send")
            .arg(escrow_address) // Target contract
-            // Function signature and arguments for abort
            .arg("abort(bytes32,address,uint256,address,bytes)") 
            .arg(&swap_id_hex)
            .arg(&token_address)
            .arg(&amount_str)
-           .arg(&sender_address) // Use sender address for abort
+           .arg(&sender_address) 
            .arg(&signatures_hex)
-           // Relayer authentication and chain selection
            .arg("--private-key")
            .arg(&self.config.relayer_private_key)
-           .arg("--gas-limit") // Add explicit gas limit
-           .arg("1000000") // Set a high gas limit (e.g., 1M)
+           .arg("--gas-limit") 
+           .arg("1000000") 
            .arg("--rpc-url")
            .arg(rpc_url)
            .stdout(Stdio::piped())
@@ -223,26 +212,115 @@ impl BlockchainInterface for EvmRelayer {
             return Err(format!("cast send failed (abort): Status: {}\nStderr: {}", output.status, stderr).into());
         }
 
-        // Parse stdout for transaction hash (using the same improved logic)
         let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_transaction_hash_from_cast_output(&stdout)
+    }
 
-        if let Some(hash_part) = stdout.lines()
-            .find(|line| line.contains("Transaction hash:"))
-            .and_then(|line| line.split(':').nth(1))
-            .map(|s| s.trim())
-        {
-            if hash_part.starts_with("0x") && hash_part.len() == 66 {
-                return Ok(hash_part.to_string());
-            }
+    // --- Add the lock function ---
+    async fn lock(
+        &self,
+        chain_id: u64,
+        sender_private_key: String,
+        swap_id: [u8; 32],
+        recipient: String,
+        token_address: String,
+        amount: U256,
+        timeout_seconds: u64,
+    ) -> Result<TransactionId, BlockchainError> {
+        let chain_config = self.get_chain_config(chain_id)?;
+
+        let swap_id_hex = hex::encode(swap_id);
+        let now = std::time::SystemTime::now();
+        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| -> BlockchainError { Box::new(e) })?;
+        let lock_expiry_timestamp = duration_since_epoch.as_secs() + timeout_seconds;
+
+        println!(
+            "[Relayer] Executing lock: chain={}, escrow={}, swap_id={}, token={}, amount={}, recipient={}, expiry={}",
+            chain_id,
+            chain_config.escrow_address,
+            swap_id_hex,
+            token_address,
+            amount,
+            recipient,
+            lock_expiry_timestamp
+        );
+
+
+        let mut cmd = Command::new(self.config.cast_path.to_str().unwrap());
+        cmd.arg("send")
+            .arg(&chain_config.escrow_address)
+            .arg("lock(bytes32,address,address,uint256,uint256)")
+            .arg(format!("0x{}", swap_id_hex))
+            .arg(&recipient)
+            .arg(&token_address)
+            .arg(amount.to_string())
+            .arg(lock_expiry_timestamp.to_string())
+            .arg("--private-key")
+            .arg(sender_private_key)
+            .arg("--rpc-url")
+            .arg(&chain_config.rpc_url);
+        
+        println!("[Relayer] Executing command: {:?}", cmd);
+
+        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (lock): {}", e))?;
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("cast send failed (lock): Status: {}\nStdout: {}\nStderr: {}", output.status, stdout, stderr).into());
         }
 
-        let trimmed_stdout = stdout.trim();
-        if trimmed_stdout.starts_with("0x") && trimmed_stdout.len() == 66 {
-            return Ok(trimmed_stdout.to_string());
+        // Use the helper function for parsing
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_transaction_hash_from_cast_output(&stdout)
+    }
+    // --- End of lock function ---
+
+    async fn approve_erc20(
+        &self,
+        chain_id: u64,
+        owner_private_key: String,
+        token_address: String,
+        spender_address: String,
+        amount: U256,
+    ) -> Result<TransactionId, BlockchainError> {
+        let chain_config = self.get_chain_config(chain_id)?;
+        let rpc_url = &chain_config.rpc_url;
+        // No need for escrow_address here
+
+        // Format arguments for cast send
+        let amount_str = amount.to_string(); // Convert U256 to string
+
+        let mut cmd = Command::new(&self.config.cast_path);
+        cmd.arg("send")
+           .arg(&token_address) // Target Token contract
+           // Function signature and arguments for approve
+           .arg("approve(address,uint256)") 
+           .arg(&spender_address)
+           .arg(&amount_str)
+           // Use the provided signer's private key
+           .arg("--private-key")
+           .arg(&owner_private_key)
+           .arg("--gas-limit") // Add explicit gas limit
+           .arg("1000000") // Adjust if needed
+           .arg("--rpc-url")
+           .arg(rpc_url)
+           .stdout(Stdio::piped())
+           .stderr(Stdio::piped());
+
+        println!("Executing command: {:?}", cmd);
+
+        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (approve): {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("cast send failed (approve): Status: {}\nStderr: {}", output.status, stderr).into());
         }
 
-        Err(format!("Failed to parse transaction hash from cast send output: {}", stdout).into())
-        // Or: Ok(stdout.trim().to_string())
+        // Use the helper function for parsing
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        self.parse_transaction_hash_from_cast_output(&stdout)
     }
 }
 
@@ -423,13 +501,13 @@ mod tests {
         let user_a_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"; // Anvil default 0
         let balance_a = relayer.get_balance(CHAIN_A_ID, user_a_address.to_string(), contracts.token_a_addr.clone()).await.map_err(|e| e.to_string())?; 
         println!("User A balance on Chain A: {}", balance_a);
-        assert!(balance_a > 0, "User A should have a positive balance"); // Simple check
+        assert!(balance_a > U256::zero(), "User A should have a positive balance");
 
         // 4. Test submit_release
         println!("\nTesting submit_release...");
         let swap_id_bytes: [u8; 32] = rand::random(); // Generate random swap ID
         let swap_id_hex = format!("0x{}", hex::encode(swap_id_bytes));
-        let release_amount = 10u64; // Small amount for testing
+        let release_amount_u256 = U256::from(10);
         let user_b_address = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"; // Anvil default 1
 
         // Get the hash the contract expects for release on Chain B
@@ -442,7 +520,7 @@ mod tests {
                 &swap_id_hex,
                 "true", // commit = true
                 &contracts.token_b_addr, // Release token on Chain B
-                &release_amount.to_string(),
+                &release_amount_u256.to_string(),
                 user_b_address, // recipient
                 "0x0000000000000000000000000000000000000000" // sender = 0 for release
             ]
@@ -463,7 +541,7 @@ mod tests {
             CHAIN_B_ID, // Target Chain B
             swap_id_bytes,
             contracts.token_b_addr.clone(),
-            release_amount,
+            release_amount_u256,
             user_b_address.to_string(),
             packed_signatures
         ).await.map_err(|e| e.to_string())?;
@@ -476,7 +554,7 @@ mod tests {
         // Post-release balance check
         let balance_b_after = relayer.get_balance(CHAIN_B_ID, user_b_address.to_string(), contracts.token_b_addr.clone()).await.map_err(|e| e.to_string())?; 
         println!("User B balance after release: {}", balance_b_after);
-        assert_eq!(balance_b_after, balance_b_before + release_amount, "User B balance incorrect after release");
+        assert_eq!(balance_b_after, balance_b_before + release_amount_u256, "User B balance incorrect after release");
         
         // Verify finalization state on chain
         let is_finalized_output = cast_call(RPC_URL_B, &contracts.escrow_b_addr, "isFinalized(bytes32)", &[&swap_id_hex]).await?;
@@ -488,7 +566,7 @@ mod tests {
         println!("\nTesting submit_abort...");
         let swap_id_abort_bytes: [u8; 32] = rand::random();
         let swap_id_abort_hex = format!("0x{}", hex::encode(swap_id_abort_bytes));
-        let lock_amount = 50u64;
+        let lock_amount_u256 = U256::from(50);
         
         // Need to lock funds on Chain A first
         println!("Locking funds on Chain A for abort test...");
@@ -500,7 +578,7 @@ mod tests {
                 &swap_id_abort_hex,
                 user_b_address,
                 &contracts.token_a_addr,
-                &lock_amount.to_string(),
+                &lock_amount_u256.to_string(),
                 "0" // Unlock time (not relevant here)
             ]
             // Add --private-key RELAYER_PK if using cast send
@@ -518,7 +596,7 @@ mod tests {
                 &swap_id_abort_hex,
                 "false", // commit = false
                 &contracts.token_a_addr, // Abort token on Chain A
-                &lock_amount.to_string(),
+                &lock_amount_u256.to_string(),
                 "0x0000000000000000000000000000000000000000", // recipient = 0 for abort
                 user_a_address // sender
             ]
@@ -539,7 +617,7 @@ mod tests {
             CHAIN_A_ID, // Target Chain A
             swap_id_abort_bytes,
             contracts.token_a_addr.clone(),
-            lock_amount,
+            lock_amount_u256,
             user_a_address.to_string(),
             packed_abort_signatures
         ).await.map_err(|e| e.to_string())?;
@@ -553,7 +631,7 @@ mod tests {
         println!("User A balance after abort: {}", balance_a_after_abort);
         // Balance should ideally be restored, but gas fees complicate exact check.
         // A simpler check might be that it increased.
-        // assert_eq!(balance_a_after_abort, balance_a_before_abort + lock_amount, "User A balance incorrect after abort");
+        // assert_eq!(balance_a_after_abort, balance_a_before_abort + lock_amount_u256, "User A balance incorrect after abort");
         assert!(balance_a_after_abort > balance_a_before_abort, "User A balance should increase after abort");
 
         // Verify finalization state on chain

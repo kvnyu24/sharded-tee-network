@@ -19,33 +19,31 @@ pub struct PartialSignature {
 #[derive(Debug, Clone)]
 pub struct ThresholdAggregator {
     required_threshold: usize,
-    message: Vec<u8>, // Store the message being signed
     // Store verified partial signatures: Map PublicKey bytes -> Signature
-    // Using BTreeMap for deterministic order if needed later.
+    // Key: Signer PK bytes, Value: (Signer PK, Verified Signature)
     verified_signatures: BTreeMap<Vec<u8>, (PublicKey, Signature)>,
 }
 
 impl ThresholdAggregator {
-    /// Creates a new aggregator for a given message and threshold.
-    pub fn new(message: &[u8], required_threshold: usize) -> Self {
+    /// Creates a new aggregator for a given threshold.
+    pub fn new(required_threshold: usize) -> Self {
         ThresholdAggregator {
             required_threshold,
-            message: message.to_vec(),
             verified_signatures: BTreeMap::new(),
         }
     }
 
-    /// Adds and verifies a partial signature to the aggregator.
+    /// Adds and verifies a partial signature against the provided message context.
     /// Returns Err if the signature is invalid or the signer has already added one.
-    pub fn add_partial_signature(&mut self, partial_sig: PartialSignature) -> Result<(), &'static str> {
+    pub fn add_partial_signature(&mut self, message: &[u8], partial_sig: PartialSignature) -> Result<(), &'static str> {
 
-        // Verify the partial signature using the signer's public key
-        if !verify(&self.message, &partial_sig.signature_data, &partial_sig.signer_id.public_key) {
+        // Verify the partial signature using the signer's public key against the provided message
+        if !verify(message, &partial_sig.signature_data, &partial_sig.signer_id.public_key) {
              println!(
                  "Aggregator: Partial signature verification failed for signer {}. Sig: {:?}, Msg: {:?}, Key: {:?}",
                  partial_sig.signer_id.id,
                  partial_sig.signature_data,
-                 self.message,
+                 message, // Log the message used for verification
                  partial_sig.signer_id.public_key
              );
             return Err("Partial signature verification failed");
@@ -178,7 +176,7 @@ mod tests {
         let message = b"approve_step_1";
         let threshold = 3;
 
-        let mut aggregator = ThresholdAggregator::new(message, threshold);
+        let mut aggregator = ThresholdAggregator::new(threshold);
 
         assert!(!aggregator.has_reached_threshold());
         assert!(aggregator.finalize_multi_signature().is_none());
@@ -188,13 +186,13 @@ mod tests {
         let partial_sig_2 = create_valid_partial_sig(&identities[2], keypairs[2], message);
         let partial_sig_4 = create_valid_partial_sig(&identities[4], keypairs[4], message);
 
-        assert!(aggregator.add_partial_signature(partial_sig_0).is_ok());
+        assert!(aggregator.add_partial_signature(message, partial_sig_0).is_ok());
         assert_eq!(aggregator.verified_signatures.len(), 1);
         assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.add_partial_signature(partial_sig_4).is_ok());
+        assert!(aggregator.add_partial_signature(message, partial_sig_4).is_ok());
         assert_eq!(aggregator.verified_signatures.len(), 2);
         assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.add_partial_signature(partial_sig_2).is_ok());
+        assert!(aggregator.add_partial_signature(message, partial_sig_2).is_ok());
         assert_eq!(aggregator.verified_signatures.len(), 3);
         assert!(aggregator.has_reached_threshold());
 
@@ -232,13 +230,13 @@ mod tests {
         let (identity0, keypair0) = create_real_tee(0);
         let message = b"message";
         let threshold = 1;
-        let mut aggregator = ThresholdAggregator::new(message, threshold);
+        let mut aggregator = ThresholdAggregator::new(threshold);
 
         let partial_sig_0 = create_valid_partial_sig(&identity0, &keypair0, message);
         let partial_sig_0_again = partial_sig_0.clone();
 
-        assert!(aggregator.add_partial_signature(partial_sig_0).is_ok());
-        let result = aggregator.add_partial_signature(partial_sig_0_again);
+        assert!(aggregator.add_partial_signature(message, partial_sig_0).is_ok());
+        let result = aggregator.add_partial_signature(message, partial_sig_0_again);
         assert!(result.is_err());
         // Error message updated
         assert_eq!(result.unwrap_err(), "Signer (key) has already provided a valid partial signature");
@@ -251,7 +249,7 @@ mod tests {
         let (_, keypair1) = create_real_tee(1); // Key doesn't match identity0
         let message = b"test_message";
         let threshold = 1;
-        let mut aggregator = ThresholdAggregator::new(message, threshold);
+        let mut aggregator = ThresholdAggregator::new(threshold);
 
         // Create signature with keypair1 but claim it's from identity0
         let invalid_sig_data = sign(message, &keypair1);
@@ -260,7 +258,7 @@ mod tests {
             signature_data: invalid_sig_data,
         };
 
-        let result = aggregator.add_partial_signature(invalid_partial_sig);
+        let result = aggregator.add_partial_signature(message, invalid_partial_sig);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Partial signature verification failed");
         assert!(aggregator.verified_signatures.is_empty());
@@ -274,13 +272,13 @@ mod tests {
 
         let message = b"another_message";
         let threshold = 3;
-        let mut aggregator = ThresholdAggregator::new(message, threshold);
+        let mut aggregator = ThresholdAggregator::new(threshold);
 
         let partial_sig_1 = create_valid_partial_sig(&identities[1], keypairs[1], message);
         let partial_sig_3 = create_valid_partial_sig(&identities[3], keypairs[3], message);
 
-        aggregator.add_partial_signature(partial_sig_1).unwrap();
-        aggregator.add_partial_signature(partial_sig_3).unwrap();
+        aggregator.add_partial_signature(message, partial_sig_1).unwrap();
+        aggregator.add_partial_signature(message, partial_sig_3).unwrap();
 
         assert!(!aggregator.has_reached_threshold());
         assert!(aggregator.finalize_multi_signature().is_none());

@@ -5,23 +5,38 @@ use crate::tee_logic::types::AttestationReport;
 // Import the new PartialSignature struct
 use crate::tee_logic::threshold_sig::PartialSignature;
 // Import the crypto sim components we need
-use crate::tee_logic::crypto_sim::{self, SecretKey, generate_keypair};
+use crate::tee_logic::crypto_sim::{self, SecretKey, generate_keypair, sign, PublicKey};
+use crate::tee_logic::types::Signature;
+use std::sync::{Arc, Mutex};
+use ed25519_dalek::SigningKey;
 
 // Simulate a TEE enclave environment
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EnclaveSim {
     pub identity: TEEIdentity,
     // Use a real Ed25519 keypair for the enclave
-    keypair: SecretKey,
+    signing_key: SecretKey,
+    // Store the public key for convenience
+    public_key: PublicKey,
+    // Placeholder for internal enclave state if needed
+    // internal_state: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl EnclaveSim {
     pub fn new(id: usize, existing_keypair: Option<SecretKey>) -> Self {
-        // Generate a real keypair for this enclave if not provided
-        let keypair = existing_keypair.unwrap_or_else(generate_keypair);
-        let public_key = keypair.verifying_key();
+        let signing_key = existing_keypair.unwrap_or_else(|| {
+            // Generate a deterministic key based on ID if none provided
+            let secret_bytes = [id as u8; 32];
+            SecretKey::from_bytes(&secret_bytes)
+        });
+        let public_key = signing_key.verifying_key();
         let identity = TEEIdentity { id, public_key };
-        EnclaveSim { identity, keypair }
+        EnclaveSim {
+            identity,
+            signing_key,
+            public_key,
+            // internal_state: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     // Helper for tests or scenarios where only ID is known
@@ -39,7 +54,7 @@ impl EnclaveSim {
         report_data.extend_from_slice(nonce);
         report_data.extend_from_slice(self.identity.public_key.as_bytes());
         // Sign the report data with the enclave's key
-        let signature = crypto_sim::sign(&report_data, &self.keypair);
+        let signature = crypto_sim::sign(&report_data, &self.signing_key);
 
         AttestationReport {
             report_data,
@@ -53,13 +68,24 @@ impl EnclaveSim {
          // Simulates the TEE using its threshold secret key share to sign the message.
          // Since we aren't implementing DKG/TSS, we use the enclave's main keypair for this.
          // In a real TSS, this would use a share derived from a group key.
-         let signature_data = crypto_sim::sign(message, &self.keypair);
+         let signature_data = crypto_sim::sign(message, &self.signing_key);
 
          PartialSignature {
              signer_id: self.identity.clone(),
              // Store the actual Ed25519 signature
              signature_data,
          }
+    }
+
+    /// Returns the public key of the simulated enclave.
+    pub fn get_public_key(&self) -> PublicKey {
+        self.public_key
+    }
+
+    /// Simulates signing a message within the enclave.
+    pub fn sign_message(&self, message: &[u8]) -> Signature {
+        // Use the imported sign function
+        sign(message, &self.signing_key)
     }
 }
 
@@ -79,7 +105,7 @@ mod tests {
         let sim = create_test_enclave(5);
         assert_eq!(sim.identity.id, 5);
         // Check that the public key in identity matches the keypair
-        assert_eq!(sim.identity.public_key, sim.keypair.verifying_key());
+        assert_eq!(sim.identity.public_key, sim.signing_key.verifying_key());
     }
 
     #[test]
@@ -121,5 +147,33 @@ mod tests {
 
         // Try to verify with sim2's public key (should fail)
         assert!(!verify(msg, &partial_sig.signature_data, &sim2.identity.public_key));
+    }
+
+    #[test]
+    fn test_enclave_sim_creation_and_signing() {
+        let enclave1 = EnclaveSim::new(1, None); // Generate key
+        let enclave2 = EnclaveSim::new(2, None); // Generate different key
+
+        assert_ne!(enclave1.get_public_key(), enclave2.get_public_key());
+
+        let message = b"hello simulation";
+
+        // Sign with enclave 1
+        let signature1 = enclave1.sign_message(message);
+
+        // Verify with enclave 1's public key (should pass)
+        assert!(verify(message, &signature1, &enclave1.get_public_key()));
+
+        // Verify with enclave 2's public key (should fail)
+        assert!(!verify(message, &signature1, &enclave2.get_public_key()));
+
+        // Test providing an existing key
+        let secret_bytes = [99u8; 32];
+        let existing_key = SecretKey::from_bytes(&secret_bytes);
+        let enclave_existing = EnclaveSim::new(3, Some(existing_key.clone()));
+        assert_eq!(enclave_existing.get_public_key(), existing_key.verifying_key());
+
+        let signature_existing = enclave_existing.sign_message(message);
+        assert!(verify(message, &signature_existing, &existing_key.verifying_key()));
     }
 } 

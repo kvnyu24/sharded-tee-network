@@ -13,6 +13,28 @@ pub struct AttestationReport {
     // Add other fields like TEE measurements, identity info, etc.
 }
 
+// Represents data related to a specific lock event that needs
+// consensus and signing by TEEs.
+// Add bincode Encode/Decode traits
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+pub struct LockProofData {
+    // Unique identifier for the overall transaction/swap
+    pub tx_id: String,
+    // Identifier for the source chain where the lock occurred
+    pub source_chain_id: u64,
+    // Identifier for the target chain where release should happen
+    pub target_chain_id: u64,
+    // Token being locked
+    pub token_address: String, // Assuming address uniquely identifies token on source chain
+    // Amount locked
+    pub amount: u64,
+    // Recipient address on the target chain
+    pub recipient: String,
+    // Potentially other relevant data like source sender, nonce, etc.
+    // pub source_sender: String,
+    // pub nonce: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

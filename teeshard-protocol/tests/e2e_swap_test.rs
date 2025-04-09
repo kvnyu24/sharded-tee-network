@@ -75,6 +75,84 @@ struct DeployedContracts {
 
 // --- Helper Functions ---\n
 
+// Helper to fund an account with ETH using cast send and wait for receipt
+async fn fund_account_on_chain(
+    rpc_url: &str,
+    recipient_address: &str,
+    amount_wei: &str, // Amount in Wei as a string
+    sender_pk: &str, // Private key of the sender (must be funded)
+) -> Result<(), String> {
+    println!(
+        "[HELPER] Funding {} with {} wei on {} from sender ending in {}...",
+        recipient_address,
+        amount_wei,
+        rpc_url,
+        &sender_pk[sender_pk.len()-4..]
+    );
+    let mut cmd_send = tokio::process::Command::new(CAST_PATH);
+    cmd_send.arg("send")
+       .arg(recipient_address)
+       .arg("--value")
+       .arg(amount_wei)
+       .arg("--private-key")
+       .arg(sender_pk)
+       .arg("--rpc-url")
+       .arg(rpc_url)
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+
+    let output_send = cmd_send.output().await
+        .map_err(|e| format!("[HELPER] Failed to execute cast send (funding): {}", e))?;
+
+    if !output_send.status.success() {
+        return Err(format!(
+            "[HELPER] cast send failed (funding): Status: {}\nStderr: {}",
+            output_send.status,
+            String::from_utf8_lossy(&output_send.stderr)
+        ));
+    }
+
+    // Parse transaction hash from stdout
+    let stdout_send = String::from_utf8_lossy(&output_send.stdout);
+    let tx_hash = stdout_send.lines()
+        .find(|line| line.trim_start().starts_with("transactionHash"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| format!("[HELPER] Failed to parse funding tx hash from output: {}", stdout_send))?;
+
+    println!("[HELPER] Funding transaction sent: {}. Waiting for receipt...", tx_hash);
+
+    // Wait for receipt using cast receipt in a loop
+    let max_retries = 10;
+    let retry_delay = Duration::from_secs(1);
+    for attempt in 0..max_retries {
+        let mut cmd_receipt = tokio::process::Command::new(CAST_PATH);
+        cmd_receipt.arg("receipt")
+            .arg(&tx_hash)
+            .arg("--rpc-url")
+            .arg(rpc_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        
+        let output_receipt = cmd_receipt.output().await
+            .map_err(|e| format!("[HELPER] Failed to execute cast receipt (funding): {}", e))?;
+        
+        if output_receipt.status.success() {
+            let stdout_receipt = String::from_utf8_lossy(&output_receipt.stdout);
+            // Check if the receipt contains a block number (indicating it's mined)
+            if stdout_receipt.contains("blockNumber") {
+                 println!("[HELPER] Funding transaction confirmed in receipt.");
+                 return Ok(());
+            }
+        }
+        // If receipt not found or not mined yet, wait and retry
+        println!("[HELPER] Receipt attempt {} failed or tx not mined yet. Retrying...", attempt + 1);
+        tokio::time::sleep(retry_delay).await;
+    }
+
+    Err(format!("[HELPER] Timed out waiting for funding transaction receipt ({})", tx_hash))
+}
+
 // Runs forge script and parses contract addresses
 // Adapted from evm_relayer tests
 fn run_forge_script() -> Result<DeployedContracts, String> {
@@ -184,12 +262,6 @@ fn create_tee_identity(id: usize, secret_bytes: &[u8; 32]) -> (TEEIdentity, Secr
     (TEEIdentity { id, public_key }, signing_key)
 }
 
-// Helper to parse balance output from cast call
-fn parse_hex_balance(hex_output: &str) -> Result<u128, String> {
-     u128::from_str_radix(hex_output.trim_start_matches("0x"), 16)
-        .map_err(|e| format!("[HELPER] Failed to parse balance output '{}' as hex: {}", hex_output, e))
-}
-
 // Helper to generate a deterministic swap_id (bytes32) from a string seed
 // Note: This is different from how the Solidity script generates it, use cautiously.
 fn generate_swap_id_bytes32(seed: &str) -> SwapId {
@@ -207,6 +279,20 @@ fn generate_swap_id_bytes32(seed: &str) -> SwapId {
 async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("--- Starting E2E Coordinator <> Relayer Test ---");
     println!("Requires Anvil running on {} and {}", RPC_URL_A, RPC_URL_B);
+
+    // NEW: Fund Relayer account on Chain B explicitly before script runs
+    // Use a known funded account (User A's PK from Anvil default set)
+    const USER_A_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"; // Default Anvil PK for 0xf39... 
+    const RELAYER_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"; // Relayer's address derived from RELAYER_PK
+    let funding_amount_wei = "10000000000000000000"; // 10 ETH in Wei
+
+    fund_account_on_chain(
+        RPC_URL_B, // Target Chain B
+        RELAYER_ADDRESS, 
+        funding_amount_wei, 
+        USER_A_PK // Fund from User A account
+    ).await?;
+    println!("[Setup] Sent funding transaction to Relayer account on Chain B.");
 
     // 1. Setup: Deploy contracts via Forge Script
     let contracts = run_forge_script()?;
@@ -351,9 +437,9 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     assert!(decision.commit, "Decision should be COMMIT (release)");
     println!("[Exec] Coordinator finalized COMMIT decision for swap {}", swap_id_str);
 
-    // Give the relayer call (submit_release) time to execute and mine
+    // Add back sleep: Relayer returns immediately, need to wait for tx mining
     println!("[Exec] Waiting for blockchain transaction...");
-    thread::sleep(Duration::from_secs(4)); // Adjust if needed
+    thread::sleep(Duration::from_secs(4)); // Adjust if needed, 4 sec seems reasonable for local Anvil
 
     // 8. Verification: Check EVM state after relayer call
     println!("[Verify] Verifying state on Chain B after release...");

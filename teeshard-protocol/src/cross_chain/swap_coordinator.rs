@@ -255,7 +255,7 @@ impl CrossChainCoordinator {
         if aggregator_option.is_none() {
             println!("Coordinator ({}): Creating {} aggregator for swap {}",
                      self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id);
-            *aggregator_option = Some(ThresholdAggregator::new(&message_bytes, threshold));
+            *aggregator_option = Some(ThresholdAggregator::new(threshold));
         }
 
         // We need to re-borrow mutably AFTER the potential assignment above.
@@ -271,7 +271,9 @@ impl CrossChainCoordinator {
             signature_data: local_signature,
         };
 
-        match aggregator.add_partial_signature(partial_sig.clone()) { // Clone partial_sig for potential broadcast
+        // Add the verified share to the aggregator
+        // Use refactored API: add_partial_signature takes message_bytes
+        match aggregator.add_partial_signature(&message_bytes, partial_sig.clone()) { // Clone partial_sig for potential broadcast
             Ok(_) => {
                 println!("Coordinator ({}): Added local {} signature share for swap {}. Total shares: {}",
                          self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
@@ -320,8 +322,11 @@ impl CrossChainCoordinator {
         };
 
         if let Some(aggregator) = aggregator_option {
-            // Verification against the message stored in the aggregator happens within add_partial_signature.
-            match aggregator.add_partial_signature(partial_sig) {
+            // Reconstruct the message bytes based on tx_id and commit flag
+            let message_bytes = Self::prepare_decision_message(tx_id, commit);
+            
+            // Verification against the reconstructed message happens within add_partial_signature.
+            match aggregator.add_partial_signature(&message_bytes, partial_sig) {
                 Ok(_) => {
                      println!("Coordinator ({}): Added remote {} signature share for swap {}. Total shares: {}",
                               self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
@@ -447,7 +452,7 @@ impl CrossChainCoordinator {
                                         target_chain_id, 
                                         swap_id, 
                                         token_address, // Use the extracted address
-                                        amount, 
+                                        amount.into(), // Use .into()
                                         recipient_address, 
                                         tee_signatures
                                     ).await {
@@ -521,7 +526,7 @@ impl CrossChainCoordinator {
                                         target_chain_id, 
                                         swap_id, 
                                         token_identifier, 
-                                        amount, 
+                                        amount.into(), // Use .into()
                                         sender_address, 
                                         tee_signatures
                                     ).await {
@@ -613,7 +618,7 @@ impl CrossChainCoordinator {
                                             target_chain_id, 
                                             swap_id, 
                                             token_identifier, 
-                                            amount, 
+                                            amount.into(), // Use .into()
                                             sender_address, 
                                             tee_signatures
                                         ).await {

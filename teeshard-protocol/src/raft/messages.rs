@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn append_entries_args_creation() {
-        let entries = vec![LogEntry { term: 2, command: Command(vec![0]) }];
+        let entries = vec![LogEntry { term: 1, command: Command::Dummy }, LogEntry { term: 2, command: Command::Dummy }];
         let args = AppendEntriesArgs {
             term: 2,
             leader_id: create_test_tee(0),
@@ -98,7 +98,7 @@ mod tests {
         };
         assert_eq!(args.term, 2);
         assert_eq!(args.leader_id.id, 0);
-        assert_eq!(args.entries.len(), 1);
+        assert_eq!(args.entries.len(), 2);
         assert_eq!(args.leader_commit, 3);
     }
 

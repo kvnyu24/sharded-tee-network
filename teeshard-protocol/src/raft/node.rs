@@ -59,7 +59,8 @@ impl fmt::Debug for RaftNode {
 }
 
 // Output of a Raft node tick/message handling
-#[derive(Debug)]
+// Derive Clone
+#[derive(Debug, Clone)]
 pub enum RaftEvent {
     SendMessage(TEEIdentity, RaftMessage),
     BroadcastMessage(RaftMessage),
@@ -495,34 +496,39 @@ impl RaftNode {
         vec![RaftEvent::SendMessage(peer.clone(), RaftMessage::AppendEntries(args))]
     }
 
-    // Leader proposes a command to be replicated
-    // Returns the index of the new log entry if successful
-    pub fn propose_command(&mut self, command: Command) -> Result<u64, &'static str> {
+    /// Returns the current role of the Raft node.
+    pub fn get_role(&self) -> RaftRole {
+        self.state.role
+    }
+
+    // Function for the leader to propose a new command to be replicated.
+    // Returns events (AppendEntries to followers) if leader, otherwise Noop.
+    // Make this public for testing/external proposal.
+    pub fn propose_command(&mut self, command: Command) -> Vec<RaftEvent> {
         if self.state.role != RaftRole::Leader {
-            return Err("Node is not the leader");
+            println!("Node {}: Non-leader tried to propose command {:?}. Ignoring.", self.state.id.id, command);
+            return vec![RaftEvent::Noop];
         }
 
+        println!("Node {}: Leader proposing command: {:?}", self.state.id.id, command);
         let new_entry = LogEntry {
             term: self.state.current_term,
             command,
         };
-        self.state.log.push(new_entry.clone());
-        self.storage.append_log_entries(&[new_entry]); // Persist the new entry
 
-        let new_log_index = self.state.last_log_index();
-        println!("Node {}: Leader proposed command, new log index {}", self.state.id.id, new_log_index);
+        // Append to leader's log
+        let new_log_index = self.state.last_log_index() + 1;
+        self.state.log.push(new_entry.clone()); // Clone entry for storage
+        self.storage.append_log_entries(&[new_entry]); // Persist
 
-        // Update leader's own match index
+        // Update leader's matchIndex for itself
         self.state.match_index.insert(self.state.id.clone(), new_log_index);
 
-        // Immediately send AppendEntries to replicate the new entry
-        // Note: This might be redundant if a heartbeat is due soon, but ensures faster replication
-        // self.send_append_entries(); // Consider if sending immediately is always best
-
-        Ok(new_log_index)
+        // Send AppendEntries to followers
+        self.send_append_entries()
     }
 
-    // Update commit index based on majority matchIndex (Leader only)
+    // Helper to advance commit index based on follower match indices
     fn update_commit_index(&mut self) {
         if self.state.role != RaftRole::Leader {
             return;
@@ -551,7 +557,7 @@ impl RaftNode {
         }
     }
 
-    // Apply entries from last_applied up to commit_index
+    // Helper to apply committed entries to the state machine
     fn apply_committed_entries(&mut self) -> RaftEvent {
         let mut commands_to_apply = Vec::new();
         // Note: commit_index and last_applied are 1-based
@@ -574,7 +580,8 @@ impl RaftNode {
             RaftEvent::Noop
         }
     }
-}
+} 
+
 
 #[cfg(test)]
 mod tests {
@@ -906,32 +913,36 @@ mod tests {
 
         // Propose a command to the leader
         let proposed_log_index;
-        let command_to_propose = Command(Vec::new()); // Fix 1: Use struct constructor for empty command
+        let command_to_propose = Command::Dummy; // Use Dummy variant
         {
             let leader_node_arc = nodes.get(&leader_id).unwrap();
             let mut leader_node = leader_node_arc.lock().unwrap();
-            assert_eq!(leader_node.state.role, RaftRole::Leader, "Node designated as leader is not in Leader role.");
-            proposed_log_index = leader_node.propose_command(command_to_propose.clone()).expect("Leader failed to propose command");
-             println!("Leader {} proposed command at index {}", leader_id.id, proposed_log_index);
-             // Fix 2: Process events from send_append_entries
-             let initial_append_events = leader_node.send_append_entries();
-             for event in initial_append_events {
-                 match event {
-                     RaftEvent::SendMessage(recipient, message) => {
-                         outgoing_messages.push((leader_id.clone(), recipient, message));
-                     }
-                     RaftEvent::BroadcastMessage(message) => { // Should not happen from send_append_entries, but handle defensively
-                         for peer_id in leader_node.peers.iter().cloned() {
-                             if &peer_id != &leader_id {
-                                 outgoing_messages.push((leader_id.clone(), peer_id, message.clone()));
-                             }
-                         }
-                     }
-                     _ => {} // Ignore Noop/ApplyToStateMachine from this context
-                 }
-             }
-        }
-        assert!(proposed_log_index > 0, "Proposed log index should be positive");
+            let events = leader_node.propose_command(command_to_propose.clone()); 
+            assert!(!events.is_empty(), "Leader should generate events when proposing command");
+            proposed_log_index = leader_node.state.last_log_index();
+            
+            // Process events from propose_command to generate messages
+            for event in events {
+                match event {
+                    RaftEvent::SendMessage(recipient, message) => {
+                        outgoing_messages.push((leader_id.clone(), recipient, message));
+                    }
+                    RaftEvent::BroadcastMessage(message) => {
+                        for peer_id in leader_node.peers.iter().cloned() {
+                            if &peer_id != &leader_id {
+                                outgoing_messages.push((leader_id.clone(), peer_id, message.clone()));
+                            }
+                        }
+                    }
+                    // ApplyToStateMachine shouldn't happen directly from propose, but handle defensively
+                    RaftEvent::ApplyToStateMachine(commands) => {
+                         println!("Unexpected ApplyToStateMachine event from propose_command on node {}", leader_id.id);
+                    }
+                    RaftEvent::Noop => {}
+                }
+            }
+        } // Lock released here
+        println!("Leader {} proposed command {:?} at index {}", leader_id.id, command_to_propose, proposed_log_index);
 
          println!("Running simulation for replication and commit...");
          // Run simulation enough times for replication, commit, and application
@@ -1016,5 +1027,36 @@ mod tests {
              assert!(leader_next_index == leader_match_index + 1, "Leader next_index for follower {} ({}) should be match_index + 1 ({})", id.id, leader_next_index, leader_match_index + 1);
          }
          println!("Log replication and commit test passed.");
+    }
+
+    #[test]
+    fn test_propose_command_as_leader() {
+        // Manual setup for a single node
+        let config = SystemConfig::default();
+        let node_id = create_identity(1); // Use helper from the same test module
+        let peers = Vec::new(); // No peers for this simple test
+        let storage = Box::new(InMemoryStorage::new());
+        let enclave = EnclaveSim::new(node_id.id, None); 
+        let mut node = RaftNode::new(node_id.clone(), peers, config, storage.clone(), enclave); 
+
+        node.state.role = RaftRole::Leader; // Force leader state
+        let prev_log_index = node.state.last_log_index();
+        let current_term = node.state.current_term;
+
+        let command_to_propose = Command::Dummy; // Use Dummy variant
+        let events = node.propose_command(command_to_propose.clone()); 
+
+        // Assertions for a leader with NO peers:
+        assert_eq!(events.len(), 0, "Leader with no peers should not generate network events on propose");
+
+        let new_log_index = node.state.last_log_index();
+        assert_eq!(new_log_index, prev_log_index + 1, "Log index should increment after propose");
+
+        let last_entry = node.state.log.last().expect("Log should have an entry after propose");
+        assert_eq!(last_entry.term, current_term, "New log entry should have the leader's current term");
+        assert_eq!(last_entry.command, command_to_propose, "New log entry should contain the proposed command");
+
+        let self_match_index = node.state.match_index.get(&node_id).copied().expect("Leader should have match_index for itself");
+        assert_eq!(self_match_index, new_log_index, "Leader's self match_index should be updated");
     }
 } 

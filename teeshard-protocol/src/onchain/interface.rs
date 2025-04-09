@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::error::Error;
+use ethers::types::{U256, Address};
 
 // Define a generic error type for blockchain operations
 pub type BlockchainError = Box<dyn Error + Send + Sync>;
@@ -25,7 +26,7 @@ pub trait BlockchainInterface: Send + Sync {
         chain_id: u64,
         swap_id: SwapId,
         token_address: String, // Assuming address as String for simplicity
-        amount: u64,
+        amount: U256,
         recipient_address: String,
         tee_signatures: SignatureBytes,
     ) -> Result<TransactionId, BlockchainError>;
@@ -36,7 +37,7 @@ pub trait BlockchainInterface: Send + Sync {
         chain_id: u64,
         swap_id: SwapId,
         token_address: String,
-        amount: u64,
+        amount: U256,
         sender_address: String, // Original sender who locked funds
         tee_signatures: SignatureBytes,
     ) -> Result<TransactionId, BlockchainError>;
@@ -47,7 +48,29 @@ pub trait BlockchainInterface: Send + Sync {
         chain_id: u64,
         account_address: String,
         token_address: String,
-    ) -> Result<u64, BlockchainError>;
+    ) -> Result<U256, BlockchainError>;
+
+    /// Submits a transaction to lock funds in escrow on the source chain.
+    async fn lock(
+        &self,
+        chain_id: u64,
+        sender_private_key: String,
+        swap_id: [u8; 32],
+        recipient: String, // Assuming address format
+        token_address: String, // Assuming address format
+        amount: U256,
+        timeout_seconds: u64,
+    ) -> Result<TransactionId, BlockchainError>;
+
+    /// Submits an ERC20 approve transaction.
+    async fn approve_erc20(
+        &self,
+        chain_id: u64,
+        owner_private_key: String,
+        token_address: String,
+        spender_address: String,
+        amount: U256,
+    ) -> Result<TransactionId, BlockchainError>;
 
     // TODO: Potentially add methods for:
     // - get_lock_proof(chain_id, original_tx_id) -> Result<LockProof, Error>
