@@ -428,18 +428,22 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("[Verify] User B balance before release: {}", balance_b_before);
 
+    // Await the async call and handle the Result/Option
+    let finalization_result = coordinator.process_proof_and_finalize(lock_proof).await;
 
-    let finalization_result = coordinator.process_proof_and_finalize(lock_proof);
-
-    // Check if coordinator attempted finalization
-    assert!(finalization_result.is_some(), "Finalization should produce a decision with threshold 1");
-    let decision = finalization_result.unwrap();
-    assert!(decision.commit, "Decision should be COMMIT (release)");
-    println!("[Exec] Coordinator finalized COMMIT decision for swap {}", swap_id_str);
-
-    // Add back sleep: Relayer returns immediately, need to wait for tx mining
-    println!("[Exec] Waiting for blockchain transaction...");
-    thread::sleep(Duration::from_secs(4)); // Adjust if needed, 4 sec seems reasonable for local Anvil
+    // Check if coordinator attempted finalization and it was successful (returned Ok(Some(...)))
+    match finalization_result {
+        Ok(Some(decision)) => {
+            assert!(decision.commit, "Finalization decision should be COMMIT");
+            println!("[Exec] Coordinator finalized COMMIT decision for swap {} and blockchain submission successful.", swap_id_str);
+        }
+        Ok(None) => {
+            panic!("Coordinator did not reach final decision (still waiting for proofs/signatures?) - Unexpected for threshold 1");
+        }
+        Err(abort_reason) => {
+            panic!("Coordinator aborted swap unexpectedly: {:?}", abort_reason);
+        }
+    }
 
     // 8. Verification: Check EVM state after relayer call
     println!("[Verify] Verifying state on Chain B after release...");

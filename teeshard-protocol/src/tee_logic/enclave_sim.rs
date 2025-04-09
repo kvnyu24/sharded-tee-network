@@ -123,8 +123,9 @@ mod tests {
 
     // Helper to create EnclaveSim for testing
     fn create_test_enclave(id: usize) -> EnclaveSim {
-        // Use the helper that generates a key
-        EnclaveSim::new_with_generated_key(id)
+        // Generate a key and pass it to new()
+        let signing_key = crypto_sim::generate_keypair();
+        EnclaveSim::new(id, Some(signing_key))
     }
 
     #[test]

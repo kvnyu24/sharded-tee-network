@@ -19,6 +19,65 @@ use std::{
 };
 use regex::Regex;
 use ethers::types::U256;
+use std::fmt;
+
+// --- START: EvmRelayerError Definition ---
+#[derive(Debug)]
+pub enum EvmRelayerError {
+    ConfigNotFound(String),
+    CommandError(String),
+    TransactionFailed(String),
+    ReceiptTimeout(String),
+    ParseError(String),
+    IoError(std::io::Error),
+    HexError(hex::FromHexError),
+    Other(String),
+}
+
+impl fmt::Display for EvmRelayerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvmRelayerError::ConfigNotFound(s) => write!(f, "Configuration Error: {}", s),
+            EvmRelayerError::CommandError(s) => write!(f, "Command Execution Error: {}", s),
+            EvmRelayerError::TransactionFailed(s) => write!(f, "Transaction Failed: {}", s),
+            EvmRelayerError::ReceiptTimeout(s) => write!(f, "Timeout waiting for receipt: {}", s),
+            EvmRelayerError::ParseError(s) => write!(f, "Parsing Error: {}", s),
+            EvmRelayerError::IoError(e) => write!(f, "IO Error: {}", e),
+            EvmRelayerError::HexError(e) => write!(f, "Hex Decoding Error: {}", e),
+            EvmRelayerError::Other(s) => write!(f, "Relayer Error: {}", s),
+        }
+    }
+}
+
+impl StdError for EvmRelayerError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            EvmRelayerError::IoError(e) => Some(e),
+            EvmRelayerError::HexError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+// Implement From conversion for easier error handling within functions
+impl From<std::io::Error> for EvmRelayerError {
+    fn from(err: std::io::Error) -> Self {
+        EvmRelayerError::IoError(err)
+    }
+}
+
+impl From<hex::FromHexError> for EvmRelayerError {
+    fn from(err: hex::FromHexError) -> Self {
+        EvmRelayerError::HexError(err)
+    }
+}
+
+impl From<String> for EvmRelayerError {
+    fn from(err: String) -> Self {
+        EvmRelayerError::Other(err)
+    }
+}
+// --- END: EvmRelayerError Definition ---
 
 // Config for a single chain
 #[derive(Debug, Clone)]
@@ -52,7 +111,7 @@ impl EvmRelayer {
     // Helper to get chain config based on chain_id
     fn get_chain_config(&self, chain_id: u64) -> Result<&ChainConfig, BlockchainError> {
         self.config.chain_details.get(&chain_id)
-            .ok_or_else(|| format!("Configuration not found for chain_id: {}", chain_id).into())
+            .ok_or_else(|| EvmRelayerError::ConfigNotFound(format!("Configuration not found for chain_id: {}", chain_id)))
     }
 
     // --- START: New Helper function for parsing tx hash ---
@@ -66,9 +125,8 @@ impl EvmRelayer {
                 }
             }
         }
-        // Fallback or additional checks if needed?
-        // For now, return error if specific format not found.
-        Err(format!("Failed to parse transaction hash from cast send output: {}", stdout).into())
+        // Use ParseError variant
+        Err(EvmRelayerError::ParseError(format!("Failed to parse transaction hash from cast send output: {}", stdout)))
     }
     // --- END: New Helper function ---
 }
@@ -98,11 +156,11 @@ impl BlockchainInterface for EvmRelayer {
 
         println!("Executing command: {:?}", cmd);
 
-        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast call: {}", e))?;
+        let output = cmd.output().await.map_err(|e| EvmRelayerError::CommandError(format!("Failed to execute cast call: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("cast call failed: Status: {}\nStderr: {}", output.status, stderr).into());
+            return Err(EvmRelayerError::TransactionFailed(format!("cast call failed: Status: {}\\nStderr: {}", output.status, stderr)));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -111,7 +169,8 @@ impl BlockchainInterface for EvmRelayer {
         
         // Parse directly into U256
         let balance = U256::from_str_radix(hex_output.trim_start_matches("0x"), 16)
-            .map_err(|e| format!("Failed to parse cast output '{}' as hex U256: {}", hex_output, e))?;
+             // Use ParseError variant, remove unused `e`
+            .map_err(|_| EvmRelayerError::ParseError(format!("Failed to parse cast output '''' as hex U256: {}", hex_output)))?;
             
         Ok(balance)
     }
@@ -131,40 +190,30 @@ impl BlockchainInterface for EvmRelayer {
         let rpc_url = &chain_config.rpc_url;
         let escrow_address = &chain_config.escrow_address;
 
-        // Format arguments for cast send
+        // Format arguments
         let swap_id_hex = format!("0x{}", hex::encode(swap_id)); 
         let signatures_hex = format!("0x{}", hex::encode(&tee_signatures));
         let amount_str = amount.to_string();
+        
+        let args = vec![
+            swap_id_hex,
+            token_address,
+            amount_str,
+            recipient_address,
+            signatures_hex,
+        ];
 
-        let mut cmd = Command::new(&self.config.cast_path);
-        cmd.arg("send")
-           .arg(escrow_address) // Target contract
-           .arg("release(bytes32,address,uint256,address,bytes)") 
-           .arg(&swap_id_hex)
-           .arg(&token_address)
-           .arg(&amount_str)
-           .arg(&recipient_address)
-           .arg(&signatures_hex)
-           .arg("--private-key")
-           .arg(&self.config.relayer_private_key)
-           .arg("--gas-limit") 
-           .arg("1000000") 
-           .arg("--rpc-url")
-           .arg(rpc_url)
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped());
-
-        println!("Executing command: {:?}", cmd);
-
-        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (release): {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("cast send failed (release): Status: {}\nStderr: {}", output.status, stderr).into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        self.parse_transaction_hash_from_cast_output(&stdout)
+        // Use the helper function
+        run_cast_send(
+            self.config.cast_path.to_str().ok_or_else(|| EvmRelayerError::Other("Invalid cast path".to_string()))?,
+            rpc_url,
+            &self.config.relayer_private_key,
+            escrow_address,
+            "release(bytes32,address,uint256,address,bytes)",
+            &args,
+            None, // No ETH value
+            Some(1_000_000) // Gas limit
+        ).await
     }
 
     // Implement submit_abort
@@ -185,35 +234,25 @@ impl BlockchainInterface for EvmRelayer {
         let signatures_hex = format!("0x{}", hex::encode(&tee_signatures));
         let amount_str = amount.to_string();
 
-        let mut cmd = Command::new(&self.config.cast_path);
-        cmd.arg("send")
-           .arg(escrow_address) // Target contract
-           .arg("abort(bytes32,address,uint256,address,bytes)") 
-           .arg(&swap_id_hex)
-           .arg(&token_address)
-           .arg(&amount_str)
-           .arg(&sender_address) 
-           .arg(&signatures_hex)
-           .arg("--private-key")
-           .arg(&self.config.relayer_private_key)
-           .arg("--gas-limit") 
-           .arg("1000000") 
-           .arg("--rpc-url")
-           .arg(rpc_url)
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped());
+        let args = vec![
+            swap_id_hex,
+            token_address,
+            amount_str,
+            sender_address, 
+            signatures_hex,
+        ];
 
-        println!("Executing command: {:?}", cmd);
-
-        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (abort): {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("cast send failed (abort): Status: {}\nStderr: {}", output.status, stderr).into());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        self.parse_transaction_hash_from_cast_output(&stdout)
+        // Use the helper function
+        run_cast_send(
+            self.config.cast_path.to_str().ok_or_else(|| EvmRelayerError::Other("Invalid cast path".to_string()))?,
+            rpc_url,
+            &self.config.relayer_private_key,
+            escrow_address,
+            "abort(bytes32,address,uint256,address,bytes)",
+            &args,
+            None, // No ETH value
+            Some(1_000_000) // Gas limit
+        ).await
     }
 
     // --- Add the lock function ---
@@ -229,51 +268,42 @@ impl BlockchainInterface for EvmRelayer {
     ) -> Result<TransactionId, BlockchainError> {
         let chain_config = self.get_chain_config(chain_id)?;
 
-        let swap_id_hex = hex::encode(swap_id);
+        let swap_id_hex = format!("0x{}", hex::encode(swap_id));
         let now = std::time::SystemTime::now();
         let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| -> BlockchainError { Box::new(e) })?;
+            .map_err(|e| EvmRelayerError::Other(format!("System time error: {}", e)))?;
         let lock_expiry_timestamp = duration_since_epoch.as_secs() + timeout_seconds;
 
         println!(
-            "[Relayer] Executing lock: chain={}, escrow={}, swap_id={}, token={}, amount={}, recipient={}, expiry={}",
+            "[Relayer] Preparing lock: chain={}, escrow={}, swap_id={}, token={}, amount={}, recipient={}, expiry={}",
             chain_id,
             chain_config.escrow_address,
-            swap_id_hex,
+            swap_id_hex, // Use hex string for logging
             token_address,
             amount,
             recipient,
             lock_expiry_timestamp
         );
 
+        let args = vec![
+            swap_id_hex, // Use hex string for arg too
+            recipient,
+            token_address,
+            amount.to_string(),
+            lock_expiry_timestamp.to_string(),
+        ];
 
-        let mut cmd = Command::new(self.config.cast_path.to_str().unwrap());
-        cmd.arg("send")
-            .arg(&chain_config.escrow_address)
-            .arg("lock(bytes32,address,address,uint256,uint256)")
-            .arg(format!("0x{}", swap_id_hex))
-            .arg(&recipient)
-            .arg(&token_address)
-            .arg(amount.to_string())
-            .arg(lock_expiry_timestamp.to_string())
-            .arg("--private-key")
-            .arg(sender_private_key)
-            .arg("--rpc-url")
-            .arg(&chain_config.rpc_url);
-        
-        println!("[Relayer] Executing command: {:?}", cmd);
-
-        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (lock): {}", e))?;
-
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("cast send failed (lock): Status: {}\nStdout: {}\nStderr: {}", output.status, stdout, stderr).into());
-        }
-
-        // Use the helper function for parsing
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        self.parse_transaction_hash_from_cast_output(&stdout)
+        // Use the helper function
+        run_cast_send(
+            self.config.cast_path.to_str().ok_or_else(|| EvmRelayerError::Other("Invalid cast path".to_string()))?,
+            &chain_config.rpc_url,
+            &sender_private_key, // Use the specific sender key for lock
+            &chain_config.escrow_address,
+            "lock(bytes32,address,address,uint256,uint256)",
+            &args,
+            None, // No ETH value
+            Some(1_000_000) // Gas limit
+        ).await
     }
     // --- End of lock function ---
 
@@ -287,40 +317,26 @@ impl BlockchainInterface for EvmRelayer {
     ) -> Result<TransactionId, BlockchainError> {
         let chain_config = self.get_chain_config(chain_id)?;
         let rpc_url = &chain_config.rpc_url;
-        // No need for escrow_address here
 
-        // Format arguments for cast send
-        let amount_str = amount.to_string(); // Convert U256 to string
+        // Format arguments
+        let amount_str = amount.to_string();
 
-        let mut cmd = Command::new(&self.config.cast_path);
-        cmd.arg("send")
-           .arg(&token_address) // Target Token contract
-           // Function signature and arguments for approve
-           .arg("approve(address,uint256)") 
-           .arg(&spender_address)
-           .arg(&amount_str)
-           // Use the provided signer's private key
-           .arg("--private-key")
-           .arg(&owner_private_key)
-           .arg("--gas-limit") // Add explicit gas limit
-           .arg("1000000") // Adjust if needed
-           .arg("--rpc-url")
-           .arg(rpc_url)
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped());
+        let args = vec![
+            spender_address,
+            amount_str,
+        ];
 
-        println!("Executing command: {:?}", cmd);
-
-        let output = cmd.output().await.map_err(|e| format!("Failed to execute cast send (approve): {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("cast send failed (approve): Status: {}\nStderr: {}", output.status, stderr).into());
-        }
-
-        // Use the helper function for parsing
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        self.parse_transaction_hash_from_cast_output(&stdout)
+        // Use the helper function
+        run_cast_send(
+            self.config.cast_path.to_str().ok_or_else(|| EvmRelayerError::Other("Invalid cast path".to_string()))?,
+            rpc_url,
+            &owner_private_key, // Use the owner's key
+            &token_address, // Target is the token contract
+            "approve(address,uint256)",
+            &args,
+            None, // No ETH value
+            Some(1_000_000) // Gas limit
+        ).await
     }
 }
 
@@ -334,7 +350,7 @@ async fn run_cast_send(
     args: &[String],
     value: Option<&str>, // Optional value for sending ETH
     gas_limit: Option<u64>,
-) -> Result<String, BlockchainError> {
+) -> Result<String, EvmRelayerError> {
     let mut cmd = tokio::process::Command::new(cast_path);
     cmd.arg("send")
        .arg(to)
@@ -354,7 +370,7 @@ async fn run_cast_send(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     println!("[Relayer] Executing command: {:?}", cmd);
-    let output = cmd.output().await.map_err(|e| BlockchainError::CommandError(format!("Failed to execute cast send: {}", e)))?;
+    let output = cmd.output().await.map_err(|e| EvmRelayerError::CommandError(format!("Failed to execute cast send: {}", e)))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -365,7 +381,7 @@ async fn run_cast_send(
     }
 
     if !output.status.success() {
-        return Err(BlockchainError::TransactionFailed(format!(
+        return Err(EvmRelayerError::TransactionFailed(format!(
             "cast send failed with status: {}. Stderr: {}",
             output.status,
             stderr
@@ -377,7 +393,7 @@ async fn run_cast_send(
         .find(|line| line.trim_start().starts_with("transactionHash"))
         .and_then(|line| line.split_whitespace().nth(1))
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| BlockchainError::CommandError(format!("Failed to parse tx hash from output: {}", stdout)))?;
+        .ok_or_else(|| EvmRelayerError::ParseError(format!("Failed to parse tx hash from output: {}", stdout)))?;
 
     println!("[Relayer] Transaction sent: {}. Waiting for receipt...", tx_hash);
 
@@ -385,8 +401,40 @@ async fn run_cast_send(
     let max_retries = 10;
     let retry_delay = Duration::from_secs(1); // Use std::time::Duration
     for attempt in 0..max_retries {
-        // ... existing code ...
+        println!("[Relayer] Checking receipt attempt {} for {}...", attempt + 1, tx_hash);
+        let mut receipt_cmd = tokio::process::Command::new(cast_path);
+        receipt_cmd.arg("receipt")
+            .arg(&tx_hash)
+            .arg("--rpc-url")
+            .arg(rpc_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        match receipt_cmd.output().await {
+            Ok(receipt_output) => {
+                if receipt_output.status.success() {
+                    let receipt_stdout = String::from_utf8_lossy(&receipt_output.stdout);
+                    if receipt_stdout.contains("blockNumber") && receipt_stdout.contains("status: 1") {
+                        println!("[Relayer] Receipt received and transaction confirmed for {}.", tx_hash);
+                        return Ok(tx_hash); // Return success when receipt is found
+                    } else if receipt_stdout.contains("status: 0") {
+                        println!("[Relayer] Transaction {} failed according to receipt!", tx_hash);
+                        return Err(EvmRelayerError::TransactionFailed(format!("Transaction {} failed on-chain (status 0 in receipt)", tx_hash)));
+                    }
+                }
+                // If status is not success or doesn't contain expected fields, continue loop
+                println!("[Relayer] Receipt not ready or invalid (attempt {}).", attempt + 1);
+            }
+            Err(e) => {
+                println!("[Relayer] Error executing cast receipt (attempt {}): {}", attempt + 1, e);
+                // Optionally return error here or just let it retry
+            }
+        }
+        tokio::time::sleep(retry_delay).await; // Use tokio sleep
     }
+
+    // If loop finishes without returning, it's a timeout
+    Err(EvmRelayerError::ReceiptTimeout(format!("Timed out waiting for receipt for tx: {}", tx_hash)))
 }
 
 #[cfg(test)]

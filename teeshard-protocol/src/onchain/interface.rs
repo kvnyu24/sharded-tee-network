@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use std::error::Error;
 use ethers::types::{U256, Address};
+use crate::onchain::evm_relayer::EvmRelayerError;
 
 // Define a generic error type for blockchain operations
-pub type BlockchainError = Box<dyn Error + Send + Sync>;
+pub type BlockchainError = EvmRelayerError;
 
 // Define a type for transaction identifiers (e.g., hash)
 // Using String for now, could be a specific hash type like H256

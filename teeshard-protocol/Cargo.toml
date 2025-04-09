@@ -18,8 +18,11 @@ async-trait = "0.1"
 hex = "0.4"
 regex = "1"
 futures = "0.3.31"
-bincode = "2.0.1"
+bincode = "2.0.0-rc.3"
 ethers = { version = "2.0", features = ["abigen", "rustls", "ws"] }
+serde_bytes = "0.11"
+log = "0.4"
+thiserror = "1.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
