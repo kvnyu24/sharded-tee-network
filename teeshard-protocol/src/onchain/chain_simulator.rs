@@ -135,7 +135,11 @@ mod tests {
     }
 
     fn create_test_asset(chain_id: u64, symbol: &str) -> AssetId {
-        AssetId { chain_id, token_symbol: symbol.to_string() }
+        AssetId {
+            chain_id,
+            token_symbol: symbol.to_string(),
+            token_address: format!("0x{}_ADDRESS_SIM", symbol),
+        }
     }
 
     #[test]

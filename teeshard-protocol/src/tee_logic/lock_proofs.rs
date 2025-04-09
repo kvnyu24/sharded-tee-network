@@ -77,7 +77,6 @@ pub fn verify_lock_proof(
     verify(&data_to_verify, &proof.attestation_or_sig, supposed_signer_pubkey)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,16 +88,20 @@ mod tests {
     fn create_test_lock_info() -> LockInfo {
         LockInfo {
             account: AccountId { chain_id: 1, address: "acc1".to_string() },
-            asset: AssetId { chain_id: 1, token_symbol: "TOK".to_string() },
+            asset: AssetId {
+                chain_id: 1,
+                token_symbol: "TOK".to_string(),
+                token_address: "0x0000000000000000000000000000000000000001".to_string(), // Placeholder added
+            },
             amount: 100,
         }
     }
 
      // Helper to create TEEIdentity and its keypair
      fn create_real_tee_kp(id: usize) -> (TEEIdentity, ed25519_dalek::SigningKey) {
-        let keypair = generate_keypair();
-        let identity = TEEIdentity { id, public_key: keypair.verifying_key() };
-        (identity, keypair)
+        let (signing_key, verifying_key) = generate_keypair(); // Destructure the keypair tuple
+        let identity = TEEIdentity { id, public_key: verifying_key }; // Use the verifying key part
+        (identity, signing_key) // Return the TEEIdentity and the signing key part
     }
 
     #[test]
@@ -138,7 +141,7 @@ mod tests {
         // Generate a proof with tampered signature
         let mut tampered_proof = generate_lock_proof("tx3", 3, &lock_info, &tee1, &signing_key1);
         // Create a different signature to simulate tampering
-        let different_key = generate_keypair();
+        let (different_key, _) = generate_keypair(); // Corrected: Only need the signing key
         tampered_proof.attestation_or_sig = sign(b"different data", &different_key);
 
 
@@ -150,5 +153,36 @@ mod tests {
 
         // Verify tampered proof with correct signer public key (should fail)
         assert!(!verify_lock_proof(&tampered_proof, &tee1.public_key), "Verification should fail for tampered proof");
+    }
+
+    #[test]
+    fn test_lock_proof_verification() {
+        let (keypair, pubkey) = generate_keypair(); // TEE keypair
+        let lock_info = LockInfo {
+            account: AccountId { chain_id: 1, address: "user1_address".to_string() },
+            asset: AssetId {
+                chain_id: 1,
+                token_symbol: "TOK".to_string(),
+                token_address: "0x0000000000000000000000000000000000000001".to_string(),
+            },
+            amount: 100,
+        };
+        let (tee, signing_key) = create_real_tee_kp(5);
+        // Pass the signing key to generate
+        let proof = generate_lock_proof("tx123", 0, &lock_info, &tee, &signing_key);
+
+        assert_eq!(proof.tx_id, "tx123");
+        assert_eq!(proof.shard_id, 0);
+        assert_eq!(proof.lock_info, lock_info);
+
+        // Check dummy data check - Recalculate expected signature
+        let mut expected_data_to_sign = b"tx123".to_vec();
+        expected_data_to_sign.extend_from_slice(&0usize.to_le_bytes()); // shard_id
+        expected_data_to_sign.extend_from_slice(lock_info.account.address.as_bytes());
+        expected_data_to_sign.extend_from_slice(lock_info.asset.token_symbol.as_bytes());
+        expected_data_to_sign.extend_from_slice(&lock_info.amount.to_le_bytes());
+        // Use the actual signing key to get expected signature
+        let expected_signature = sign(&expected_data_to_sign, &signing_key);
+        assert_eq!(proof.attestation_or_sig.to_bytes(), expected_signature.to_bytes());
     }
 }

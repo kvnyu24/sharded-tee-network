@@ -1,5 +1,5 @@
 use crate::config::SystemConfig;
-use crate::data_structures::{AccountId, Transaction, GraphNode, GraphEdge, TEEIdentity, TxType};
+use crate::data_structures::{AccountId, Transaction, GraphNode, GraphEdge, TEEIdentity, TxType, AssetId, LockInfo};
 use std::collections::{HashMap, HashSet};
 use crate::tee_logic::crypto_sim::generate_keypair;
 
@@ -266,6 +266,15 @@ impl ShardManager {
         self.account_to_shard.get(account)
             .and_then(|shard_id| self.partitions.get(*shard_id))
     }
+
+    // Helper function to create AssetId for testing
+    fn create_test_asset(chain_id: u64, symbol: &str) -> AssetId {
+        AssetId {
+            chain_id,
+            token_symbol: symbol.to_string(),
+            token_address: format!("0x{}_ADDRESS", symbol), // Use a derived placeholder
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,7 +302,11 @@ mod tests {
     }
 
     fn create_test_asset(chain_id: u64, symbol: &str) -> AssetId {
-         AssetId { chain_id, token_symbol: symbol.to_string() }
+        AssetId {
+            chain_id,
+            token_symbol: symbol.to_string(),
+            token_address: format!("0x{}_ADDRESS", symbol), // Use a derived placeholder
+        }
     }
 
     // Simplified transactions for refinement test
@@ -308,11 +321,11 @@ mod tests {
 
         // Transactions designed to give weights A=5, B=2, C=2, D=1
         vec![
-            Transaction { tx_id: "t1".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_b.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
-            Transaction { tx_id: "t2".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_c.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
-            Transaction { tx_id: "t3".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_d.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
-             Transaction { tx_id: "t4".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_b.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) }, // A and B again
-             Transaction { tx_id: "t5".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_c.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) }, // A and C again
+            Transaction { tx_id: "t1".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_b.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
+            Transaction { tx_id: "t2".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_c.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
+            Transaction { tx_id: "t3".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_d.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
+             Transaction { tx_id: "t4".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_b.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None }, // A and B again
+             Transaction { tx_id: "t5".into(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a.clone(), acc_c.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None }, // A and C again
         ]
     }
 
@@ -377,10 +390,21 @@ mod tests {
         let asset_a = create_test_asset(1, "AAA");
         let asset_b = create_test_asset(2, "BBB");
         vec![
-            Transaction { tx_id: "tx1".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a1.clone(), acc_a2.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
-            Transaction { tx_id: "tx2".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a2.clone(), acc_a3.clone()], amounts: vec![50], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
-            Transaction { tx_id: "tx3".to_string(), tx_type: TxType::CrossChainSwap, accounts: vec![acc_a1.clone(), acc_a2.clone(), acc_b1.clone(), acc_b2.clone()], amounts: vec![200, 300], required_locks: vec![ LockInfo { account: acc_a1.clone(), asset: asset_a.clone(), amount: 200 }, LockInfo { account: acc_b1.clone(), asset: asset_b.clone(), amount: 300 }, ], timeout: std::time::Duration::from_secs(60) },
-            Transaction { tx_id: "tx4".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a1.clone(), acc_a3.clone()], amounts: vec![75], required_locks: vec![], timeout: std::time::Duration::from_secs(60) },
+            Transaction { tx_id: "tx1".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a1.clone(), acc_a2.clone()], amounts: vec![10], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
+            Transaction { tx_id: "tx2".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a2.clone(), acc_a3.clone()], amounts: vec![50], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
+            Transaction { 
+                tx_id: "tx3".to_string(), 
+                tx_type: TxType::CrossChainSwap, 
+                accounts: vec![acc_a1.clone(), acc_a2.clone(), acc_b1.clone(), acc_b2.clone()], 
+                amounts: vec![200, 300], 
+                required_locks: vec![ 
+                    LockInfo { account: acc_a1.clone(), asset: asset_a.clone(), amount: 200 }, 
+                    LockInfo { account: acc_b1.clone(), asset: asset_b.clone(), amount: 300 }, 
+                ], 
+                timeout: std::time::Duration::from_secs(60), 
+                target_asset: Some(asset_b.clone()) // Corrected: Set target asset for swap
+            },
+            Transaction { tx_id: "tx4".to_string(), tx_type: TxType::SingleChainTransfer, accounts: vec![acc_a1.clone(), acc_a3.clone()], amounts: vec![75], required_locks: vec![], timeout: std::time::Duration::from_secs(60), target_asset: None },
         ]
     }
     #[test]

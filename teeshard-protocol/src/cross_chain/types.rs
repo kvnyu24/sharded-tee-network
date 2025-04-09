@@ -142,4 +142,16 @@ mod tests {
             panic!("Incorrect SwapOutcome variant");
         }
     }
+
+    pub fn dummy_lock_info() -> LockInfo {
+        LockInfo {
+            account: AccountId { chain_id: 1, address: "dummy_acc".to_string() },
+            asset: AssetId {
+                chain_id: 1,
+                token_symbol: "TOK".to_string(),
+                token_address: "0x0000000000000000000000000000000000000001".to_string(),
+            },
+            amount: 100,
+        }
+    }
 } 

@@ -759,6 +759,21 @@ mod tests {
         }
     }
 
+    // Helper to create a dummy LockRequest for tests
+    fn create_dummy_lock_request() -> LockRequest {
+        LockRequest {
+            tx_id: "dummy_swap_id".to_string(),
+            asset: AssetId {
+                chain_id: 0,
+                token_symbol: "DUM".into(),
+                token_address: "0x0000000000000000000000000000000000000000".to_string(), // Placeholder added
+            },
+            amount: 100,
+            recipient: AccountId { chain_id: 1, address: "dummy_recv_addr".to_string() },
+            timeout: Duration::from_secs(120),
+        }
+    }
+
     // --- Mock Blockchain Interface for Tests ---
     #[derive(Clone)]
     struct MockBlockchainInterface;
