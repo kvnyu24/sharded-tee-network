@@ -31,3 +31,5 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+evm-simulation/broadcast/
+
