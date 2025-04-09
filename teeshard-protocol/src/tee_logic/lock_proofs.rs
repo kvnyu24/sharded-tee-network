@@ -99,7 +99,8 @@ mod tests {
 
      // Helper to create TEEIdentity and its keypair
      fn create_real_tee_kp(id: usize) -> (TEEIdentity, ed25519_dalek::SigningKey) {
-        let (signing_key, verifying_key) = generate_keypair(); // Destructure the keypair tuple
+        let signing_key = generate_keypair(); // Directly assign SigningKey
+        let verifying_key = signing_key.verifying_key(); // Get VerifyingKey from SigningKey
         let identity = TEEIdentity { id, public_key: verifying_key }; // Use the verifying key part
         (identity, signing_key) // Return the TEEIdentity and the signing key part
     }
@@ -141,7 +142,7 @@ mod tests {
         // Generate a proof with tampered signature
         let mut tampered_proof = generate_lock_proof("tx3", 3, &lock_info, &tee1, &signing_key1);
         // Create a different signature to simulate tampering
-        let (different_key, _) = generate_keypair(); // Corrected: Only need the signing key
+        let different_key = generate_keypair(); // Directly assign SigningKey
         tampered_proof.attestation_or_sig = sign(b"different data", &different_key);
 
 
@@ -157,7 +158,8 @@ mod tests {
 
     #[test]
     fn test_lock_proof_verification() {
-        let (keypair, pubkey) = generate_keypair(); // TEE keypair
+        let keypair = generate_keypair(); // Assign SigningKey (use 'keypair' as var name for now)
+        let pubkey = keypair.verifying_key(); // Get VerifyingKey
         let lock_info = LockInfo {
             account: AccountId { chain_id: 1, address: "user1_address".to_string() },
             asset: AssetId {

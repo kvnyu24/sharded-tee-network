@@ -740,7 +740,11 @@ mod tests {
     fn create_dummy_lock_proof(tx_id: &str, shard_id: usize, signing_tee: &TEEIdentity, signing_key: &SecretKey) -> LockProof {
         let lock_info = LockInfo {
             account: AccountId { chain_id: 0, address: format!("dummy_acc_{}", shard_id) }, // Make distinct
-            asset: AssetId { chain_id: 0, token_symbol: "DUM".into() },
+            asset: AssetId {
+                chain_id: 0,
+                token_symbol: "DUM".into(),
+                token_address: "0x0000000000000000000000000000000000000000".to_string(), // Placeholder added
+            },
             amount: 10 + shard_id as u64 // Make distinct
         };
         let mut data_to_sign = tx_id.as_bytes().to_vec();
@@ -761,16 +765,22 @@ mod tests {
 
     // Helper to create a dummy LockRequest for tests
     fn create_dummy_lock_request() -> LockRequest {
-        LockRequest {
-            tx_id: "dummy_swap_id".to_string(),
+        // Create the needed LockInfo directly
+        let dummy_lock_info = LockInfo {
+            account: AccountId { chain_id: 1, address: "dummy_recv_addr".to_string() },
             asset: AssetId {
                 chain_id: 0,
                 token_symbol: "DUM".into(),
-                token_address: "0x0000000000000000000000000000000000000000".to_string(), // Placeholder added
+                token_address: "0x0000000000000000000000000000000000000000".to_string(),
             },
             amount: 100,
-            recipient: AccountId { chain_id: 1, address: "dummy_recv_addr".to_string() },
-            timeout: Duration::from_secs(120),
+            // Add timeout if LockInfo needs it, otherwise remove.
+            // timeout: Duration::from_secs(120), // Assuming LockInfo does NOT have timeout based on its definition
+        };
+
+        LockRequest {
+            tx_id: "dummy_swap_id".to_string(),
+            lock_info: dummy_lock_info,
         }
     }
 
