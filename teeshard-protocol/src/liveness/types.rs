@@ -3,17 +3,96 @@
 use crate::data_structures::TEEIdentity;
 use crate::tee_logic::types::AttestationReport;
 use std::time::{Duration, Instant};
+use ed25519_dalek::Signature;
+use serde::{Serialize, Deserialize};
+use std::sync::Arc;
 
 // Using simple u64 for nonce for now
 pub type Nonce = u64;
 
-// State tracked per TEE node for liveness
-#[derive(Clone, Debug)]
+// Represents a unique challenge sent to a TEE node
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChallengeNonce {
+    pub nonce: [u8; 32], // Unique nonce value
+    pub target_node_id: usize, // ID of the node being challenged
+    pub timestamp: u64, // Timestamp when challenge was issued (e.g., milliseconds since epoch)
+}
+
+// Represents the attestation response from a TEE node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivenessAttestation {
+    pub node_id: usize,
+    pub nonce: [u8; 32], // Nonce received in the challenge
+    pub timestamp: u64, // Timestamp from the original challenge
+    pub signature: Signature, // Signature over (node_id || nonce || timestamp) or similar
+    // Optionally include attestation report data if needed for deeper verification
+    // pub attestation_report: Vec<u8>,
+}
+
+// Result of verifying a single liveness attestation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationResult {
+    Valid,
+    InvalidSignature,
+    NonceMismatch,
+    TimestampMismatch,
+    // Other potential error types
+}
+
+// Configuration parameters for the liveness system
+#[derive(Debug, Clone)]
+pub struct LivenessConfig {
+    pub default_trust: f64,
+    pub trust_increment: f64,
+    pub trust_decrement: f64,
+    pub trust_threshold: f64,
+    pub high_trust_threshold: f64,
+    pub min_interval: Duration,
+    pub max_interval: Duration,
+    pub max_failures: usize,
+    // Consider adding challenge window duration
+    pub challenge_window: Duration,
+}
+
+// Sensible defaults for configuration
+impl Default for LivenessConfig {
+    fn default() -> Self {
+        LivenessConfig {
+            default_trust: 100.0,
+            trust_increment: 1.0,
+            trust_decrement: 10.0,
+            trust_threshold: 50.0,
+            high_trust_threshold: 150.0,
+            min_interval: Duration::from_secs(10),
+            max_interval: Duration::from_secs(300),
+            max_failures: 3,
+            challenge_window: Duration::from_secs(5), // Example window
+        }
+    }
+}
+
+// State maintained for each TEE node regarding liveness
+#[derive(Debug, Clone)]
 pub struct LivenessState {
     pub trust_score: f64,
     pub challenge_interval: Duration,
-    pub last_challenge_time: Option<Instant>, // Use Option for initial state
-    pub consecutive_fails: usize,
+    pub last_challenge_time: Instant,
+    pub consecutive_failures: usize,
+}
+
+impl LivenessState {
+    // Constructor using LivenessConfig
+    pub fn new(config: &LivenessConfig) -> Self {
+        LivenessState {
+            trust_score: config.default_trust,
+            // Calculate initial interval based on config min/max
+            challenge_interval: Duration::from_secs_f64(
+                (config.min_interval.as_secs_f64() + config.max_interval.as_secs_f64()) / 2.0
+            ),
+            last_challenge_time: Instant::now(), // Initialize to current time
+            consecutive_failures: 0,
+        }
+    }
 }
 
 // Message sent from Challenger to a TEE node
@@ -63,15 +142,11 @@ mod tests {
 
     #[test]
     fn liveness_state_creation() {
-        let state = LivenessState {
-            trust_score: 100.0,
-            challenge_interval: Duration::from_secs(5),
-            last_challenge_time: None,
-            consecutive_fails: 0,
-        };
+        let config = LivenessConfig::default();
+        let state = LivenessState::new(&config);
         assert_eq!(state.trust_score, 100.0);
-        assert_eq!(state.consecutive_fails, 0);
-        assert!(state.last_challenge_time.is_none());
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.last_challenge_time <= Instant::now());
     }
 
     #[test]

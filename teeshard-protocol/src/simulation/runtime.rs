@@ -1,6 +1,7 @@
 // teeshard-protocol/src/simulation/runtime.rs
 use crate::{
     data_structures::TEEIdentity,
+    liveness::types::{ChallengeNonce, LivenessAttestation}, // Import liveness types
     raft::{messages::RaftMessage, state::Command}, // Import Command
     tee_logic::types::{LockProofData, Signature},
     simulation::node::NodeProposalRequest, // Import NodeProposalRequest
@@ -9,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot}; // Import oneshot
 use futures;
+use std::collections::HashSet;
 
 // Type for results sent back from nodes (e.g., signature shares)
 // Tuple: (Signer Identity, Data Signed (e.g., LockProofData), Signature)
@@ -22,25 +24,44 @@ pub struct SimulationRuntime {
     node_raft_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<(TEEIdentity, RaftMessage)>>>>,
     // NEW: Map Node ID -> Sender channel for Command Proposals
     node_proposal_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<NodeProposalRequest>>>>,
+    // Map Node ID -> Sender channel for Liveness Challenges
+    node_challenge_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<ChallengeNonce>>>>,
     // Map Shard ID -> List of Node Identities in that shard
     shard_assignments: Arc<Mutex<HashMap<usize, Vec<TEEIdentity>>>>,
     // Channel for nodes to send results (e.g., signature shares) back to the test/coordinator
     result_tx: mpsc::Sender<SignatureShare>,
+    // Channel for Aggregator to receive Liveness Attestations
+    aggregator_attestation_tx: Arc<Mutex<Option<mpsc::Sender<LivenessAttestation>>>>,
+    // Channel for Aggregator to report isolated node IDs
+    isolation_report_tx: mpsc::Sender<Vec<usize>>,
 }
 
 impl SimulationRuntime {
-    /// Creates a new simulation runtime and returns it along with the receiver for results.
-    pub fn new() -> (Self, mpsc::Receiver<SignatureShare>) {
+    /// Creates a new simulation runtime and returns it along with receivers.
+    pub fn new() -> (
+        Self, 
+        mpsc::Receiver<SignatureShare>, 
+        mpsc::Receiver<LivenessAttestation>, 
+        mpsc::Receiver<Vec<usize>>, // Return Vec<usize> receiver
+    ) {
         let (result_tx, result_rx) = mpsc::channel(100);
+        let (attestation_tx, attestation_rx) = mpsc::channel(100);
+        // Create channel for isolation reports (Vec<usize>)
+        let (isolation_tx, isolation_rx): (mpsc::Sender<Vec<usize>>, mpsc::Receiver<Vec<usize>>) = mpsc::channel(10); 
 
         let runtime = SimulationRuntime {
             node_raft_senders: Arc::new(Mutex::new(HashMap::new())),
             node_proposal_senders: Arc::new(Mutex::new(HashMap::new())),
+            node_challenge_senders: Arc::new(Mutex::new(HashMap::new())), // Initialize new map
             shard_assignments: Arc::new(Mutex::new(HashMap::new())),
             result_tx,
+            // Store the sender end for attestations
+            aggregator_attestation_tx: Arc::new(Mutex::new(Some(attestation_tx))),
+            isolation_report_tx: isolation_tx, // Store Vec<usize> sender
         };
 
-        (runtime, result_rx)
+        // Return runtime and Vec<usize> receiver
+        (runtime, result_rx, attestation_rx, isolation_rx)
     }
 
     /// Registers a node's communication channels.
@@ -48,15 +69,30 @@ impl SimulationRuntime {
         &self, 
         identity: TEEIdentity, 
         raft_sender: mpsc::Sender<(TEEIdentity, RaftMessage)>,
-        proposal_sender: mpsc::Sender<NodeProposalRequest>
+        proposal_sender: mpsc::Sender<NodeProposalRequest>,
+        challenge_sender: mpsc::Sender<ChallengeNonce>, // Add challenge sender
     ) {
-        let mut raft_senders = self.node_raft_senders.lock().unwrap();
-        println!("[Runtime] Registering Raft sender for Node {}", identity.id);
-        raft_senders.insert(identity.id, raft_sender);
-        
-        let mut proposal_senders = self.node_proposal_senders.lock().unwrap();
-        println!("[Runtime] Registering Proposal sender for Node {}", identity.id);
-        proposal_senders.insert(identity.id, proposal_sender);
+        let node_id = identity.id;
+        self.node_raft_senders.lock().unwrap().insert(node_id, raft_sender);
+        println!("[Runtime] Registered Raft sender for Node {}", node_id);
+        self.node_proposal_senders.lock().unwrap().insert(node_id, proposal_sender);
+        println!("[Runtime] Registered Proposal sender for Node {}", node_id);
+        // Register challenge sender
+        self.node_challenge_senders.lock().unwrap().insert(node_id, challenge_sender);
+        println!("[Runtime] Registered Challenge sender for Node {}", node_id);
+    }
+
+    /// Registers the Aggregator's attestation receiving channel.
+    pub fn register_aggregator(&self, attestation_sender: mpsc::Sender<LivenessAttestation>) {
+        // This might overwrite if called multiple times, consider alternatives if needed.
+        println!("[Runtime] Registering Aggregator attestation channel.");
+        *self.aggregator_attestation_tx.lock().unwrap() = Some(attestation_sender);
+    }
+
+    // --- Add method to take the aggregator sender (for the aggregator task) --- 
+    // This prevents the runtime from holding a sender that the aggregator needs to receive from.
+    pub fn take_aggregator_attestation_sender(&self) -> Option<mpsc::Sender<LivenessAttestation>> {
+        self.aggregator_attestation_tx.lock().unwrap().take()
     }
 
     /// Routes a RaftMessage from a sender to a specific target node.
@@ -103,6 +139,37 @@ impl SimulationRuntime {
             // send_futures.push(tokio::spawn(async move { ... sender.send(...).await ... }));
         }
         // if using spawn: futures::future::join_all(send_futures).await;
+    }
+
+    /// Routes a Liveness Challenge to a specific target node.
+    pub async fn route_challenge(&self, target_node_id: usize, challenge: ChallengeNonce) {
+        let target_sender = {
+            let senders = self.node_challenge_senders.lock().unwrap();
+            senders.get(&target_node_id).cloned()
+        };
+
+        if let Some(sender) = target_sender {
+            // println!("[Runtime] Routing challenge to Node {}: {:?}", target_node_id, challenge);
+            if let Err(e) = sender.send(challenge).await { 
+                eprintln!("[Runtime] Error sending challenge to Node {}: {}", target_node_id, e);
+            }
+        } else {
+            println!("[Runtime] Warning: No challenge sender found for target Node {}. Challenge dropped.", target_node_id);
+        }
+    }
+
+    /// Forwards a Liveness Attestation from a node to the registered Aggregator.
+    pub async fn forward_attestation_to_aggregator(&self, attestation: LivenessAttestation) {
+        let agg_sender_opt = {
+            self.aggregator_attestation_tx.lock().unwrap().clone()
+        };
+        if let Some(sender) = agg_sender_opt {
+             if let Err(e) = sender.send(attestation).await {
+                 eprintln!("[Runtime] Failed to forward attestation to aggregator: {}. Receiver likely dropped.", e);
+            }
+        } else {
+             println!("[Runtime] Warning: No aggregator attestation channel registered. Attestation dropped.");
+        }
     }
 
     /// Sends a signature share result back to the central collector (test/coordinator).
@@ -156,6 +223,59 @@ impl SimulationRuntime {
             }
             // Removed warning about missing sender here, handled by filter_map above
         }
+    }
+
+    /// Sends a report of isolated node IDs and removes them from runtime structures.
+    pub async fn report_isolated_nodes(&self, isolated_node_ids: Vec<usize>) {
+         println!("[Runtime] Received isolation report for nodes: {:?}. Removing from runtime...", isolated_node_ids);
+         if isolated_node_ids.is_empty() {
+            return; // Nothing to do
+         }
+
+         let isolated_set: HashSet<usize> = isolated_node_ids.iter().cloned().collect();
+
+         // Remove senders (Use .lock().unwrap() for std::sync::Mutex)
+         {
+            let mut raft_senders = self.node_raft_senders.lock().unwrap(); // Use unwrap()
+            for node_id in &isolated_node_ids {
+                if raft_senders.remove(node_id).is_some() {
+                    println!("[Runtime] Removed Raft sender for isolated node {}", node_id);
+                }
+            }
+         } 
+         {
+            let mut proposal_senders = self.node_proposal_senders.lock().unwrap(); // Use unwrap()
+             for node_id in &isolated_node_ids {
+                if proposal_senders.remove(node_id).is_some() {
+                     println!("[Runtime] Removed Proposal sender for isolated node {}", node_id);
+                 }
+            }
+         } 
+          {
+            let mut challenge_senders = self.node_challenge_senders.lock().unwrap(); // Use unwrap()
+             for node_id in &isolated_node_ids {
+                 if challenge_senders.remove(node_id).is_some() {
+                     println!("[Runtime] Removed Challenge sender for isolated node {}", node_id);
+                 }
+            }
+         } 
+
+         // Update shard assignments (Use .lock().unwrap())
+         {
+             let mut assignments = self.shard_assignments.lock().unwrap(); // Use unwrap()
+             for (_shard_id, nodes_in_shard) in assignments.iter_mut() {
+                 nodes_in_shard.retain(|identity| !isolated_set.contains(&identity.id));
+             }
+             println!("[Runtime] Updated shard assignments after isolation: {:?}", assignments);
+         } 
+
+         // --- Send the report ---
+         if let Err(e) = self.isolation_report_tx.send(isolated_node_ids.clone()).await { // Clone ids for logging
+             eprintln!("[Runtime] Failed to send isolation report for {:?}: {}. Receiver likely dropped.", isolated_node_ids, e);
+         } else {
+             // --- ADD THIS LOG --- 
+             println!("[Runtime] Successfully sent isolation report for {:?} via channel.", isolated_node_ids);
+         }
     }
 
     // TODO: Add methods for coordinator interaction, logging, etc.

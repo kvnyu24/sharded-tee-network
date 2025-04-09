@@ -450,7 +450,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("[Verify] User B balance on Chain B after release: {}", balance_b_after);
     // User B starts with 0 (minted to escrow), should receive release_amount
-    assert_eq!(u128::from(balance_b_after), u128::from(balance_b_before) + u128::from(release_amount), "User B balance is incorrect after release.");
+    assert_eq!(balance_b_after.low_u128(), balance_b_before.low_u128() + release_amount as u128, "User B balance is incorrect after release.");
 
     // Check finalization state on Escrow B
     let is_finalized_output = cast_call(

@@ -2,8 +2,10 @@ use crate::{
     config::SystemConfig,
     data_structures::{AccountId, TEEIdentity, Transaction},
     onchain::interface::{BlockchainInterface, BlockchainError, SwapId, TransactionId},
+    raft::{messages::RaftMessage, node::RaftNode, state::*, storage::*},
     simulation::runtime::{SimulationRuntime, SignatureShare},
-    raft::state::Command,
+    tee_logic::types::{LockProofData, Signature},
+    liveness::types::LivenessAttestation,
 };
 use std::{
     collections::HashMap,
@@ -28,7 +30,8 @@ pub struct MockSimulationRuntime {
 impl MockSimulationRuntime {
     // Creates a mock runtime and the result receiver
     pub fn new() -> (Self, mpsc::Receiver<SignatureShare>) {
-        let (runtime_handle, result_rx) = SimulationRuntime::new();
+        // Capture all 4 return values from the real new(), ignore the last two
+        let (runtime_handle, result_rx, _liveness_rx, _isolation_rx) = SimulationRuntime::new();
         (Self {
             handle: runtime_handle,
             sent_shard_commands: Arc::new(Mutex::new(Vec::new())),
@@ -50,6 +53,24 @@ impl MockSimulationRuntime {
          println!("[MockRuntime] assign_nodes_to_shard called for Shard {}. Forwarding to real handle.", shard_id);
          // Call the real handle's method
          self.handle.assign_nodes_to_shard(shard_id, nodes);
+    }
+
+    // Helper to set up a basic simulation environment
+    pub fn setup_simulation_env(
+        // config: SystemConfig, // Removed unused args
+        // num_nodes: usize,
+        // blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
+    ) -> (
+        SimulationRuntime,
+        tokio::sync::mpsc::Receiver<SignatureShare>, // Corrected type
+        tokio::sync::mpsc::Receiver<LivenessAttestation>,
+        tokio::sync::mpsc::Receiver<Vec<usize>>
+    )
+    {
+        let (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx) =
+            SimulationRuntime::new(); // Call with zero arguments
+
+        (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx)
     }
 }
 
@@ -90,13 +111,28 @@ pub struct MockChainState {
 #[derive(Clone)]
 pub struct MockBlockchainInterface {
     state: Arc<Mutex<HashMap<u64, MockChainState>>>,
+    // Add state for tracking submit_release calls
+    release_called: Arc<Mutex<bool>>,
+    last_release_args: Arc<Mutex<Option<(u64, SwapId, String, U256, String, Vec<u8>)>>>,
 }
 
 impl MockBlockchainInterface {
     pub fn new() -> Self {
         MockBlockchainInterface {
-            state: Arc::new(Mutex::new(HashMap::new()))
+            state: Arc::new(Mutex::new(HashMap::new())),
+            // Initialize new state fields
+            release_called: Arc::new(Mutex::new(false)),
+            last_release_args: Arc::new(Mutex::new(None)),
         }
+    }
+
+    // Helper methods for testing assertions
+    pub async fn submit_release_called(&self) -> bool {
+        *self.release_called.lock().unwrap()
+    }
+
+    pub async fn get_last_release_args(&self) -> Option<(u64, SwapId, String, U256, String, Vec<u8>)> {
+        self.last_release_args.lock().unwrap().clone()
     }
 
     // Helper to get chain state, creating if it doesn't exist
@@ -146,6 +182,18 @@ impl BlockchainInterface for MockBlockchainInterface {
             "[Mock] Release called: chain={}, swap_id={}, recipient={}, token={}, amount={}, sig_len={}",
             chain_id, swap_id_hex, recipient, token_address, amount, tee_signatures.len()
         );
+
+        // --- Add tracking for tests ---
+        *self.release_called.lock().unwrap() = true;
+        *self.last_release_args.lock().unwrap() = Some((
+            chain_id,
+            swap_id, // Store the actual SwapId ([u8; 32])
+            token_address.clone(),
+            amount, // U256 is Clone
+            recipient.clone(),
+            tee_signatures.clone(), // Vec<u8> is Clone
+        ));
+        // --- End tracking ---
 
         if !chain_state.locks.contains_key(&swap_id_hex) {
             println!("[Mock] Warning: Releasing non-existent lock: {}", swap_id_hex);
@@ -241,3 +289,34 @@ impl BlockchainInterface for MockBlockchainInterface {
         Ok(format!("mock_approve_tx_{}", approval_key))
     }
 }
+
+#[tokio::test]
+async fn test_mock_blockchain_interface_lock_release() {
+    let mock_blockchain = MockBlockchainInterface::new();
+    let chain_id = 1;
+    let token_address = "0xTokenA".to_string();
+    let user_pk = "user1_pk".to_string();
+    let amount = U256::from(100);
+    let recipient = "recipient_addr".to_string();
+    let swap_id: [u8; 32] = [1; 32];
+    let timeout: u64 = 3600;
+
+    let lock_tx = mock_blockchain
+        .lock(chain_id, user_pk.clone(), swap_id, recipient.clone(), token_address.clone(), amount, timeout)
+        .await
+        .expect("Lock failed");
+    println!("Lock Tx ID: {}", lock_tx);
+    assert!(!lock_tx.is_empty());
+
+    let dummy_release_signatures = vec![0u8; 64];
+    let release_tx = mock_blockchain
+        .submit_release(chain_id, swap_id, token_address, amount, recipient, dummy_release_signatures)
+        .await
+        .expect("Release failed");
+    println!("Release Tx ID: {}", release_tx);
+    assert!(!release_tx.is_empty());
+
+    // TODO: Add state checks on the mock? e.g., did lock/release modify expected state?
+}
+
+// ... other tests ...

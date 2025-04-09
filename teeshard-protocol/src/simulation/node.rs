@@ -3,6 +3,7 @@
 use crate::{
     config::SystemConfig,
     data_structures::TEEIdentity,
+    liveness::types::{ChallengeNonce, LivenessAttestation}, // Import liveness types
     raft::{
         messages::RaftMessage,
         node::{RaftNode, RaftEvent},
@@ -21,6 +22,8 @@ use tokio::time::{interval, Duration};
 use bincode; // Add bincode import
 use bincode::config::standard; // Import standard config
 use std::collections::HashSet; // Import HashSet
+use ed25519_dalek::SigningKey; // Import SigningKey
+use ed25519_dalek::Signer; // Add Signer trait
 
 // Type for proposal requests received by the node's run loop
 pub type NodeProposalRequest = (Command, oneshot::Sender<Result<Vec<RaftEvent>, String>>);
@@ -45,7 +48,8 @@ pub type NodeQuery = (NodeQueryRequest, oneshot::Sender<NodeQueryResponse>);
 /// Represents a single TEE node within the simulation.
 pub struct SimulatedTeeNode {
     pub identity: TEEIdentity,
-    secret_key: SecretKey, // Keep the secret key for signing
+    // Use SigningKey from ed25519_dalek for consistency
+    signing_key: SigningKey,
     raft_node: RaftNode,
     // Track processed command identifiers (e.g., tx_id for ConfirmLockAndSign)
     processed_commands: HashSet<String>,
@@ -59,19 +63,29 @@ pub struct SimulatedTeeNode {
     // NEW: Channel for state queries
     query_rx: mpsc::Receiver<NodeQuery>,
     query_tx: mpsc::Sender<NodeQuery>,
+    // Channel for receiving liveness challenges
+    challenge_rx: mpsc::Receiver<ChallengeNonce>,
+    _challenge_tx: mpsc::Sender<ChallengeNonce>, // Keep sender for registration
 }
 
 impl SimulatedTeeNode {
     /// Creates a new simulated TEE node.
     pub fn new(
         identity: TEEIdentity,
-        secret_key: SecretKey,
+        signing_key: SigningKey, // Accept SigningKey
         peers: Vec<TEEIdentity>, // Peers within the same shard
         config: SystemConfig,
         runtime: SimulationRuntime,
+        // Accept liveness channel senders/receivers
+        challenge_rx: mpsc::Receiver<ChallengeNonce>,
+        _challenge_tx: mpsc::Sender<ChallengeNonce>,
     ) -> Self {
         let storage = Box::new(InMemoryStorage::new()); // Each node gets its own storage
-        let enclave = EnclaveSim::new(identity.id, Some(secret_key.clone()));
+        // EnclaveSim uses SecretKey which is an alias for SigningKey. Pass directly.
+        // Remove redundant conversion via bytes:
+        // let secret_key_bytes = signing_key.to_bytes();
+        // let secret_key = SecretKey::from_bytes(&secret_key_bytes).expect("Should convert from signing key bytes");
+        let enclave = EnclaveSim::new(identity.id, Some(signing_key.clone())); // Clone signing_key as EnclaveSim::new takes Option<SigningKey>
         let raft_node = RaftNode::new(identity.clone(), peers, config, storage, enclave);
 
         // Create a channel for this node to receive messages (now tuple)
@@ -81,7 +95,7 @@ impl SimulatedTeeNode {
 
         SimulatedTeeNode {
             identity,
-            secret_key,
+            signing_key,
             raft_node,
             processed_commands: HashSet::new(), // Initialize the set
             runtime,
@@ -91,6 +105,8 @@ impl SimulatedTeeNode {
             proposal_tx: prop_tx, // Store proposal sender
             query_rx, // Store query receiver
             query_tx, // Store query sender
+            challenge_rx,
+            _challenge_tx,
         }
     }
 
@@ -107,6 +123,11 @@ impl SimulatedTeeNode {
     /// Returns the sender channel for state queries.
     pub fn get_query_sender(&self) -> mpsc::Sender<NodeQuery> {
         self.query_tx.clone()
+    }
+
+    /// Returns the sender channel for challenge sender (needed for runtime registration)
+    pub fn get_challenge_sender(&self) -> mpsc::Sender<ChallengeNonce> {
+        self._challenge_tx.clone()
     }
 
     /// Starts the node's main event loop in a separate Tokio task.
@@ -144,19 +165,12 @@ impl SimulatedTeeNode {
                 }
                 // NEW: Handle state queries
                 Some((query, response_sender)) = self.query_rx.recv() => {
-                    match query {
-                        NodeQueryRequest::GetRaftState => {
-                            let state = &self.raft_node.state;
-                            let response = NodeQueryResponse::RaftState {
-                                last_log_index: state.last_log_index(),
-                                commit_index: state.commit_index,
-                                role: state.role.clone(),
-                            };
-                            if response_sender.send(response).is_err() {
-                                eprintln!("[Node {}] Failed to send query response back.", self.identity.id);
-                            }
-                        }
-                    }
+                    self.handle_query(query, response_sender).await;
+                }
+                // Handle incoming liveness challenges
+                Some(challenge) = self.challenge_rx.recv() => {
+                    println!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge.nonce);
+                    self.handle_liveness_challenge(challenge).await;
                 }
                 else => {
                     // Channel closed or other condition, break the loop
@@ -165,6 +179,46 @@ impl SimulatedTeeNode {
                 }
             }
         }
+    }
+
+    /// Handles received state queries
+    async fn handle_query(&self, query: NodeQueryRequest, response_sender: oneshot::Sender<NodeQueryResponse>) {
+         match query {
+            NodeQueryRequest::GetRaftState => {
+                let state = &self.raft_node.state;
+                let response = NodeQueryResponse::RaftState {
+                    last_log_index: state.last_log_index(),
+                    commit_index: state.commit_index,
+                    role: state.role.clone(),
+                };
+                if response_sender.send(response).is_err() {
+                    eprintln!("[Node {}] Failed to send query response back.", self.identity.id);
+                }
+            }
+        }
+    }
+
+    /// Handles a received liveness challenge by generating and sending an attestation
+    async fn handle_liveness_challenge(&self, challenge: ChallengeNonce) {
+        // Construct the message to sign: (node_id || nonce || timestamp)
+        let mut message = Vec::new();
+        message.extend_from_slice(&self.identity.id.to_ne_bytes());
+        message.extend_from_slice(&challenge.nonce);
+        message.extend_from_slice(&challenge.timestamp.to_ne_bytes());
+
+        // Sign the message using the node's signing key
+        let signature = self.signing_key.sign(&message);
+
+        // Create the attestation response
+        let attestation = LivenessAttestation {
+            node_id: self.identity.id,
+            nonce: challenge.nonce,
+            timestamp: challenge.timestamp,
+            signature,
+        };
+
+        // Send the attestation response via the Runtime to the Aggregator
+        self.runtime.forward_attestation_to_aggregator(attestation).await;
     }
 
     /// Processes events generated by the RaftNode.

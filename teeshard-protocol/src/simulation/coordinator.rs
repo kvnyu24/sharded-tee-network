@@ -17,6 +17,15 @@ use bincode::config::standard;
 use crate::tee_logic::threshold_sig::PartialSignature;
 use crate::tee_logic::crypto_sim::verify;
 use hex;
+use crate::network::MockNetwork;
+use std::{
+    collections::{HashSet},
+    sync::{Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::sync::{oneshot, Mutex as TokioMutex}; // mpsc was duplicate
+use ed25519_dalek::SigningKey; // For test key generation
+use ethers::types::U256;
 
 // --- Command Enum ---
 #[derive(Debug)]
@@ -273,25 +282,12 @@ impl SimulatedCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*; // Import items from outer module
-    use crate::{ 
-        config::SystemConfig,
-        data_structures::{AccountId, AssetId, TEEIdentity, Transaction, TxType},
-        // REMOVE: onchain::interface::{BlockchainError, SwapId}, // Add SwapId import
-        onchain::interface::{BlockchainError}, // Keep BlockchainError if needed, remove SwapId?
-        simulation::mocks::{MockBlockchainInterface, MockSimulationRuntime},
-        simulation::runtime::SimulationRuntime, 
-        tee_logic::crypto_sim::{generate_keypair, sign},
-        raft::state::Command, 
-        tee_logic::types::LockProofData, // Correct import path
-    };
-    use std::{ 
-        collections::{HashMap, HashSet},
-        sync::{Arc, Mutex as StdMutex}, // Use StdMutex if non-async needed, else remove
-        time::Duration,
-    };
-    use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex}; // Use Tokio Mutex for async tests
-    use ed25519_dalek::SigningKey; // For test key generation
-    use crate::onchain::SwapId; // Import SwapId directly
+    use crate::simulation::mocks::MockBlockchainInterface;
+    use crate::network::MockNetwork; // Use corrected path here too
+    use crate::tee_logic::crypto_sim::sign; // Add missing import for sign
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex; // Keep alias for clarity
+    use ethers::types::U256;
 
     // Helper to create TEE Identity and SecretKey for tests
     fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -301,14 +297,23 @@ mod tests {
         (TEEIdentity { id, public_key }, secret_key)
     }
 
-    // --- REMOVED test_coordinator_sends_command_on_lock test ---
-    /* 
-    #[tokio::test]
-    async fn test_coordinator_sends_command_on_lock() {
-        // ... entire test removed ...
+    // Helper function to create a SystemConfig for tests
+    // Copied from cross_chain/swap_coordinator.rs tests
+    fn create_test_config(num_coordinators: usize, threshold: usize) -> SystemConfig {
+        let mut coordinator_identities = Vec::new();
+        for i in 0..num_coordinators {
+            let (id, _) = create_test_tee(100 + i); // Generate unique IDs
+            coordinator_identities.push(id);
+        }
+
+        SystemConfig {
+            coordinator_identities,
+            coordinator_threshold: threshold, // Set threshold
+            nodes_per_shard: 2, // Default or adjust if needed
+            ..Default::default() // Use defaults for other fields
+        }
     }
-    */
-    
+
     // --- Test: Share Processing, Aggregation, and Release Trigger ---
     #[tokio::test]
     async fn test_coordinator_processes_shares_and_triggers_release() {
@@ -320,7 +325,7 @@ mod tests {
         
         let mock_relayer = Arc::new(MockBlockchainInterface::new());
         // Use the non-mock SimulationRuntime here, as the coordinator interacts with its handle
-        let (runtime, _result_rx) = SimulationRuntime::new(); 
+        let (runtime, _result_rx, _, _) = SimulationRuntime::new(); 
         let partition_mapping = PartitionMapping::new(); // Not needed for this specific test focus
 
         // No receiver needed for this test, as we call process_signature_share directly
@@ -359,7 +364,7 @@ mod tests {
             let shares_map = coordinator.pending_shares.lock().await;
             assert_eq!(shares_map.get(&tx_id_string).expect("Aggregator for tx1 should exist after first share").signature_count(), 1);
         } // Lock dropped here
-        assert!(!mock_relayer.submit_release_called(), "Relayer should not be called yet");
+        assert!(!mock_relayer.submit_release_called().await, "Relayer should not be called yet");
 
         // Process second share (meets threshold)
         coordinator.process_signature_share(share2).await;
@@ -372,14 +377,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await; 
             assert!(shares_map.get(&tx_id_string).is_none(), "Aggregator should be removed after processing and release submission");
         } // Lock dropped here
-        assert!(mock_relayer.submit_release_called(), "Relayer should be called after threshold met");
+        assert!(mock_relayer.submit_release_called().await, "Relayer should be called after threshold met");
         
         // Verify details passed to relayer
         let (chain_id, swap_id, token, amount, recipient, sig_bytes) = mock_relayer.get_last_release_args().await.unwrap();
         assert_eq!(chain_id, lock_data.target_chain_id);
         assert_eq!(swap_id, tx_id_bytes, "Swap ID passed to relayer mismatch"); // Compare with the byte array
         assert_eq!(token, lock_data.token_address);
-        assert_eq!(amount, lock_data.amount);
+        assert_eq!(amount, U256::from(lock_data.amount), "Amount mismatch");
         assert_eq!(recipient, lock_data.recipient);
         
         // Verify signature bytes: Construct expected bytes in the order determined by PK sorting
@@ -393,5 +398,23 @@ mod tests {
             [sig2.to_bytes().as_slice(), sig1.to_bytes().as_slice()].concat()
         };
         assert_eq!(sig_bytes, expected_sig_bytes, "Aggregated signature bytes mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_initiates_swap_and_collects_shares() {
+        // Setup: Coordinators, Network, Blockchain
+        let num_coordinators = 3;
+        let threshold = 2;
+        let config = create_test_config(num_coordinators, threshold);
+        let mock_network = Arc::new(MockNetwork::new());
+        let mock_blockchain = Arc::new(MockBlockchainInterface::new()); // Call ::new()
+
+        // Use the actual runtime for node interaction simulation if needed, 
+        // or stick with MockNetwork if only testing coordinator logic.
+        // Let's assume MockNetwork is sufficient for this specific unit test.
+        let (runtime, _result_rx, _att_rx, _iso_rx) = SimulationRuntime::new(); // Fix destructuring
+
+        let mut coordinators: HashMap<TEEIdentity, Arc<TokioMutex<SimulatedCoordinator>>> = HashMap::new();
+        let mut coordinator_keys: Vec<SecretKey> = Vec::new();
     }
 }

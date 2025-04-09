@@ -1,8 +1,11 @@
-use std::hash::{Hash, Hasher};
+use std::hash::{Hash};
 // Import the PublicKey type
 use crate::tee_logic::crypto_sim::PublicKey; // VerifyingKey re-exported as PublicKey
 // Import HashSet which was removed by cargo fix
 use std::collections::HashSet;
+use serde::{Serialize, Deserialize};
+use ed25519_dalek::{Signature, VerifyingKey};
+use std::time::Duration;
 
 // Represent a user account on some chain
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -70,29 +73,10 @@ pub struct GraphEdge {
 
 // Represents a TEE Node Identity
 // Now using a real cryptographic public key type
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TEEIdentity {
-    pub id: usize, // Simple numeric ID for now
-    // pub public_key: Vec<u8>, // Placeholder for cryptographic key material
-    pub public_key: PublicKey,
-}
-
-// Implement PartialEq manually because PublicKey doesn't derive Eq fully (uses constant time eq)
-impl PartialEq for TEEIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.public_key == other.public_key
-    }
-}
-
-// Implement Eq manually
-impl Eq for TEEIdentity {}
-
-// Implement Hash manually using the public key bytes
-impl Hash for TEEIdentity {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.public_key.as_bytes().hash(state);
-    }
+    pub id: usize,
+    pub public_key: VerifyingKey,
 }
 
 #[cfg(test)]

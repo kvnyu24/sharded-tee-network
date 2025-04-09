@@ -15,9 +15,11 @@ use teeshard_protocol::{
 };
 use std::time::Duration;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::oneshot; // Keep oneshot
+use tokio::sync::{mpsc, oneshot}; // Import mpsc
 use bincode::config::standard; // For verification serialization
 use hex; // Need hex for share verification output
+// Import liveness types needed for node creation
+use teeshard_protocol::liveness::types::ChallengeNonce;
 
 // Helper to create TEE Identity and SecretKey
 fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -31,7 +33,7 @@ fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
 #[tokio::test]
 async fn test_simulation_runtime_and_node_startup() {
     println!("--- Starting Simulation Runtime Test ---");
-    let (runtime, _result_rx) = SimulationRuntime::new(); // Correctly unpack tuple
+    let (runtime, _result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(); // Capture all 4, ignore 3
     let config = SystemConfig::default();
     let num_nodes = 3;
     let mut node_handles = Vec::new();
@@ -52,26 +54,29 @@ async fn test_simulation_runtime_and_node_startup() {
             .filter(|id| id.id != i)
             .cloned()
             .collect();
+        let (challenge_tx, challenge_rx) = mpsc::channel::<ChallengeNonce>(10);
         let node = SimulatedTeeNode::new(
             identity.clone(),
             secret_key,
             peers,
             config.clone(),
             runtime.clone(),
+            challenge_rx,
+            challenge_tx.clone(),
         );
-        // Register message sender before moving node
         runtime.register_node(
             identity, 
-            node.get_message_sender(), // Raft sender
-            node.get_proposal_sender() // Proposal sender
+            node.get_message_sender(),
+            node.get_proposal_sender(),
+            challenge_tx,
         );
-        nodes_to_spawn.push(node); // Store node to spawn later
+        nodes_to_spawn.push(node);
     }
 
     // 3. Spawn node tasks
     for node in nodes_to_spawn {
         let id = node.identity.id;
-        let handle = tokio::spawn(node.run()); // node is moved here
+        let handle = tokio::spawn(node.run());
         node_handles.push((id, handle));
         println!("[Test] Spawned node {} task.", id);
     }
@@ -93,7 +98,7 @@ async fn test_raft_state_machine_command_processing() {
     println!("--- Starting State Machine Command Processing Test ---");
 
     // 1. Setup Simulation Environment
-    let (runtime, mut result_rx) = SimulationRuntime::new(); // result_rx is mpsc::Receiver<SignatureShare>
+    let (runtime, mut result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(); // Capture all 4, ignore 2
     let config = SystemConfig::default();
     let num_nodes = 3;
     let mut node_handles = Vec::new();
@@ -117,19 +122,23 @@ async fn test_raft_state_machine_command_processing() {
             .cloned()
             .collect();
 
+        let (challenge_tx, challenge_rx) = mpsc::channel::<ChallengeNonce>(10);
         let node = SimulatedTeeNode::new(
             identity.clone(),
             secret_key,
             peers,
             config.clone(),
             runtime.clone(),
+            challenge_rx,
+            challenge_tx.clone(),
         );
         node_proposal_senders.insert(identity.id, node.get_proposal_sender());
         node_query_senders.insert(identity.id, node.get_query_sender()); // NEW: Store query sender
         runtime.register_node(
             identity, 
-            node.get_message_sender(), // Raft sender
-            node.get_proposal_sender() // Proposal sender
+            node.get_message_sender(),
+            node.get_proposal_sender(),
+            challenge_tx,
         );
         nodes_to_spawn.push(node);
     }

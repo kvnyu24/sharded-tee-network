@@ -324,6 +324,70 @@ impl BlockchainInterface for EvmRelayer {
     }
 }
 
+// Helper function to run cast send and wait for receipt
+async fn run_cast_send(
+    cast_path: &str,
+    rpc_url: &str,
+    private_key: &str,
+    to: &str,
+    sig: &str,
+    args: &[String],
+    value: Option<&str>, // Optional value for sending ETH
+    gas_limit: Option<u64>,
+) -> Result<String, BlockchainError> {
+    let mut cmd = tokio::process::Command::new(cast_path);
+    cmd.arg("send")
+       .arg(to)
+       .arg(sig);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    cmd.arg("--private-key").arg(private_key);
+    cmd.arg("--rpc-url").arg(rpc_url);
+    if let Some(val) = value {
+        cmd.arg("--value").arg(val);
+    }
+    if let Some(gas) = gas_limit {
+        cmd.arg("--gas-limit").arg(gas.to_string());
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    println!("[Relayer] Executing command: {:?}", cmd);
+    let output = cmd.output().await.map_err(|e| BlockchainError::CommandError(format!("Failed to execute cast send: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    println!("[Relayer] cast send STDOUT:\n{}", stdout);
+    if !stderr.is_empty() {
+        println!("[Relayer] cast send STDERR:\n{}", stderr);
+    }
+
+    if !output.status.success() {
+        return Err(BlockchainError::TransactionFailed(format!(
+            "cast send failed with status: {}. Stderr: {}",
+            output.status,
+            stderr
+        )));
+    }
+
+    // Parse transaction hash from stdout
+    let tx_hash = stdout.lines()
+        .find(|line| line.trim_start().starts_with("transactionHash"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|s| s.trim().to_string())
+        .ok_or_else(|| BlockchainError::CommandError(format!("Failed to parse tx hash from output: {}", stdout)))?;
+
+    println!("[Relayer] Transaction sent: {}. Waiting for receipt...", tx_hash);
+
+    // Wait for receipt using cast receipt in a loop
+    let max_retries = 10;
+    let retry_delay = Duration::from_secs(1); // Use std::time::Duration
+    for attempt in 0..max_retries {
+        // ... existing code ...
+    }
+}
 
 #[cfg(test)]
 mod tests {

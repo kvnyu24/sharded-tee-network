@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 // Assuming TxType is defined elsewhere, e.g., crate::data_structures::TxType
 // We'll need to make TxType Hashable and Eq later if not already.
 use crate::data_structures::TxType; // Placeholder import
 use crate::data_structures::TEEIdentity; // Added TEEIdentity
 use crate::tee_logic::crypto_sim::generate_keypair; // For default TEE identities
+use crate::liveness::types::LivenessConfig; // Need import for LivenessConfig
 
 #[derive(Clone, Debug)]
 pub struct SystemConfig {
@@ -104,6 +106,35 @@ impl Default for SystemConfig {
                 create_default_tee(101),
                 create_default_tee(102),
             ],
+        }
+    }
+}
+
+// Helper struct to convert SystemConfig to LivenessConfig
+impl From<&SystemConfig> for LivenessConfig {
+    fn from(sys_config: &SystemConfig) -> Self {
+        // --- Calculate challenge_window based on heartbeat --- 
+        let heartbeat_duration = Duration::from_millis(sys_config.raft_heartbeat_ms);
+        // Set window to e.g., 10x heartbeat interval, minimum 500ms?
+        let calculated_window = heartbeat_duration * 10; 
+        let min_window = Duration::from_millis(500); // Ensure a minimum reasonable window
+        let challenge_window = calculated_window.max(min_window);
+        println!("[Config] Calculated Liveness Challenge Window: {:?} (based on {:?} heartbeat)", 
+                 challenge_window, heartbeat_duration);
+        // --- End calculation --- 
+        
+        LivenessConfig {
+            default_trust: sys_config.liveness_default_trust,
+            trust_increment: sys_config.liveness_trust_increment,
+            trust_decrement: sys_config.liveness_trust_decrement,
+            trust_threshold: sys_config.liveness_trust_threshold,
+            high_trust_threshold: sys_config.liveness_high_trust_threshold,
+            min_interval: Duration::from_millis(sys_config.liveness_min_interval_ms),
+            max_interval: Duration::from_millis(sys_config.liveness_max_interval_ms),
+            max_failures: sys_config.liveness_max_consecutive_fails,
+            // Remove hardcoded value
+            // challenge_window: Duration::from_secs(10), 
+            challenge_window, // Use calculated value
         }
     }
 }

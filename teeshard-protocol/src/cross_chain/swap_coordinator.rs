@@ -21,6 +21,7 @@ use std::sync::Arc; // Import Arc
 use hex;
 use tokio;
  // Alias dalek::Signature
+use ethers::types::U256;
 
 // Represents the state of a coordinator TEE managing a swap
 pub struct CrossChainCoordinator {
@@ -784,45 +785,73 @@ mod tests {
     }
 
     // --- Mock Blockchain Interface for Tests ---
-    #[derive(Clone)]
+    #[derive(Clone, Debug)] // Add Debug
     struct MockBlockchainInterface;
 
     #[async_trait]
     impl BlockchainInterface for MockBlockchainInterface {
+        // --- Fix Return Type: u64 -> U256 ---
         async fn get_balance(
             &self,
             _chain_id: u64,
             _account_address: String,
             _token_address: String,
-        ) -> Result<u64, BlockchainError> {
-            // println!("MockBlockchainInterface: get_balance called");
-            Ok(1000) // Return a dummy balance
+        ) -> Result<U256, BlockchainError> { // Changed return type
+            Ok(U256::from(1000)) // Return a dummy U256 balance
         }
 
+        // --- Fix Param Type: u64 -> U256 ---
         async fn submit_release(
             &self,
             _chain_id: u64,
             _swap_id: SwapId,
             _token_address: String,
-            _amount: u64,
+            _amount: U256, // Changed param type
             _recipient_address: String,
             _tee_signatures: SignatureBytes,
         ) -> Result<TransactionId, BlockchainError> {
-            // println!("MockBlockchainInterface: submit_release called");
             Ok("mock_tx_release_hash_123".to_string())
         }
 
+        // --- Fix Param Type: u64 -> U256 ---
         async fn submit_abort(
             &self,
             _chain_id: u64,
             _swap_id: SwapId,
             _token_address: String,
-            _amount: u64,
+            _amount: U256, // Changed param type
             _sender_address: String,
             _tee_signatures: SignatureBytes,
         ) -> Result<TransactionId, BlockchainError> {
-            // println!("MockBlockchainInterface: submit_abort called");
             Ok("mock_tx_abort_hash_456".to_string())
+        }
+
+        // --- Add Missing Method: lock (dummy implementation) ---
+        async fn lock(
+            &self,
+            _chain_id: u64,
+            _sender_private_key: String,
+            _swap_id: SwapId,
+            _recipient_address: String,
+            _token_address: String,
+            _amount: U256,
+            _timeout_seconds: u64,
+        ) -> Result<TransactionId, BlockchainError> {
+            println!("MockBlockchainInterface: lock called (dummy)");
+            Ok("mock_tx_lock_hash_789".to_string()) 
+        }
+
+        // --- Add Missing Method: approve_erc20 (dummy implementation) ---
+        async fn approve_erc20(
+            &self,
+            _chain_id: u64,
+            _owner_private_key: String,
+            _token_address: String,
+            _spender_address: String,
+            _amount: U256,
+        ) -> Result<TransactionId, BlockchainError> {
+            println!("MockBlockchainInterface: approve_erc20 called (dummy)");
+            Ok("mock_tx_approve_hash_101".to_string())
         }
     }
     // --- End Mock Blockchain Interface ---

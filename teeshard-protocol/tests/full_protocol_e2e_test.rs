@@ -12,12 +12,14 @@ use teeshard_protocol::{
     tee_logic::{crypto_sim::SecretKey, types::LockProofData},
     simulation::{SimulationRuntime, SimulatedTeeNode, coordinator::SimulatedCoordinator, node::{NodeProposalRequest, NodeQuery}},
     raft::messages::RaftMessage,
+    liveness::types::{LivenessAttestation, ChallengeNonce},
+    liveness::{
+        aggregator::Aggregator,
+        challenger::Challenger,
+        types::{LivenessConfig},
+    },
 };
-use ethers::{
-    prelude::*,
-    utils::Anvil,
-};
-use serde_json::Value as JsonValue;
+use ethers::{types::{Address, U256}, prelude::*};
 use tokio::sync::mpsc;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,9 +29,7 @@ use regex::Regex;
 use teeshard_protocol::onchain::evm_relayer::{EvmRelayer, EvmRelayerConfig, ChainConfig};
 use tokio::process::Command as TokioCommand;
 use teeshard_protocol::simulation::CoordinatorCommand;
-use teeshard_protocol::onchain::BlockchainError;
 use teeshard_protocol::onchain::BlockchainInterface;
-use ethers::types::U256;
 
 // Helper to create TEE Identity and SecretKey (can be shared with other tests)
 fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -240,68 +240,108 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
 
     // 3. Setup Simulation Runtime & Nodes based on Sharding
     println!("[Setup] Setting up Simulation Runtime and Nodes...");
-    let (runtime, result_rx) = SimulationRuntime::new(); // Keep result_rx
+    let (runtime, mut result_rx, attestation_rx_agg, mut isolation_rx) = SimulationRuntime::new();
 
     let mut node_handles = Vec::new();
-    // Use tokio::sync::mpsc::Sender in HashMap types
     let mut node_message_senders: HashMap<usize, tokio::sync::mpsc::Sender<(TEEIdentity, RaftMessage)>> = HashMap::new();
     let mut node_proposal_senders: HashMap<usize, tokio::sync::mpsc::Sender<NodeProposalRequest>> = HashMap::new();
     let mut node_query_senders: HashMap<usize, tokio::sync::mpsc::Sender<NodeQuery>> = HashMap::new();
-    // let mut all_nodes_map: HashMap<usize, TEEIdentity> = identities.into_iter().map(|id| (id.id, id)).collect(); // Can likely remove if identities is kept
-    let mut nodes_to_spawn = Vec::new();
+    let mut nodes_to_spawn: Vec<SimulatedTeeNode> = Vec::new(); // Store nodes before spawning
 
-    // Create SimulatedTeeNode instances based on partitions
+    // --- Create and Register Nodes for each Shard --- 
     for partition in &final_partitions {
         let shard_id = partition.shard_id;
         let nodes_in_shard = &partition.tee_nodes;
-        println!("[Setup] Creating nodes for Shard {} with {:?} members", shard_id, nodes_in_shard.iter().map(|n| n.id).collect::<Vec<_>>());
-
+        println!("[Setup] Creating nodes for Shard {}: {:?}", shard_id, nodes_in_shard.iter().map(|n| n.id).collect::<Vec<_>>());
         for tee_identity in nodes_in_shard {
-            let node_id = tee_identity.id;
-            // Re-create secret key (assuming deterministic keys based on ID)
-            let (_, secret_key) = create_test_tee(node_id);
-
-            // Peers are other nodes *within the same shard*
-            let peers: Vec<TEEIdentity> = nodes_in_shard.iter()
-                .filter(|peer| peer.id != node_id)
-                .cloned()
-                .collect();
-
+            let (_, secret_key) = create_test_tee(tee_identity.id);
+            let peers: Vec<TEEIdentity> = nodes_in_shard.iter().filter(|&p| p.id != tee_identity.id).cloned().collect();
+            let (challenge_tx, challenge_rx) = mpsc::channel(10);
             let node = SimulatedTeeNode::new(
-                tee_identity.clone(),
-                secret_key,
-                peers, // Pass the correct intra-shard peers
-                config.clone(),
-                runtime.clone(),
+                tee_identity.clone(), secret_key, peers, config.clone(), runtime.clone(),
+                challenge_rx, challenge_tx.clone(), 
             );
-
-            // Store senders for later use (e.g., by coordinator or test logic)
-            // Now we store them explicitly typed
-            node_message_senders.insert(node_id, node.get_message_sender());
-            node_proposal_senders.insert(node_id, node.get_proposal_sender());
-            node_query_senders.insert(node_id, node.get_query_sender());
-
-            // Register node with the runtime (providing BOTH senders)
-            runtime.register_node(
-                tee_identity.clone(),
-                node.get_message_sender(), // Raft message sender
-                node.get_proposal_sender() // Proposal sender
-            );
+            runtime.register_node(tee_identity.clone(), node.get_message_sender(), node.get_proposal_sender(), node.get_challenge_sender());
             nodes_to_spawn.push(node);
         }
+        runtime.assign_nodes_to_shard(shard_id, nodes_in_shard.clone());
     }
     
-    // Spawn node tasks
+    // --- Spawn Node Tasks --- 
+    let node_to_fail_id = 2; // Choose a node to fail (ensure it exists)
+    let mut failed_node_handle = None;
     for node in nodes_to_spawn {
         let id = node.identity.id;
         let handle = tokio::spawn(node.run());
-        node_handles.push((id, handle));
+        if id == node_to_fail_id {
+            println!("[Test Setup] Intentionally failing Node {} by aborting its task shortly.", id);
+            failed_node_handle = Some(handle); // Store handle to abort later
+        } else {
+            node_handles.push(handle); // Store handles for cleanup
+        }
+        println!("[Setup] Spawned node {} task.", id);
     }
-    println!("[Setup] Spawned {} node tasks.", node_handles.len());
-
-    // Make the result receiver mutable as it will be consumed
-    let mut result_rx = result_rx;
+    // Abort the designated failed node's task after a brief moment
+    if let Some(ref handle) = failed_node_handle {
+        println!("[Test Setup] Waiting 30 seconds before failing Node {}...", node_to_fail_id);
+        tokio::time::sleep(Duration::from_secs(30)).await; // NEW longer sleep
+        handle.abort();
+        println!("[Test Setup] Aborted task for Node {}.", node_to_fail_id);
+    }
+    println!("[Setup] Spawned/Managed {} node tasks.", node_handles.len() + if failed_node_handle.is_some() {1} else {0});
     
+    // --- Setup Liveness Components --- 
+    println!("[Setup] Setting up Liveness Challenger and Aggregator...");
+    let liveness_config = LivenessConfig::from(&config);
+    let (agg_challenge_tx, agg_challenge_rx) = mpsc::channel::<ChallengeNonce>(50);
+    
+    // Create Challenger
+    let mut challenger = Challenger::new(identities.clone(), runtime.clone(), agg_challenge_tx);
+    
+    // Create Aggregator
+    let (aggregator_instance, challenge_rx_agg) = Aggregator::new(liveness_config.clone(), identities.clone(), runtime.clone(), agg_challenge_rx);
+    let aggregator = Arc::new(aggregator_instance); 
+    
+    // --- Register Aggregator Sender with Runtime --- 
+    let aggregator_attestation_sender = runtime.take_aggregator_attestation_sender()
+        .expect("Runtime should have an aggregator attestation sender to take");
+    runtime.register_aggregator(aggregator_attestation_sender);
+    println!("[Setup] Registered Aggregator attestation sender with Runtime.");
+
+    // Spawn Challenger Task
+    let challenger_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5)); // Example challenge interval
+        loop {
+            interval.tick().await;
+            challenger.issue_challenges().await;
+        }
+    });
+    println!("[Setup] Spawned Challenger task.");
+
+    // Spawn Aggregator Listener Tasks
+    let agg_challenge_listener_handle = {
+        let agg_clone = aggregator.clone();
+        tokio::spawn(async move {
+            agg_clone.run_challenge_listener(challenge_rx_agg).await;
+        })
+    };
+    let agg_attestation_listener_handle = {
+        let agg_clone = aggregator.clone();
+        tokio::spawn(async move {
+            agg_clone.run_attestation_listener(attestation_rx_agg).await;
+        })
+    };
+    
+    // --- Add print BEFORE spawning timeout checker ---
+    println!("!!! [Setup] About to spawn run_timeout_checker task..."); 
+    let agg_timeout_checker_handle = {
+        tokio::spawn(async move {
+            let agg_clone = aggregator.clone(); 
+            agg_clone.run_timeout_checker().await;
+        })
+    };
+    println!("[Setup] Spawned Aggregator listener and checker tasks."); // Original log remains
+
     // 4. Setup *Actual* EVM Relayer
     println!("[Setup] Setting up EVM Relayer...");
     // Configure Relayer
@@ -440,71 +480,118 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     println!("[Test] Waiting for Raft consensus, share generation, aggregation, and release...");
     tokio::time::sleep(Duration::from_secs(10)).await; 
 
-    // 7. Verification
-    println!("\n[Test] Verifying final state on EVM chains...");
+    // 7. Verification (Fetch Balances First)
+    println!("\n[Test] Fetching final state on EVM chains for verification...");
 
-    // Check final balances on Chain A
+    // Fetch final balances on Chain A
     let user_a_balance_a_final = evm_relayer.get_balance(
         chain_id_a,
-        user_a_chain1.address.parse().unwrap(),
+        user_a_chain1.address.clone(), // Use address string directly
         token_a_chain1.token_address.clone()
     ).await.map_err(|e| format!("Failed to get User A balance on Chain A: {}", e))?;
-    // Use get_balance for escrow address as well
     let escrow_a_balance_final = evm_relayer.get_balance(
         chain_id_a,
         format!("{:?}", deployed_contracts.escrow_addr_a), // Escrow address as string
         format!("{:?}", deployed_contracts.token_addr_a)  // Token address as string
     ).await.map_err(|e| format!("Failed to get Escrow A balance on Chain A: {}", e))?;
-
-    println!("[Verify] Final User A Balance (Chain A): {}", user_a_balance_a_final);
-    println!("[Verify] Final Escrow A Balance (Chain A): {}", escrow_a_balance_final);
-
-    // Assert final state on Chain A
-    // User A balance should decrease by swap_amount 
-    // Convert swap_amount (u64) to U256 for comparison and SCALE by decimals
-    assert_eq!(
-        user_a_balance_a_final, 
-        initial_user_a_balance_a, // Expect final balance to equal the balance read after script setup
-        "User A final balance mismatch on Chain A (Expected no change during test execution phase)"
-    );
-    // Escrow A balance should increase by swap_amount
-    let initial_escrow_a_balance = U256::zero(); // Escrow starts empty
-    assert_eq!(
-        escrow_a_balance_final, // This is U256 now
-        initial_escrow_a_balance + swap_amount_u256, // Use scaled amount
-        "Escrow A final balance mismatch on Chain A"
-    );
-
-    // Check final balances on Chain B
-    // Use get_balance
+    
+    // Fetch final balances on Chain B
     let user_b_balance_b_final = evm_relayer.get_balance(
         chain_id_b,
         user_b_chain2.address.clone(), // User B address string
         token_b_chain2.token_address.clone() // Token B address string
     ).await.map_err(|e| format!("Failed to get User B balance on Chain B: {}", e))?;
-     // Use get_balance
      let escrow_b_balance_final = evm_relayer.get_balance(
         chain_id_b,
         format!("{:?}", deployed_contracts.escrow_addr_b), // Escrow address string
         format!("{:?}", deployed_contracts.token_addr_b) // Token address string
     ).await.map_err(|e| format!("Failed to get Escrow B balance on Chain B: {}", e))?;
 
-    println!("[Verify] Final User B Balance (Chain B): {}", user_b_balance_b_final);
-    println!("[Verify] Final Escrow B Balance (Chain B): {}", escrow_b_balance_final);
-    // Assert final state on Chain B
-    assert_eq!(user_b_balance_b_final, swap_amount_u256, "User B should have received the swap amount"); // Compare scaled U256
-    assert_eq!(escrow_b_balance_final, U256::zero(), "Escrow B should be empty after release"); // Compare U256
+    println!("[Verify] Fetched Balances:");
+    println!("  User A (Chain A): Final={}, Initial={}", user_a_balance_a_final, initial_user_a_balance_a);
+    println!("  Escrow A (Chain A): Final={}, Expected={}", escrow_a_balance_final, swap_amount_u256);
+    println!("  User B (Chain B): Final={}, Expected={}", user_b_balance_b_final, swap_amount_u256);
+    println!("  Escrow B (Chain B): Final={}, Expected={}", escrow_b_balance_final, U256::zero());
 
-    // Cleanup node and coordinator tasks
-    println!("\n[Test] Cleaning up tasks...");
-    for (id, handle) in node_handles {
-         println!("Aborting node {} task...", id);
+    // --- Store Balance Check Results --- 
+    let initial_escrow_a_balance = U256::zero(); // Escrow starts empty
+    let user_a_balance_ok = user_a_balance_a_final == initial_user_a_balance_a;
+    let escrow_a_balance_ok = escrow_a_balance_final == initial_escrow_a_balance + swap_amount_u256;
+    let user_b_balance_ok = user_b_balance_b_final == swap_amount_u256;
+    let escrow_b_balance_ok = escrow_b_balance_final == U256::zero();
+    let all_balances_ok = user_a_balance_ok && escrow_a_balance_ok && user_b_balance_ok && escrow_b_balance_ok;
+
+    // 8. Wait for Liveness Failure Detection and Isolation
+    let liveness_wait_secs = 60; 
+    println!("\n[Test] Waiting {} seconds for liveness system to isolate Node {}...", liveness_wait_secs, node_to_fail_id);
+    tokio::time::sleep(Duration::from_secs(liveness_wait_secs)).await;
+
+    // 9. Verify Isolation Report
+    println!("[Test] Checking for isolation report for Node {}...", node_to_fail_id);
+    let isolation_check_result = tokio::time::timeout(Duration::from_secs(1), isolation_rx.recv()).await;
+
+    // --- Store Liveness Check Result --- 
+    let mut isolation_ok = false;
+    let mut isolation_report_content = "None received".to_string();
+    match isolation_check_result {
+        Ok(Some(isolated_ids)) => {
+            println!("[Test] Received isolation report: {:?}", isolated_ids);
+            isolation_report_content = format!("{:?}", isolated_ids);
+            if isolated_ids.contains(&node_to_fail_id) {
+                isolation_ok = true;
+            } else {
+                println!("[Verify FAIL] Isolation report {:?} did not contain failed node ID {}", isolated_ids, node_to_fail_id);
+            }
+        }
+        Ok(None) => {
+            println!("[Verify FAIL] Isolation channel closed unexpectedly while waiting for report for node {}", node_to_fail_id);
+            isolation_report_content = "Channel closed".to_string();
+        }
+        Err(_) => {
+            println!("[Verify FAIL] Timeout waiting for isolation report for node {}", node_to_fail_id);
+            isolation_report_content = "Timeout".to_string();
+        }
+    }
+
+    // 10. Final Summary and Assertion
+    println!("\n--- Final E2E Test Summary ---");
+    println!("Balance Checks (Expected Amount: {})", swap_amount_u256);
+    // --- Update Print Statements for Balances --- 
+    println!("  User A (Chain A): {} (Initial: {}, Final: {})", 
+             if user_a_balance_ok { "OK" } else { "FAILED" }, 
+             initial_user_a_balance_a, 
+             user_a_balance_a_final);
+    println!("  Escrow A (Chain A): {} (Expected: {}, Final: {})", 
+             if escrow_a_balance_ok { "OK" } else { "FAILED" }, 
+             swap_amount_u256, // Expected = initial (0) + swap_amount 
+             escrow_a_balance_final);
+    println!("  User B (Chain B): {} (Expected: {}, Final: {})", 
+             if user_b_balance_ok { "OK" } else { "FAILED" }, 
+             swap_amount_u256, 
+             user_b_balance_b_final);
+    println!("  Escrow B (Chain B): {} (Expected: 0, Final: {})", 
+             if escrow_b_balance_ok { "OK" } else { "FAILED" }, 
+             escrow_b_balance_final);
+    // --- End Balance Print Updates --- 
+    println!("Liveness Isolation Check:");
+    println!("  Isolation of Node {}: {} (Report: {})", node_to_fail_id, if isolation_ok { "OK" } else { "FAILED" }, isolation_report_content);
+
+    // Abort tasks *before* final assert to avoid hangs on failure
+    println!("\n[Cleanup] Aborting remaining tasks...");
+    challenger_handle.abort();
+    agg_challenge_listener_handle.abort();
+    agg_attestation_listener_handle.abort();
+    agg_timeout_checker_handle.abort();
+    share_listener_handle.abort();
+    command_listener_handle.abort();
+    for handle in node_handles { // Only abort nodes that weren't the failed one
         handle.abort();
     }
-    println!("Aborting coordinator tasks...");
-    share_listener_handle.abort(); // Abort share listener task
-    command_listener_handle.abort(); // Abort command listener task
+    
+    // Final assertion for the overall test result
+    assert!(all_balances_ok && isolation_ok, "One or more E2E checks failed. See summary above.");
 
-    println!("--- Full Protocol E2E Test FINISHED ---");
-    Ok(())
+    println!("--- Full Protocol E2E Test (with Liveness Failure) Completed Successfully --- TBD by final assert");
+
+    Ok(()) // Return Ok if the final assert passes
 }
