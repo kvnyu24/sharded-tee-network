@@ -3,34 +3,21 @@ use std::hash::{Hash, Hasher};
 use crate::tee_logic::crypto_sim::PublicKey; // VerifyingKey re-exported as PublicKey
 // Import HashSet which was removed by cargo fix
 use std::collections::HashSet;
+use std::collections::HashMap;
 
 // Represent a user account on some chain
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct AccountId {
     pub chain_id: u64,
     pub address: String, // Using String for simplicity, could be H160 or similar fixed-size type
 }
 
-// Implement PartialEq manually because of String
-impl PartialEq for AccountId {
-    fn eq(&self, other: &Self) -> bool {
-        self.chain_id == other.chain_id && self.address == other.address
-    }
-}
-
-// Implement Hash manually
-impl Hash for AccountId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.chain_id.hash(state);
-        self.address.hash(state);
-    }
-}
-
 // Represent a specific asset on a specific chain
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct AssetId {
     pub chain_id: u64,
     pub token_symbol: String, // e.g., "ETH", "USDC"
+    pub token_address: String, // e.g., "0x..."
 }
 
 // Information about a required lock for a transaction
@@ -61,6 +48,8 @@ pub struct Transaction {
     pub amounts: Vec<u64>,
     // List of resources that must be locked for this transaction to proceed (esp. for CrossChainSwap)
     pub required_locks: Vec<LockInfo>,
+    // Asset to be released or acted upon on the target chain (for CrossChainSwap)
+    pub target_asset: Option<AssetId>, // Added target asset info
     pub timeout: std::time::Duration, // Added timeout duration
     // Add other transaction details like timestamps, nonces, etc.
 }
@@ -82,7 +71,7 @@ pub struct GraphEdge {
 
 // Represents a TEE Node Identity
 // Now using a real cryptographic public key type
-#[derive(Clone, Debug)] // Remove Eq, Hash temporarily
+#[derive(Clone, Debug)]
 pub struct TEEIdentity {
     pub id: usize, // Simple numeric ID for now
     // pub public_key: Vec<u8>, // Placeholder for cryptographic key material
@@ -139,9 +128,9 @@ mod tests {
 
     #[test]
     fn asset_id_creation() {
-        let asset_eth = AssetId { chain_id: 1, token_symbol: "ETH".to_string() };
-        let asset_usdc = AssetId { chain_id: 1, token_symbol: "USDC".to_string() };
-        let asset_matic = AssetId { chain_id: 2, token_symbol: "MATIC".to_string() };
+        let asset_eth = AssetId { chain_id: 1, token_symbol: "ETH".to_string(), token_address: "0x...".to_string() };
+        let asset_usdc = AssetId { chain_id: 1, token_symbol: "USDC".to_string(), token_address: "0x...".to_string() };
+        let asset_matic = AssetId { chain_id: 2, token_symbol: "MATIC".to_string(), token_address: "0x...".to_string() };
 
         assert_eq!(asset_eth.chain_id, 1);
         assert_eq!(asset_usdc.token_symbol, "USDC");
@@ -151,7 +140,7 @@ mod tests {
     #[test]
     fn lock_info_creation() {
         let acc1 = AccountId { chain_id: 1, address: "addr1".to_string() };
-        let asset1 = AssetId { chain_id: 1, token_symbol: "ETH".to_string() };
+        let asset1 = AssetId { chain_id: 1, token_symbol: "ETH".to_string(), token_address: "0x...".to_string() };
         let lock = LockInfo {
             account: acc1.clone(),
             asset: asset1.clone(),
@@ -168,8 +157,8 @@ mod tests {
         let acc_a2 = AccountId { chain_id: 1, address: "a2".to_string() };
         let acc_b1 = AccountId { chain_id: 2, address: "b1".to_string() };
         let acc_b2 = AccountId { chain_id: 2, address: "b2".to_string() };
-        let asset_a = AssetId { chain_id: 1, token_symbol: "AAA".to_string() };
-        let asset_b = AssetId { chain_id: 2, token_symbol: "BBB".to_string() };
+        let asset_a = AssetId { chain_id: 1, token_symbol: "AAA".to_string(), token_address: "0x...".to_string() };
+        let asset_b = AssetId { chain_id: 2, token_symbol: "BBB".to_string(), token_address: "0x...".to_string() };
 
         let lock1 = LockInfo { account: acc_a1.clone(), asset: asset_a.clone(), amount: 50 };
         let lock2 = LockInfo { account: acc_b1.clone(), asset: asset_b.clone(), amount: 30 };
@@ -180,6 +169,7 @@ mod tests {
             accounts: vec![acc_a1.clone(), acc_a2.clone(), acc_b1.clone(), acc_b2.clone()],
             amounts: vec![50, 30], // e.g., 50 units from a1->a2, 30 units from b1->b2
             required_locks: vec![lock1.clone(), lock2.clone()],
+            target_asset: Some(asset_b.clone()),
             timeout: std::time::Duration::from_secs(0),
         };
 
@@ -188,6 +178,7 @@ mod tests {
         assert_eq!(tx_cross.required_locks.len(), 2);
         assert_eq!(tx_cross.required_locks[0], lock1);
         assert_eq!(tx_cross.required_locks[1], lock2);
+        assert_eq!(tx_cross.target_asset, Some(asset_b));
     }
 
      #[test]

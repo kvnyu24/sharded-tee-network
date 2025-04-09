@@ -7,6 +7,7 @@ use crate::tee_logic::types::Signature;
 use crate::data_structures::TEEIdentity;
 // Import PublicKey for SignedCoordinatorDecision
 use crate::tee_logic::crypto_sim::PublicKey;
+use serde::{Serialize, Deserialize};
 
 // Represents a proof from a shard that a resource has been locked
 #[derive(Clone, Debug, PartialEq, Eq)] // Signature derives these
@@ -30,8 +31,10 @@ pub struct LockRequest {
 }
 
 // Reasons why a cross-chain swap might be aborted
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AbortReason {
+    VerificationFailed,
+    Timeout,
     LockProofVerificationFailed,
     TimeoutWaitingForLocks,
     LocalValidationError(String), // Validation failed within a shard

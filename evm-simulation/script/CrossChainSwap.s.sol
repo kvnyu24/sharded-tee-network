@@ -22,10 +22,10 @@ contract CrossChainSwapScript is Script {
     uint256 public userBPrivateKey = 0x5fa022c5fd19412b85af918ea35c48c86e17f5ad55ad275e9336b2d8eeb07ba0; 
     // Public Key: 0x60B162Ba495Ce3E498E805B49f439D0246FC0c07
 
-    // TEE Committee (Use slightly more robust keys)
-    uint256 public committeeMember1Pk = 0x100; 
-    uint256 public committeeMember2Pk = 0x200;
-    uint256 public committeeMember3Pk = 0x300;
+    // TEE Committee (Use valid generated keys)
+    uint256 public committeeMember1Pk = 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318;
+    uint256 public committeeMember2Pk = 0x6370fd033278c143179d81c5526140625662b8daa446c22ee2d73db3707e620c;
+    uint256 public committeeMember3Pk = 0x646f1ce2fdad0e6dee9cbf8d8e9a01932f8349b816954563c94686ca85773086;
     uint256 public threshold = 2;
 
     // Contract Addresses (will be populated after deployment)
@@ -40,7 +40,8 @@ contract CrossChainSwapScript is Script {
 
     // --- Helper: Get Packed Signature --- 
     // (Duplicated from test for script use - could be moved to a library)
-    function _getPackedSignature(uint256 privateKey, bytes32 messageHash) internal returns (bytes memory) {
+    // Marked as pure as it doesn't read/write state
+    function _getPackedSignature(uint256 privateKey, bytes32 messageHash) internal pure returns (bytes memory) {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, messageHash);
         if (v < 27) { v += 27; }
         return abi.encodePacked(r, s, v);
@@ -90,6 +91,11 @@ contract CrossChainSwapScript is Script {
         DummyERC20(tokenAddrA).approve(escrowAddrA, SWAP_AMOUNT * (10**18)); // Assuming 18 decimals
 
         vm.stopBroadcast();
+
+        // --> Record Initial State on Chain A <--
+        vm.selectFork(chainAId); // Make sure we are on Chain A
+        uint256 initialUserABalanceA = IERC20(tokenAddrA).balanceOf(userA);
+        console.log("Initial User A Balance on Chain A:", initialUserABalanceA / (10**18));
 
         // == Chain B Setup ==
         console.log("\n--- Setting up Chain B (%s) ---", RPC_URL_CHAIN_B);
@@ -186,26 +192,133 @@ contract CrossChainSwapScript is Script {
 
         vm.stopBroadcast();
 
-        // == Verification ==
-        console.log("\n--- Verifying Final State --- ");
-        
+        // == Verification After Release ==
+        console.log("\n--- Verifying State After Release --- ");
+
         // Check Chain A balances
         vm.selectFork(chainAId);
-        uint256 userABalanceA = IERC20(tokenAddrA).balanceOf(userA);
-        uint256 escrowABalanceA = IERC20(tokenAddrA).balanceOf(escrowAddrA);
-        console.log("Chain A - User A Balance:", userABalanceA / (10**18));
-        console.log("Chain A - Escrow A Balance:", escrowABalanceA / (10**18));
-        // Add assertions here
+        uint256 userABalanceAfterRelease = IERC20(tokenAddrA).balanceOf(userA);
+        uint256 escrowABalanceAfterRelease = IERC20(tokenAddrA).balanceOf(escrowAddrA);
+        console.log("Chain A - User A Balance After Release:", userABalanceAfterRelease / (10**18));
+        console.log("Chain A - Escrow A Balance After Release:", escrowABalanceAfterRelease / (10**18));
+        require(userABalanceAfterRelease == initialUserABalanceA - (SWAP_AMOUNT * (10**18)), "User A balance mismatch on Chain A after release");
+        require(escrowABalanceAfterRelease == SWAP_AMOUNT * (10**18), "Escrow A balance mismatch on Chain A after release");
 
         // Check Chain B balances
         vm.selectFork(chainBId);
-        uint256 userBBalanceB = IERC20(tokenAddrB).balanceOf(userB);
-        uint256 escrowBBalanceB = IERC20(tokenAddrB).balanceOf(escrowAddrB);
-        console.log("Chain B - User B Balance:", userBBalanceB / (10**18)); 
-        console.log("Chain B - Escrow B Balance:", escrowBBalanceB / (10**18));
+        uint256 userBBalanceAfterRelease = IERC20(tokenAddrB).balanceOf(userB);
+        uint256 escrowBBalanceAfterRelease = IERC20(tokenAddrB).balanceOf(escrowAddrB);
+        console.log("Chain B - User B Balance After Release:", userBBalanceAfterRelease / (10**18)); 
+        console.log("Chain B - Escrow B Balance After Release:", escrowBBalanceAfterRelease / (10**18));
         // Add assertions here - User B should have SWAP_AMOUNT
-        require(userBBalanceB == SWAP_AMOUNT * (10**18), "User B balance mismatch on Chain B");
+        // require(userBBalanceB == SWAP_AMOUNT * (10**18), "User B balance mismatch on Chain B"); // Original line, slightly different variable name
+        require(userBBalanceAfterRelease == SWAP_AMOUNT * (10**18), "User B balance mismatch on Chain B after release");
+        require(escrowBBalanceAfterRelease == 0, "Escrow B balance mismatch on Chain B after release"); // Should be 0 after transfer
 
-        console.log("\nCross-Chain Swap Simulation Complete.");
+        // console.log("\nCross-Chain Swap Simulation Complete."); // Moved to end
+
+        // ====================================
+        // == Execute Abort Scenario ==
+        // ====================================
+        console.log("\n\n--- Executing Abort Scenario ---");
+
+        // Use a new Swap ID
+        // Adding extra user address and timestamp component for uniqueness
+        bytes32 swapIdAbort = keccak256(abi.encodePacked("myAbortSwap", userA, block.timestamp)); 
+
+        // 1. User A locks tokens on Chain A (again, for abort scenario)
+        console.log("User A locking funds on Chain A for Abort...");
+        vm.selectFork(chainAId);
+        vm.startBroadcast(userAPrivateKey); // User A pays gas
+
+        // Check allowance and re-approve if necessary
+        uint256 allowanceNeeded = SWAP_AMOUNT * (10**18);
+        uint256 currentAllowance = DummyERC20(tokenAddrA).allowance(userA, escrowAddrA);
+        console.log("Current allowance for Escrow A:", currentAllowance);
+        if (currentAllowance < allowanceNeeded) {
+            console.log("Approving escrow again for abort scenario...");
+            uint256 approveAmount = allowanceNeeded - currentAllowance; // Approve only the difference needed
+            DummyERC20(tokenAddrA).approve(escrowAddrA, approveAmount);
+            console.log("Approved Escrow A for additional:", approveAmount);
+        } else {
+            console.log("Sufficient allowance exists for abort lock.");
+        }
+
+        // Record balance before second lock for later verification
+        uint256 userABalanceBeforeAbortLock = IERC20(tokenAddrA).balanceOf(userA);
+        console.log("User A balance before Abort lock:", userABalanceBeforeAbortLock / (10**18));
+
+        TEEescrow(escrowAddrA).lock(swapIdAbort, userB, tokenAddrA, allowanceNeeded, block.timestamp + 3600); // Use allowanceNeeded
+        console.logString("Lock successful on Chain A for Abort swapId:");
+        console.logBytes32(swapIdAbort);
+
+        vm.stopBroadcast();
+
+        // 2. Simulate TEEs observing and signing for Chain A Abort
+        console.log("Simulating TEE Observation and Signing for Chain A Abort...");
+        // Fork is already selected (Chain A)
+        
+        // Calculate the ABORT hash payload
+        bytes32 rawMessageHashAbort = keccak256(
+            abi.encodePacked(
+                bytes("ABORT:"), 
+                swapIdAbort, 
+                escrowAddrA,        // Escrow contract on Chain A
+                block.chainid,    // Chain ID of Chain A
+                tokenAddrA,        // Token on Chain A
+                allowanceNeeded,   // Amount
+                address(0),        // Recipient N/A for abort
+                userA              // Sender who gets funds back
+            )
+        );
+        console.logString("Raw Hash Payload (Abort Script):");
+        console.logBytes32(rawMessageHashAbort);
+
+        // Apply the standard Ethereum signed message prefix
+        bytes32 prefixedMessageHashAbort = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", rawMessageHashAbort));
+        console.logString("Prefixed Hash (Abort Script):");
+        console.logBytes32(prefixedMessageHashAbort);
+
+        // Sign the prefixed ABORT hash
+        bytes memory sig1Abort = _getPackedSignature(committeeMember1Pk, prefixedMessageHashAbort);
+        bytes memory sig2Abort = _getPackedSignature(committeeMember2Pk, prefixedMessageHashAbort);
+        bytes memory combinedSigsAbort = abi.encodePacked(sig1Abort, sig2Abort);
+
+        // 3. Relayer (or User A) calls abort on Chain A
+        console.log("Relayer calling abort on Chain A...");
+        vm.startBroadcast(userAPrivateKey); // User A pays gas
+
+        // Call abort with all required parameters
+        TEEescrow(escrowAddrA).abort(
+            swapIdAbort,
+            tokenAddrA,
+            allowanceNeeded,
+            userA, // Sender receives funds
+            combinedSigsAbort
+        );
+        console.log("Abort successful on Chain A.");
+
+        vm.stopBroadcast();
+
+        // == Final Verification (After Abort) == 
+        console.log("\n--- Verifying State After Abort --- ");
+        vm.selectFork(chainAId); // Select Chain A to check state
+        uint256 userABalanceAfterAbort = IERC20(tokenAddrA).balanceOf(userA);
+        uint256 escrowABalanceAfterAbort = IERC20(tokenAddrA).balanceOf(escrowAddrA); // Escrow A's total balance
+        console.log("Chain A - User A Balance After Abort:", userABalanceAfterAbort / (10**18));
+        console.log("Chain A - Escrow A Balance After Abort:", escrowABalanceAfterAbort / (10**18));
+        // Basic check: User A balance should be back to what it was before the *second* lock (minus gas)
+        // A more robust check requires comparing with userABalanceBeforeAbortLock
+        console.log("(Compare User A balance before Abort lock:", userABalanceBeforeAbortLock / (10**18), ")"); // Keep for reference
+
+        // TODO: Add require checks in Step 2 of roadmap
+        // require(userABalanceAfterAbort == userABalanceBeforeAbortLock, "User A balance mismatch after abort"); // This won't account for gas
+        // Add require checks
+        // User A balance should be back to what it was just before the *second* lock
+        require(userABalanceAfterAbort == userABalanceBeforeAbortLock, "User A balance mismatch after abort");
+        // Escrow A balance should be back to what it was *after* the successful release, before the second lock/abort cycle
+        require(escrowABalanceAfterAbort == escrowABalanceAfterRelease, "Escrow A balance mismatch after abort");
+
+        console.log("\nCross-Chain Simulation (incl. Abort) Complete and Verified.");
     }
 } 

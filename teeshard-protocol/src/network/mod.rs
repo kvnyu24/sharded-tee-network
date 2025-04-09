@@ -7,6 +7,7 @@ use crate::tee_logic::threshold_sig::PartialSignature;
 use crate::tee_logic::Signature;
 use crate::data_structures::TEEIdentity;
 use crate::tee_logic::crypto_sim::generate_keypair;
+use std::sync::Mutex;
 
 // Represents the types of messages that can be sent over the network
 #[derive(Debug, Clone)] // Added Clone
@@ -55,51 +56,43 @@ impl dyn NetworkInterface + Send + Sync {}
 
 
 // Mock implementation for testing
-#[cfg(test)]
-pub mod mock_network {
-    use super::*;
-    use std::sync::Mutex;
+#[derive(Default, Debug)] 
+pub struct MockNetwork {
+    pub sent_messages: Mutex<Vec<NetworkMessage>>,
+}
 
-    #[derive(Default)]
-    pub struct MockNetwork {
-        pub sent_messages: Mutex<Vec<NetworkMessage>>,
+#[async_trait::async_trait]
+impl NetworkInterface for MockNetwork {
+    fn send_message(&self, msg: NetworkMessage) {
+        self.sent_messages.lock().unwrap().push(msg);
+    }
+}
+
+impl MockNetwork {
+    pub fn new() -> Self {
+        MockNetwork { sent_messages: Mutex::new(Vec::new()) }
     }
 
-    impl NetworkInterface for MockNetwork {
-        fn send_message(&self, msg: NetworkMessage) {
-            // Simply record the message was sent
-            self.sent_messages.lock().unwrap().push(msg);
-            // In a more complex mock, could simulate delays or routing
-        }
+    pub fn get_sent_messages(&self) -> Vec<NetworkMessage> {
+        self.sent_messages.lock().unwrap().clone()
     }
 
-    // Add method specifically for tests to retrieve messages
-    impl MockNetwork {
-        pub fn get_sent_messages(&self) -> Vec<NetworkMessage> {
-            self.sent_messages.lock().unwrap().clone()
-        }
+    pub fn clear_sent_messages(&self) {
+        self.sent_messages.lock().unwrap().clear();
+    }
 
-        /// Retrieves and removes messages destined for a specific recipient.
-        pub fn retrieve_messages_for(&self, recipient_id: &TEEIdentity) -> Vec<NetworkMessage> {
-            let mut messages = self.sent_messages.lock().unwrap();
-            let mut recipient_messages = Vec::new();
-
-            // Use Vec::retain which is efficient for removing multiple items.
-            // It keeps elements for which the closure returns true.
-            messages.retain(|msg| {
-                if &msg.receiver == recipient_id {
-                    // It's for our recipient. Clone it for the result...
-                    recipient_messages.push(msg.clone());
-                    // ...and return false to remove it from the main Vec.
-                    false
-                } else {
-                    // It's for someone else, keep it.
-                    true
-                }
-            });
-
-            recipient_messages
-        }
+    pub fn retrieve_messages_for(&self, recipient_id: &TEEIdentity) -> Vec<NetworkMessage> {
+        let mut messages = self.sent_messages.lock().unwrap();
+        let mut recipient_messages = Vec::new();
+        messages.retain(|msg| {
+            if &msg.receiver == recipient_id {
+                recipient_messages.push(msg.clone());
+                false
+            } else {
+                true
+            }
+        });
+        recipient_messages
     }
 }
 
