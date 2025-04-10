@@ -7,6 +7,7 @@ use crate::data_structures::TxType; // Placeholder import
 use crate::data_structures::TEEIdentity; // Added TEEIdentity
 use crate::tee_logic::crypto_sim::generate_keypair; // For default TEE identities
 use crate::liveness::types::LivenessConfig; // Need import for LivenessConfig
+use crate::tee_logic::enclave_sim::TeeDelayConfig;
 
 #[derive(Clone, Debug)]
 pub struct SystemConfig {
@@ -49,6 +50,9 @@ pub struct SystemConfig {
 
     // List of TEEs designated as coordinators
     pub coordinator_identities: Vec<TEEIdentity>,
+
+    // Add TEE Overhead Configuration
+    pub tee_delays: TeeDelayConfig,
 }
 
 // Helper function to create TEEIdentity for default config
@@ -106,6 +110,9 @@ impl Default for SystemConfig {
                 create_default_tee(101),
                 create_default_tee(102),
             ],
+
+            // Default TEE Delays
+            tee_delays: TeeDelayConfig::default(), // Use defaults (likely 0 delay)
         }
     }
 }
@@ -135,6 +142,8 @@ impl From<&SystemConfig> for LivenessConfig {
             // Remove hardcoded value
             // challenge_window: Duration::from_secs(10), 
             challenge_window, // Use calculated value
+            // Add missing field
+            tee_delays: sys_config.tee_delays.clone(), 
         }
     }
 }
@@ -158,6 +167,9 @@ mod tests {
         assert_eq!(config.coordinator_threshold, 2);
         assert_eq!(config.coordinator_identities.len(), 3);
         assert_eq!(config.coordinator_identities[0].id, 100);
-        // Add more checks for other default fields
+        // Add check for default TEE delays
+        assert_eq!(config.tee_delays.sign_min_ms, 0);
+        assert_eq!(config.tee_delays.attest_max_ms, 0);
+        assert_eq!(config.tee_delays.verify_min_ms, 0);
     }
 } 

@@ -445,8 +445,8 @@ mod tests {
     // These should match the keys and settings in evm-simulation/script/CrossChainSwap.s.sol
     const RPC_URL_A: &str = "http://localhost:8545";
     const RPC_URL_B: &str = "http://localhost:8546";
-    const CHAIN_A_ID: u64 = 31337; // Default Anvil ID
-    const CHAIN_B_ID: u64 = 31337; // Use 31337 again if using the same Anvil instance or different if using two
+    const CHAIN_A_ID: u64 = 1; // Default Anvil ID
+    const CHAIN_B_ID: u64 = 10; // Use 31337 again if using the same Anvil instance or different if using two
 
     const RELAYER_PK: &str = "0x59c6995e998f97a5300194dc6916aa8c096e6d7d7f81a78f05791c43177926b8"; // Anvil default key 1
     // TEE committee member keys from the script (needed for signing)

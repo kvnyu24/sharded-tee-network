@@ -10,7 +10,7 @@ use crate::{
         state::{Command, RaftRole}, // Import Command and RaftRole enum
         storage::InMemoryStorage, // Using InMemoryStorage for simulation
     },
-    tee_logic::{crypto_sim::SecretKey, enclave_sim::EnclaveSim, types::{Signature, LockProofData}},
+    tee_logic::{crypto_sim::SecretKey, enclave_sim::{EnclaveSim, TeeDelayConfig}, types::{Signature, LockProofData}},
 };
 // Use crate::simulation::runtime::SimulationRuntime;
 // Corrected import path assumption
@@ -81,11 +81,14 @@ impl SimulatedTeeNode {
         _challenge_tx: mpsc::Sender<ChallengeNonce>,
     ) -> Self {
         let storage = Box::new(InMemoryStorage::new()); // Each node gets its own storage
-        // EnclaveSim uses SecretKey which is an alias for SigningKey. Pass directly.
-        // Remove redundant conversion via bytes:
-        // let secret_key_bytes = signing_key.to_bytes();
-        // let secret_key = SecretKey::from_bytes(&secret_key_bytes).expect("Should convert from signing key bytes");
-        let enclave = EnclaveSim::new(identity.id, Some(signing_key.clone())); // Clone signing_key as EnclaveSim::new takes Option<SigningKey>
+
+        // Get the Arc<SimulationConfig> from the runtime
+        let sim_config = runtime.get_config();
+        // Clone the TeeDelayConfig from the SimulationConfig
+        let tee_delay_config = sim_config.tee_delays.clone();
+
+        // Create EnclaveSim with the specific delay config wrapped in Arc
+        let enclave = EnclaveSim::new(identity.id, Some(signing_key.clone()), Arc::new(tee_delay_config));
         let raft_node = RaftNode::new(identity.clone(), peers, config, storage, enclave);
 
         // Create a channel for this node to receive messages (now tuple)
@@ -256,7 +259,8 @@ impl SimulatedTeeNode {
                     match bincode::encode_to_vec(&lock_data, standard()) {
                         Ok(data_to_sign) => {
                             println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
-                            let signature: Signature = self.raft_node.enclave.sign_message(&data_to_sign);
+                            // Use the correct `sign` method from EnclaveSim
+                            let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
                             let share = (self.identity.clone(), lock_data.clone(), signature);
                             println!("[Node {}][StateMachine] Submitting signature share for tx_id: {}", self.identity.id, lock_data.tx_id);
                             self.runtime.submit_result(share).await;
@@ -285,4 +289,4 @@ impl SimulatedTeeNode {
 
     // Add methods for application-specific logic if needed
     // e.g., fn process_command(command: Command) -> Result<Option<SignatureShare>, Error>
-} 
+}

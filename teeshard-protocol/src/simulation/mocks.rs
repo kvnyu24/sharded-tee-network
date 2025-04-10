@@ -7,6 +7,7 @@ use crate::{
     tee_logic::types::{LockProofData, Signature},
     liveness::types::LivenessAttestation,
 };
+use crate::simulation::config::SimulationConfig;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard},
@@ -31,7 +32,7 @@ impl MockSimulationRuntime {
     // Creates a mock runtime and the result receiver
     pub fn new() -> (Self, mpsc::Receiver<SignatureShare>) {
         // Capture all 4 return values from the real new(), ignore the last two
-        let (runtime_handle, result_rx, _liveness_rx, _isolation_rx) = SimulationRuntime::new();
+        let (runtime_handle, result_rx, _liveness_rx, _isolation_rx) = SimulationRuntime::new(SimulationConfig::default());
         (Self {
             handle: runtime_handle,
             sent_shard_commands: Arc::new(Mutex::new(Vec::new())),
@@ -68,7 +69,7 @@ impl MockSimulationRuntime {
     )
     {
         let (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx) =
-            SimulationRuntime::new(); // Call with zero arguments
+            SimulationRuntime::new(SimulationConfig::default()); // Call with config
 
         (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx)
     }

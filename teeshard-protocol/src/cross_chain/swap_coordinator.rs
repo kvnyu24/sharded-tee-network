@@ -21,11 +21,13 @@ use log::{info, warn, error, debug};
 use thiserror::Error;
 use tokio;
 use std::error::Error as StdError;
+use crate::tee_logic::lock_proofs; // Import the module
 
 // Constants
 const DEFAULT_SWAP_TIMEOUT_SECS: u64 = 3600; // 1 hour
 
 // Represents the state of a coordinator TEE managing a swap
+#[derive(Clone)]
 pub struct CrossChainCoordinator {
     pub identity: TEEIdentity,
     pub signing_key: SecretKey, // Coordinator needs its own key to sign placeholder decisions
@@ -170,7 +172,8 @@ impl CrossChainCoordinator {
 
     // Handles incoming lock proofs, stores them, and triggers finalization if ready.
     // Returns Ok(true) if ready to finalize, Ok(false) if waiting, Err on verification failure.
-    pub fn handle_lock_proof(&mut self, proof: LockProof) -> Result<bool, AbortReason> {
+    // Make async due to verify_lock_proof call
+    pub async fn handle_lock_proof(&mut self, proof: LockProof) -> Result<bool, AbortReason> {
         let tx_id = proof.tx_id.clone();
         println!("Coordinator ({}): Received lock proof for swap {} from shard {}",
                  self.identity.id, tx_id, proof.shard_id);
@@ -181,13 +184,15 @@ impl CrossChainCoordinator {
                 AbortReason::Other("Swap not found".to_string())
             })?;
 
-        // Verify the proof using the signer's public key
-        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof, &proof.signer_identity.public_key) {
+        // Get verify delays from config
+        let verify_min_ms = self.config.tee_delays.verify_min_ms;
+        let verify_max_ms = self.config.tee_delays.verify_max_ms;
+
+        // Verify the proof using the signer's public key (now async)
+        if !lock_proofs::verify_lock_proof(&proof, &proof.signer_identity.public_key, verify_min_ms, verify_max_ms).await {
             println!("Coordinator ({}): Lock proof verification failed for swap {} from signer {}",
                      self.identity.id, tx_id, proof.signer_identity.id);
-            // Mark swap as aborted instead of removing immediately
             swap.status = SwapStatus::Aborted(AbortReason::LockProofVerificationFailed);
-            // self.active_swaps.remove(&tx_id); // Don't remove yet
             return Err(AbortReason::LockProofVerificationFailed);
         }
 
@@ -241,9 +246,14 @@ impl CrossChainCoordinator {
     /// Adds the local coordinator's signature share for a RELEASE or ABORT decision.
     /// Ensures the appropriate aggregator exists and adds the partial signature.
     /// Returns Ok if added, Err if the swap doesn't exist or signing fails.
-    fn add_local_signature_share(&mut self, tx_id: &str, commit: bool) -> Result<(), String> {
+    // Make async due to add_partial_signature call
+    async fn add_local_signature_share(&mut self, tx_id: &str, commit: bool) -> Result<(), String> {
         let message_bytes = Self::prepare_decision_message(tx_id, commit);
         let threshold = self.get_coordinator_threshold();
+        // Get the delay config from self.config
+        // Need Arc<TeeDelayConfig> for ThresholdAggregator::new
+        // Clone the TeeDelayConfig from SystemConfig and wrap in Arc
+        let delay_config = Arc::new(self.config.tee_delays.clone());
 
         let swap = self.active_swaps.get_mut(tx_id)
             .ok_or_else(|| format!("Swap {} not found for signing", tx_id))?;
@@ -258,25 +268,23 @@ impl CrossChainCoordinator {
         if aggregator_option.is_none() {
             println!("Coordinator ({}): Creating {} aggregator for swap {}",
                      self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id);
-            *aggregator_option = Some(ThresholdAggregator::new(threshold));
+            // Pass the delay config Arc when creating
+            *aggregator_option = Some(ThresholdAggregator::new(threshold, Arc::clone(&delay_config)));
         }
 
-        // We need to re-borrow mutably AFTER the potential assignment above.
-        let aggregator = aggregator_option.as_mut().unwrap(); // Safe to unwrap due to check above
-
-        // Check if the message matches (in case aggregator was created for a different older message? Unlikely here)
-        // if aggregator.message != message_bytes { ... error handling ... }
+        // Re-borrow mutably AFTER the potential assignment above.
+        let aggregator = aggregator_option.as_mut().unwrap(); // Safe to unwrap
 
         // Create and add the partial signature
+        // Signing the decision message itself doesn't use TEE delays currently
         let local_signature = self.signing_key.sign(&message_bytes);
         let partial_sig = PartialSignature {
             signer_id: self.identity.clone(),
             signature_data: local_signature,
         };
 
-        // Add the verified share to the aggregator
-        // Use refactored API: add_partial_signature takes message_bytes
-        match aggregator.add_partial_signature(&message_bytes, partial_sig.clone()) { // Clone partial_sig for potential broadcast
+        // Add the verified share to the aggregator (now async)
+        match aggregator.add_partial_signature(&message_bytes, partial_sig.clone()).await { // Added .await
             Ok(_) => {
                 println!("Coordinator ({}): Added local {} signature share for swap {}. Total shares: {}",
                          self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
@@ -303,8 +311,6 @@ impl CrossChainCoordinator {
                 Ok(())
             },
             Err(e) => {
-                // Log error, but don't necessarily fail the whole operation?
-                // Might fail if we already signed.
                 eprintln!("Coordinator ({}): Failed to add local {} signature share for swap {}: {}",
                           self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, e);
                 Err(format!("Failed to add local signature share: {}", e))
@@ -313,8 +319,8 @@ impl CrossChainCoordinator {
     }
 
     /// Placeholder function to handle receiving a partial signature from another coordinator.
-    // TODO: Integrate with network layer to receive and route PartialSignature messages here.
-    fn handle_partial_signature(&mut self, partial_sig: PartialSignature, tx_id: &str, commit: bool) -> Result<(), String> {
+    // Make async due to add_partial_signature call
+    async fn handle_partial_signature(&mut self, partial_sig: PartialSignature, tx_id: &str, commit: bool) -> Result<(), String> {
         let swap = self.active_swaps.get_mut(tx_id)
             .ok_or_else(|| format!("Swap {} not found for receiving partial signature", tx_id))?;
 
@@ -325,16 +331,13 @@ impl CrossChainCoordinator {
         };
 
         if let Some(aggregator) = aggregator_option {
-            // Reconstruct the message bytes based on tx_id and commit flag
             let message_bytes = Self::prepare_decision_message(tx_id, commit);
             
-            // Verification against the reconstructed message happens within add_partial_signature.
-            match aggregator.add_partial_signature(&message_bytes, partial_sig) {
+            // Call async version and await
+            match aggregator.add_partial_signature(&message_bytes, partial_sig).await { // Added .await
                 Ok(_) => {
                      println!("Coordinator ({}): Added remote {} signature share for swap {}. Total shares: {}",
                               self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
-                     // Optional: Check if threshold met and trigger finalization?
-                     // if aggregator.has_reached_threshold() { ... }
                      Ok(())
                 },
                 Err(e) => {
@@ -344,10 +347,6 @@ impl CrossChainCoordinator {
                 }
             }
         } else {
-            // This might happen if a partial signature arrives before the local coordinator
-            // has even initialized the aggregator (e.g., before deciding to sign locally).
-            // Policy decision: Should we store it pending aggregator creation, or reject it?
-            // Rejecting for now.
              eprintln!("Coordinator ({}): Received partial {} signature for swap {} but no corresponding aggregator exists yet.",
                        self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id);
              Err("Aggregator not initialized".to_string())
@@ -400,122 +399,94 @@ impl CrossChainCoordinator {
     }
 
     // Optional: A combined function to handle proof and finalize if ready
+    // This function now needs to call async add_local_signature_share
     pub async fn process_proof_and_finalize(&mut self, proof: LockProof) -> Result<Option<SignedCoordinatorDecision>, AbortReason> {
-        let tx_id_str = proof.tx_id.clone();
-        // Use match for cleaner error handling and early return
-        // The original handle_lock_proof logic is now integrated here
+        let tx_id_str = proof.tx_id.clone(); // Clone tx_id for use throughout
         
-        let tx_id = proof.tx_id.clone();
+        // --- Lock Proof Handling Logic (extracted from handle_lock_proof) --- 
         println!("Coordinator ({}): Received lock proof for swap {} from shard {}",
-                 self.identity.id, tx_id, proof.shard_id);
-
-        let swap = self.active_swaps.get_mut(&tx_id)
+                 self.identity.id, tx_id_str, proof.shard_id);
+        
+        let swap = self.active_swaps.get_mut(&tx_id_str)
             .ok_or_else(|| {
-                println!("Coordinator Error: Swap {} not found when handling proof from shard {}", tx_id, proof.shard_id);
+                println!("Coordinator Error: Swap {} not found when handling proof from shard {}", tx_id_str, proof.shard_id);
                 AbortReason::Other("Swap not found".to_string())
             })?;
 
-        // Verify the proof
-        if !crate::tee_logic::lock_proofs::verify_lock_proof(&proof, &proof.signer_identity.public_key) {
+        // Get verify delays from config
+        let verify_min_ms = self.config.tee_delays.verify_min_ms;
+        let verify_max_ms = self.config.tee_delays.verify_max_ms;
+
+        // Verify the proof (now async)
+        // TODO: Add verification delay here? YES - now implemented.
+        if !lock_proofs::verify_lock_proof(&proof, &proof.signer_identity.public_key, verify_min_ms, verify_max_ms).await {
             println!("Coordinator ({}): Lock proof verification failed for swap {} from signer {}",
-                     self.identity.id, tx_id, proof.signer_identity.id);
+                     self.identity.id, tx_id_str, proof.signer_identity.id);
             swap.status = SwapStatus::Aborted(AbortReason::LockProofVerificationFailed);
             return Err(AbortReason::LockProofVerificationFailed);
         }
 
-        // Store the verified proof
         if swap.relevant_shards.contains(&proof.shard_id) {
             let _ = swap.received_proofs.insert(proof.shard_id, proof.clone()); 
             println!("Coordinator ({}): Stored valid proof for swap {} from shard {}. ({}/{}) proofs received.",
-                     self.identity.id, tx_id, proof.shard_id, swap.received_proofs.len(), swap.relevant_shards.len());
+                     self.identity.id, tx_id_str, proof.shard_id, swap.received_proofs.len(), swap.relevant_shards.len());
         } else {
-            println!("Coordinator Warning: Received proof for swap {} from irrelevant shard {}. Ignoring.", tx_id, proof.shard_id);
+            println!("Coordinator Warning: Received proof for swap {} from irrelevant shard {}. Ignoring.", tx_id_str, proof.shard_id);
             return Ok(None); // Not ready yet
         }
+        // --- End Lock Proof Handling Logic --- 
 
         // Check if all proofs are received
-        if self.evaluate_all_locks(&tx_id) {
-            println!("Coordinator ({}): All lock proofs received for swap {}. Attempting to finalize COMMIT.", self.identity.id, tx_id);
+        if self.evaluate_all_locks(&tx_id_str) {
+            println!("Coordinator ({}): All lock proofs received for swap {}. Attempting to finalize COMMIT.", self.identity.id, tx_id_str);
             
             let commit = true;
-            if self.add_local_signature_share(&tx_id, commit).is_err() {
-                println!("Coordinator ({}): Failed to add local COMMIT share for swap {}. Aborting internally.", self.identity.id, tx_id);
-                let swap = self.active_swaps.get_mut(&tx_id).unwrap(); // Should exist
-                swap.status = SwapStatus::Aborted(AbortReason::CoordinatorFailure);
-                return Err(AbortReason::CoordinatorFailure);
+            // Attempt to add local signature share (now async)
+            if let Err(e) = self.add_local_signature_share(&tx_id_str, commit).await { // Added .await
+                eprintln!("Coordinator ({}): Failed to add local signature share during finalization for {}: {}. Aborting potentially?",
+                         self.identity.id, tx_id_str, e);
+                // Decide policy: Abort or just log? Returning Ok(None) for now, assuming broadcast might still succeed.
+                return Ok(None);
             }
-            
-            let finalize_result = self.attempt_finalize_decision_signature(&tx_id, commit);
 
-            match finalize_result {
-                Ok(Some(signatures_collection)) => {
-                    // Decision struct is defined locally later
-                    let decision = SignedCoordinatorDecision {
-                        tx_id: tx_id.clone(),
-                        commit,
-                        signature: signatures_collection.clone(), // Keep original structure for decision
-                    };
-                    // Convert Vec<(PublicKey, Signature)> to Vec<u8>
-                    let signature_bytes: Vec<u8> = signatures_collection
-                        .iter()
-                        .flat_map(|(_pk, sig)| sig.to_bytes())
-                                        .collect();
-
-                    match self.submit_decision_to_blockchain(tx_id.clone(), true, signature_bytes).await {
-                        Ok(tx_hash) => {
-                             println!("Coordinator ({}): Successfully submitted COMMIT for swap {} to blockchain. Tx: {}", self.identity.id, tx_id, tx_hash);
-                             self.active_swaps.remove(&tx_id);
-                             Ok(Some(decision)) // Return the successful decision
-                        }
-                        Err(e) => {
-                            println!("Coordinator ({}): ERROR submitting COMMIT for swap {} to blockchain: {}. Swap remains active for potential retry/abort.", self.identity.id, tx_id, e);
-                            Err(AbortReason::Other(format!("Blockchain submission failed: {}", e)))
-                        }
+            // Check if threshold is met *after* adding local share
+            // finalize_decision remains synchronous as it just checks state
+            if let Some(signed_decision) = self.finalize_decision(&tx_id_str, commit) {
+                println!("Coordinator ({}): COMMIT decision threshold met for swap {}. Submitting to blockchain...", self.identity.id, tx_id_str);
+                // Call submit_decision_to_blockchain with the SignedCoordinatorDecision object
+                match self.submit_decision_to_blockchain(signed_decision.clone()).await { 
+                    Ok(blockchain_tx_id) => {
+                        println!("Coordinator ({}): Blockchain submission successful for swap {}: {}",
+                                 self.identity.id, tx_id_str, blockchain_tx_id);
+                        // Clean up the swap state upon successful submission
+                        self.active_swaps.remove(&tx_id_str);
+                        // Return the signed decision object
+                        return Ok(Some(signed_decision));
+                    }
+                    Err(e) => {
+                        eprintln!("Coordinator ({}): Blockchain submission FAILED for swap {}: {:?}. Swap remains active locally.",
+                                 self.identity.id, tx_id_str, e);
+                        // TODO: Should we attempt to abort here? Or rely on timeout?
+                        // Swap state is NOT removed on blockchain failure.
+                        // Returning Ok(None) as the decision was reached but not submitted.
+                        return Ok(None); 
                     }
                 }
-                Ok(None) => {
-                    println!("Coordinator ({}): COMMIT threshold not met for swap {} after adding local share (unexpected). Waiting.", self.identity.id, tx_id);
-                    Ok(None) // Still waiting
-                }
-                    Err(e) => {
-                    println!("Coordinator ({}): Error finalizing COMMIT decision for swap {}: {}. Aborting.", self.identity.id, tx_id, e);
-                    let swap = self.active_swaps.get_mut(&tx_id).unwrap(); // Should exist
-                    swap.status = SwapStatus::Aborted(AbortReason::CoordinatorFailure);
-                    Err(AbortReason::CoordinatorFailure)
-                }
+            } else {
+                println!("Coordinator ({}): COMMIT threshold not met yet for swap {} after adding local share.", self.identity.id, tx_id_str);
+                // Threshold not met, wait for more partial signatures from peers
+                Ok(None)
             }
         } else {
-            Ok(None) // Still waiting for more proofs
-        }
-    }
-
-    /// Attempts to finalize the decision signature aggregation.
-    /// Separated from the blockchain submission logic.
-    fn attempt_finalize_decision_signature(&self, tx_id: &str, commit: bool) -> Result<Option<Vec<(PublicKey, Signature)>>, String> {
-        let swap = self.active_swaps.get(tx_id)
-            .ok_or_else(|| format!("Swap {} not found for finalization attempt", tx_id))?;
-
-        let aggregator_option = if commit {
-            &swap.release_aggregator
-        } else {
-            &swap.abort_aggregator
-        };
-
-        if let Some(aggregator) = aggregator_option {
-            if let Some(multi_sig_collection) = aggregator.finalize_multi_signature() {
-                // Return the collection directly
-                Ok(Some(multi_sig_collection))
-                             } else {
-                Ok(None) // Threshold not met
-                             }
-                         } else {
-            Ok(None) // Aggregator not initialized
+            // Still waiting for more proofs
+            Ok(None)
         }
     }
 
     /// Checks for timed-out swaps, marks them as Aborted, adds local ABORT share,
     /// potentially finalizes, and returns a list of signed decisions if finalized.
-    pub fn check_timeouts(&mut self) -> Vec<SignedCoordinatorDecision> {
+    // Make async because it calls add_local_signature_share
+    pub async fn check_timeouts(&mut self) -> Vec<SignedCoordinatorDecision> {
         let now = std::time::Instant::now();
         let mut decisions = Vec::new();
         // let timeout_duration = self.config.swap_timeout; // Field doesn't exist
@@ -537,7 +508,7 @@ impl CrossChainCoordinator {
                 if state.status == SwapStatus::Active {
                     state.status = SwapStatus::Aborted(AbortReason::Timeout);
                     // Attempt to sign and finalize ABORT due to timeout
-                    match self.add_local_signature_share(&tx_id, false) { // false for ABORT
+                    match self.add_local_signature_share(&tx_id, false).await { // false for ABORT
                         Ok(_) => {
                             if let Some(decision) = self.finalize_decision(&tx_id, false) {
                                 println!(
@@ -547,46 +518,18 @@ impl CrossChainCoordinator {
                                 );
 
                                 // --- Submit to Blockchain (Timeout Abort) --- 
-                                let blockchain_if = Arc::clone(&self.blockchain_interface);
-                                let swap_state = self.active_swaps.get(&tx_id).cloned(); 
-                                let final_decision = decision.clone();
                                 let tx_id_clone = tx_id.clone(); // Clone tx_id for the closure
 
-                                if let Some(state_inner) = swap_state {
-                                    tokio::spawn(async move {
-                                        // Extract details for abort
-                                        let target_chain_id = state_inner.transaction.accounts.get(0).map_or(0, |acc| acc.chain_id); 
-                                        let token_identifier = state_inner.transaction.required_locks.get(0).map_or("".to_string(), |lock| lock.asset.token_symbol.clone());
-                                        let amount = state_inner.transaction.amounts.get(0).copied().unwrap_or(0);
-                                        let sender_address = state_inner.transaction.accounts.get(0).map_or("".to_string(), |acc| acc.address.clone());
-
-                                        // Convert swap_id string to [u8; 32]
-                                        let swap_id_bytes = hex::decode(tx_id_clone.trim_start_matches("0x")).unwrap_or_default(); // Use clone
-                                        let mut swap_id = [0u8; 32];
-                                        let len = std::cmp::min(swap_id_bytes.len(), 32);
-                                        swap_id[..len].copy_from_slice(&swap_id_bytes[..len]);
-
-                                        // Convert Vec<(VerifyingKey, DalekSignature)> to packed SignatureBytes (Vec<u8>)
-                                        let tee_signatures: SignatureBytes = final_decision.signature
-                                            .iter()
-                                            .flat_map(|(_pk, sig)| sig.to_bytes().to_vec())
-                                            .collect();
-
-                                        match blockchain_if.submit_abort(
-                                            target_chain_id, 
-                                            swap_id, 
-                                            token_identifier, 
-                                            amount.into(), // Use .into()
-                                            sender_address, 
-                                            tee_signatures
-                                        ).await {
-                                            Ok(tx_hash) => println!("Blockchain submission SUCCESS (Timeout Abort) for swap {}: TxHash {}", final_decision.tx_id, tx_hash),
-                                            Err(e) => eprintln!("Blockchain submission FAILED (Timeout Abort) for swap {}: {}", final_decision.tx_id, e),
-                                        }
-                                    });
-                                } else {
-                                    eprintln!("Error: Swap state not found for {} during blockchain submission (Timeout Abort).", tx_id);
-                                }
+                                // Spawn a task to call the refactored submit function
+                                let self_clone = Arc::new(self.clone()); // Need to clone self or relevant parts safely
+                                let decision_clone_for_spawn = decision.clone(); // Clone decision BEFORE spawn
+                                tokio::spawn(async move {
+                                    match self_clone.submit_decision_to_blockchain(decision_clone_for_spawn).await { // Use the clone
+                                        Ok(tx_hash) => println!("Blockchain submission SUCCESS (Timeout Abort) for swap {}: TxHash {}", tx_id_clone, tx_hash),
+                                        Err(e) => eprintln!("Blockchain submission FAILED (Timeout Abort) for swap {}: {}", tx_id_clone, e),
+                                    }
+                                });
+                                
                                 // --- End Submit (Timeout Abort) ---
                                 decisions.push(decision);
                                 self.active_swaps.remove(&tx_id);
@@ -627,81 +570,87 @@ impl CrossChainCoordinator {
     }
     // --- End Helper Functions ---
 
-    // Needs to be async now
+    /// Finalizes the decision and submits it to the blockchain interface.
+    /// Takes the finalized SignedCoordinatorDecision containing threshold signatures.
     async fn submit_decision_to_blockchain(
         &self,
-        tx_id_str: String,
-        commit: bool, // Add commit flag directly
-        signatures: Vec<u8>
-    ) -> Result<TransactionId, BlockchainError> { // Return the Result
-        // Use correct field name: blockchain_interface
+        decision: SignedCoordinatorDecision,
+    ) -> Result<TransactionId, BlockchainError> { 
         let relayer = self.blockchain_interface.clone(); 
+        let tx_id_str = decision.tx_id.clone();
+        let commit = decision.commit;
         let swap_info = self.active_swaps.get(&tx_id_str).cloned(); // Clone swap state
 
-        if let Some(swap_state) = swap_info { // Rename to avoid confusion with transaction fields
-             println!("Coordinator ({}): Finalized {} decision for swap {}. Submitting to blockchain.", self.identity.id, if commit { "COMMIT" } else { "ABORT" }, tx_id_str);
-            
+        if let Some(swap_state) = swap_info { 
+             println!(
+                 "Coordinator ({}): Finalized {} decision for swap {}. Preparing submission...", 
+                 self.identity.id, 
+                 if commit { "COMMIT" } else { "ABORT" }, 
+                 tx_id_str
+             );
+
+            // Decode the swap_id hex string into bytes32
+            let swap_id_bytes = hex::decode(tx_id_str.trim_start_matches("0x"))
+                .map_err(|e| EvmRelayerError::HexError(e))?;
+            let swap_id: SwapId = swap_id_bytes.try_into()
+                .map_err(|_| EvmRelayerError::ParseError("Failed to convert Vec<u8> to SwapId [u8; 32]".to_string()))?;
+
+            // Pack the collected threshold signatures from the SignedCoordinatorDecision
+            let final_signature_bytes: SignatureBytes = decision.signature
+                .iter()
+                // Signatures are already pre-sorted by public key within the aggregator
+                .flat_map(|(_pk, sig)| sig.to_bytes().to_vec()) 
+                .collect();
+
+            println!("[Coordinator {}] Submitting with packed threshold signatures ({} bytes) for swap {}", self.identity.id, final_signature_bytes.len(), tx_id_str);
+
+            // Now submit to the blockchain using the *correctly* signed hash
             if commit {
                 // Access fields via swap_state.transaction
                 if let Some(target_asset) = swap_state.transaction.target_asset.clone() {
-                    let swap_id_bytes = hex::decode(tx_id_str.trim_start_matches("0x"))
-                        .map_err(|e| EvmRelayerError::HexError(e))?;
-                    let swap_id: SwapId = swap_id_bytes.try_into()
-                        .map_err(|_| EvmRelayerError::ParseError("Failed to convert Vec<u8> to SwapId [u8; 32]".to_string()))?;
-
-                    // Access fields via swap_state.transaction
                     let recipient_address = swap_state.transaction.accounts.get(1).map(|acc| acc.address.clone())
                         .ok_or_else(|| EvmRelayerError::Other("Missing recipient account in swap info".to_string()))?;
 
-                    // Access fields via swap_state.transaction
                     let amount_u64 = swap_state.transaction.amounts.get(0).cloned()
                         .ok_or_else(|| EvmRelayerError::Other("Missing amount in swap info".to_string()))?;
                     let amount_u256 = U256::from(amount_u64);
 
+                    println!("[Coordinator {}] Calling relayer.submit_release for swap 0x{}...", self.identity.id, hex::encode(swap_id));
                     relayer.submit_release(
                         target_asset.chain_id,
                         swap_id,
                         target_asset.token_address,
                         amount_u256,
                         recipient_address,
-                        signatures,
+                        final_signature_bytes, // Use the newly generated signature
                     ).await
                  } else {
-                     println!("Coordinator ({}): ERROR - Cannot submit RELEASE for swap {} - target_asset info missing!", self.identity.id, tx_id_str);
+                     println!("[Coordinator {}] ERROR - Cannot submit RELEASE for swap {} - target_asset info missing!", self.identity.id, tx_id_str);
                      Err(EvmRelayerError::ConfigNotFound("Missing target asset info".to_string()))
                  }
             } else { // ABORT case
-                 // Access fields via swap_state.transaction
                  if let Some(lock_info) = swap_state.transaction.required_locks.get(0) {
-                    let swap_id_bytes = hex::decode(tx_id_str.trim_start_matches("0x"))
-                        .map_err(|e| EvmRelayerError::HexError(e))?;
-                    let swap_id: SwapId = swap_id_bytes.try_into()
-                        .map_err(|_| EvmRelayerError::ParseError("Failed to convert Vec<u8> to SwapId [u8; 32]".to_string()))?;
-
-                    // Get sender address from lock_info
                     let sender_address = lock_info.account.address.clone();
-                    // Get amount from lock_info
                     let amount_u256 = U256::from(lock_info.amount);
-                    // Get token address from lock_info
                     let token_address = lock_info.asset.token_address.clone();
-                    // Get chain_id from lock_info
                     let chain_id = lock_info.asset.chain_id; 
 
+                     println!("[Coordinator {}] Calling relayer.submit_abort for swap 0x{}...", self.identity.id, hex::encode(swap_id));
                      relayer.submit_abort(
-                        chain_id, // Use source chain ID from lock
+                        chain_id, 
                         swap_id,
-                        token_address, // Use token from lock
-                        amount_u256, // Use amount from lock
-                        sender_address, // Use original sender address from lock
-                        signatures,
+                        token_address, 
+                        amount_u256, 
+                        sender_address, 
+                        final_signature_bytes, // Use the newly generated signature
                     ).await
                  } else {
-                     println!("Coordinator ({}): ERROR - Cannot submit ABORT for swap {} - lock_info missing!", self.identity.id, tx_id_str);
+                     println!("[Coordinator {}] ERROR - Cannot submit ABORT for swap {} - lock_info missing!", self.identity.id, tx_id_str);
                      Err(EvmRelayerError::ConfigNotFound("Missing lock info".to_string()))
                  }
             }
         } else {
-             println!("Coordinator ({}): ERROR - Swap info not found for {} during blockchain submission.", self.identity.id, tx_id_str);
+             println!("[Coordinator {}] ERROR - Swap info not found for {} during blockchain submission.", self.identity.id, tx_id_str);
              Err(EvmRelayerError::ConfigNotFound(format!("Swap info not found for {}", tx_id_str)))
         }
     }
@@ -773,7 +722,8 @@ mod tests {
     }
 
     // create_dummy_lock_proof needs signer identity
-    fn create_dummy_lock_proof(tx_id: &str, shard_id: usize, signing_tee: &TEEIdentity, signing_key: &SecretKey) -> LockProof {
+    // Make async because it calls sign
+    async fn create_dummy_lock_proof(tx_id: &str, shard_id: usize, signing_tee: &TEEIdentity, signing_key: &SecretKey) -> LockProof {
         let lock_info = LockInfo {
             account: AccountId { chain_id: 0, address: format!("dummy_acc_{}", shard_id) }, // Make distinct
             asset: AssetId {
@@ -788,13 +738,15 @@ mod tests {
         data_to_sign.extend_from_slice(lock_info.account.address.as_bytes());
         data_to_sign.extend_from_slice(&lock_info.asset.token_symbol.as_bytes());
         data_to_sign.extend_from_slice(&lock_info.amount.to_le_bytes());
-        let signature = sign(&data_to_sign, signing_key);
+        // Provide delay arguments (0, 0 for tests) and await the async sign function
+        let signature = sign(&data_to_sign, signing_key, 0, 0).await;
 
         LockProof {
             tx_id: tx_id.to_string(),
             shard_id,
             lock_info,
             signer_identity: signing_tee.clone(),
+            // Signature is now the correct type after awaiting
             attestation_or_sig: signature,
         }
     }
@@ -893,8 +845,9 @@ mod tests {
     // --- End Mock Blockchain Interface ---
 
     // Helper to dispatch messages from mock network to coordinators
+    // Make async because it calls handle_partial_signature
     // Updated to take only 2 arguments
-    fn dispatch_messages(
+    async fn dispatch_messages(
         network: &Arc<MockNetwork>, // Network to retrieve messages from
         coordinators: &HashMap<TEEIdentity, Arc<Mutex<CrossChainCoordinator>>>,
         // shared_mock_network: &Arc<MockNetwork> // Removed redundant arg
@@ -910,7 +863,8 @@ mod tests {
                      match network_msg.message {
                          Message::CoordPartialSig { tx_id, commit, signature } => {
                              // Call the handler on the coordinator instance
-                            if let Err(e) = coordinator.handle_partial_signature(signature, &tx_id, commit) {
+                             // Need to await the async function call here
+                            if let Err(e) = coordinator.handle_partial_signature(signature, &tx_id, commit).await { // ADDED .await
                                  eprintln!("   -> Dispatch Error handling PartialSig for {}: {}", coord_id.id, e);
                              }
                          }
@@ -967,7 +921,7 @@ mod tests {
             println!("--- Dispatcher Round {} ---", round + 1);
             let messages_before = mock_network.get_sent_messages().len();
             // Call site already uses 2 args, now matches updated definition
-            dispatch_messages(&mock_network, &coordinators); 
+            dispatch_messages(&mock_network, &coordinators).await; 
             let messages_after = mock_network.get_sent_messages().len();
             if messages_before > 0 && messages_after == 0 {
                 println!("--- Dispatcher: Quiesced ---");
@@ -1035,7 +989,7 @@ mod tests {
         });
 
         // Check timeouts immediately after setup (should detect the old swap)
-        let timed_out_swaps = coordinator.check_timeouts();
+        let timed_out_swaps = coordinator.check_timeouts().await;
         assert!(!timed_out_swaps.is_empty(), "Expected to find timed out swaps");
     }
 } // end tests mod 

@@ -12,10 +12,12 @@ use rand::Rng; // Import Rng trait
 // Import StdRng and SeedableRng for Send-compatible RNG
 use rand::{rngs::StdRng, SeedableRng};
 use tokio::sync::mpsc; // Import mpsc
+use tokio::time::interval;
 
 // Represents a TEE node acting as a challenger
 pub struct Challenger {
     // config: LivenessConfig, // Removed unused config
+    identity: TEEIdentity,
     nodes_to_challenge: Vec<TEEIdentity>,
     runtime: SimulationRuntime, 
     aggregator_tx: mpsc::Sender<ChallengeNonce>,
@@ -23,16 +25,17 @@ pub struct Challenger {
 
 impl Challenger {
     pub fn new(
-        // config: LivenessConfig, // Removed unused config
+        identity: TEEIdentity,
         initial_nodes: Vec<TEEIdentity>,
         runtime: SimulationRuntime,
         aggregator_tx: mpsc::Sender<ChallengeNonce>,
     ) -> Self {
-        Challenger { 
+        Challenger {
             // config, // Removed unused config
-            nodes_to_challenge: initial_nodes, 
-            runtime, 
-            aggregator_tx 
+            identity,
+            nodes_to_challenge: initial_nodes,
+            runtime,
+            aggregator_tx
         }
     }
 
@@ -70,6 +73,22 @@ impl Challenger {
         }
     }
 
+    /// Main run loop for the challenger task.
+    pub async fn run(mut self) {
+        log::info!("[Challenger {}] Starting run loop...", self.identity.id);
+        // TODO: Make challenge frequency configurable via LivenessConfig/SimulationConfig
+        let challenge_interval_duration = Duration::from_secs(15); // Example: challenge every 15 seconds
+        let mut challenge_timer = interval(challenge_interval_duration);
+
+        loop {
+            challenge_timer.tick().await;
+            log::debug!("[Challenger {}] Issuing periodic challenges.", self.identity.id);
+            self.issue_challenges().await;
+        }
+        // Note: Loop runs indefinitely, relies on Tokio task cancellation for shutdown
+        // log::info!("[Challenger {}] Stopping run loop.", self.identity.id);
+    }
+
     // Remove adjust_intervals method
     /* pub fn adjust_intervals(&mut self) { ... } */
 }
@@ -81,6 +100,7 @@ mod tests {
     use crate::liveness::types::LivenessConfig;
     use crate::tee_logic::crypto_sim::generate_keypair;
     use crate::simulation::runtime::SimulationRuntime;
+    use crate::simulation::config::SimulationConfig; // Import SimulationConfig
     use tokio::sync::mpsc;
     use std::time::Duration;
 
@@ -97,7 +117,8 @@ mod tests {
         let node2 = create_test_tee_identity(2);
         let initial_nodes = vec![node1.clone(), node2.clone()];
         
-        let (runtime, _, _, _) = SimulationRuntime::new(); 
+        // Pass default SimulationConfig to runtime constructor
+        let (runtime, _, _, _) = SimulationRuntime::new(SimulationConfig::default());
         let (agg_tx, mut agg_rx) = mpsc::channel::<ChallengeNonce>(10);
         let (node1_challenge_tx, mut node1_challenge_rx) = mpsc::channel(10);
         let (node2_challenge_tx, mut node2_challenge_rx) = mpsc::channel(10);
@@ -107,8 +128,10 @@ mod tests {
         runtime.register_node(node1.clone(), raft_tx.clone(), prop_tx.clone(), node1_challenge_tx);
         runtime.register_node(node2.clone(), raft_tx, prop_tx, node2_challenge_tx);
 
-        // Pass only needed args to Challenger::new
-        let mut challenger = Challenger::new(initial_nodes, runtime.clone(), agg_tx);
+        let challenger_id = create_test_tee_identity(0); // Give challenger an ID
+
+        // Pass identity to Challenger::new
+        let mut challenger = Challenger::new(challenger_id, initial_nodes, runtime.clone(), agg_tx);
 
         challenger.issue_challenges().await;
 

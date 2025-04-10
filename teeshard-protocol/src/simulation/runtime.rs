@@ -5,6 +5,7 @@ use crate::{
     raft::{messages::RaftMessage, state::Command}, // Import Command
     tee_logic::types::{LockProofData, Signature},
     simulation::node::NodeProposalRequest, // Import NodeProposalRequest
+    simulation::config::SimulationConfig, // Import the new SimulationConfig
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,9 @@ pub type SignatureShare = (TEEIdentity, LockProofData, Signature); // Use Signat
 /// Cloning this struct allows multiple components (nodes, coordinator) to interact with the runtime.
 #[derive(Clone, Debug)]
 pub struct SimulationRuntime {
+    // Simulation Configuration
+    config: Arc<SimulationConfig>, // Store the config
+
     // Map Node ID -> Sender channel for RaftMessages
     node_raft_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<(TEEIdentity, RaftMessage)>>>>,
     // NEW: Map Node ID -> Sender channel for Command Proposals
@@ -38,7 +42,7 @@ pub struct SimulationRuntime {
 
 impl SimulationRuntime {
     /// Creates a new simulation runtime and returns it along with receivers.
-    pub fn new() -> (
+    pub fn new(config: SimulationConfig) -> (
         Self, 
         mpsc::Receiver<SignatureShare>, 
         mpsc::Receiver<LivenessAttestation>, 
@@ -50,6 +54,7 @@ impl SimulationRuntime {
         let (isolation_tx, isolation_rx): (mpsc::Sender<Vec<usize>>, mpsc::Receiver<Vec<usize>>) = mpsc::channel(10); 
 
         let runtime = SimulationRuntime {
+            config: Arc::new(config), // Store the config in an Arc
             node_raft_senders: Arc::new(Mutex::new(HashMap::new())),
             node_proposal_senders: Arc::new(Mutex::new(HashMap::new())),
             node_challenge_senders: Arc::new(Mutex::new(HashMap::new())), // Initialize new map
@@ -62,6 +67,11 @@ impl SimulationRuntime {
 
         // Return runtime and Vec<usize> receiver
         (runtime, result_rx, attestation_rx, isolation_rx)
+    }
+
+    /// Returns a clone of the simulation configuration.
+    pub fn get_config(&self) -> Arc<SimulationConfig> {
+        Arc::clone(&self.config)
     }
 
     /// Registers a node's communication channels.

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::Signature;
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
+// Import TeeDelayConfig
+use crate::tee_logic::enclave_sim::TeeDelayConfig;
 
 // Using simple u64 for nonce for now
 pub type Nonce = u64;
@@ -52,6 +54,8 @@ pub struct LivenessConfig {
     pub max_failures: usize,
     // Consider adding challenge window duration
     pub challenge_window: Duration,
+    // Add TEE delay config for verification
+    pub tee_delays: TeeDelayConfig,
 }
 
 // Sensible defaults for configuration
@@ -67,6 +71,8 @@ impl Default for LivenessConfig {
             max_interval: Duration::from_secs(300),
             max_failures: 3,
             challenge_window: Duration::from_secs(5), // Example window
+            // Default to no TEE delay
+            tee_delays: TeeDelayConfig::default(),
         }
     }
 }
@@ -147,6 +153,8 @@ mod tests {
         assert_eq!(state.trust_score, 100.0);
         assert_eq!(state.consecutive_failures, 0);
         assert!(state.last_challenge_time <= Instant::now());
+        // Check default delays were added
+        assert_eq!(config.tee_delays.verify_min_ms, 0);
     }
 
     #[test]

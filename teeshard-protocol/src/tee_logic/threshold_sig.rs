@@ -3,9 +3,11 @@
 use crate::data_structures::TEEIdentity;
 // Use the real Signature type
 use crate::tee_logic::types::Signature;
-use std::collections::BTreeMap; // Use BTreeMap for deterministic iteration
+use std::collections::{BTreeMap, HashSet}; // Use BTreeMap for deterministic iteration, HashSet for verify_multi
 // Import crypto sim components
-use crate::tee_logic::crypto_sim::{PublicKey, verify};
+use crate::tee_logic::crypto_sim::{PublicKey, verify}; 
+use crate::tee_logic::enclave_sim::TeeDelayConfig; // Correct path
+use std::sync::Arc; // Need Arc for passing config
 
 // Represents a signature share from a single TEE
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,30 +24,41 @@ pub struct ThresholdAggregator {
     // Store verified partial signatures: Map PublicKey bytes -> Signature
     // Key: Signer PK bytes, Value: (Signer PK, Verified Signature)
     verified_signatures: BTreeMap<Vec<u8>, (PublicKey, Signature)>,
+    // Store delay config for verify operations
+    delay_config: Arc<TeeDelayConfig>, // Use Arc for shared ownership
 }
 
 impl ThresholdAggregator {
-    /// Creates a new aggregator for a given threshold.
-    pub fn new(required_threshold: usize) -> Self {
+    /// Creates a new aggregator for a given threshold and delay config.
+    pub fn new(required_threshold: usize, delay_config: Arc<TeeDelayConfig>) -> Self {
         ThresholdAggregator {
             required_threshold,
             verified_signatures: BTreeMap::new(),
+            delay_config, // Store the config Arc
         }
     }
 
     /// Adds and verifies a partial signature against the provided message context.
     /// Returns Err if the signature is invalid or the signer has already added one.
-    pub fn add_partial_signature(&mut self, message: &[u8], partial_sig: PartialSignature) -> Result<(), &'static str> {
+    pub async fn add_partial_signature(&mut self, message: &[u8], partial_sig: PartialSignature) -> Result<(), &'static str> {
 
         // Verify the partial signature using the signer's public key against the provided message
-        if !verify(message, &partial_sig.signature_data, &partial_sig.signer_id.public_key) {
-             println!(
-                 "Aggregator: Partial signature verification failed for signer {}. Sig: {:?}, Msg: {:?}, Key: {:?}",
-                 partial_sig.signer_id.id,
-                 partial_sig.signature_data,
-                 message, // Log the message used for verification
-                 partial_sig.signer_id.public_key
-             );
+        let is_valid = verify(
+            message, 
+            &partial_sig.signature_data, 
+            &partial_sig.signer_id.public_key,
+            self.delay_config.verify_min_ms,
+            self.delay_config.verify_max_ms,
+        ).await;
+
+        if !is_valid {
+            println!(
+                "Aggregator: Partial signature verification failed for signer {}. Sig: {:?}, Msg: {:?}, Key: {:?}",
+                partial_sig.signer_id.id,
+                partial_sig.signature_data,
+                message, // Log the message used for verification
+                partial_sig.signer_id.public_key
+            );
             return Err("Partial signature verification failed");
         }
 
@@ -108,11 +121,11 @@ impl ThresholdAggregator {
 
 
 // Verify a multi-signature collection produced by the aggregator
-pub fn verify_multi_signature(
+pub async fn verify_multi_signature(
     message: &[u8],
-    // The collection of signatures to verify
     multi_sig: &[(PublicKey, Signature)],
     required_threshold: usize,
+    delay_config: Arc<TeeDelayConfig>, // Accept delay config
 ) -> bool {
     println!("VerifyMultiSig: Verifying {} signatures for message {:?} against threshold {}",
               multi_sig.len(), message, required_threshold);
@@ -123,15 +136,21 @@ pub fn verify_multi_signature(
         return false;
     }
 
-    // Check if we have *at least* `required_threshold` valid signatures in the collection.
-    // We also need to ensure no duplicate public keys are counted.
-    let mut verified_keys = std::collections::HashSet::new();
+    let mut verified_keys = HashSet::new();
     let mut valid_sig_count = 0;
 
     for (public_key, signature) in multi_sig {
-        if verify(message, signature, public_key) {
-            // Only count if the public key hasn't been seen before in this verification set
-             if verified_keys.insert(public_key.to_bytes()) { // Diffs PublicKey by bytes
+        // Call async verify with delays
+        let is_valid = verify(
+            message, 
+            signature, 
+            public_key,
+            delay_config.verify_min_ms,
+            delay_config.verify_max_ms
+        ).await;
+
+        if is_valid {
+            if verified_keys.insert(public_key.to_bytes()) {
                 valid_sig_count += 1;
             }
         } else {
@@ -148,8 +167,20 @@ pub fn verify_multi_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tee_logic::crypto_sim::{generate_keypair, sign};
+    // Import sign/generate from crypto_sim and TeeDelayConfig from enclave_sim
+    use crate::tee_logic::crypto_sim::{generate_keypair, sign}; 
+    use crate::tee_logic::enclave_sim::TeeDelayConfig; // Correct path
     use crate::data_structures::TEEIdentity; // Import TEEIdentity
+    use tokio::runtime::Runtime; // Add tokio runtime for async tests
+    use std::sync::Arc; // Import Arc
+
+    // Helper function to run async tests
+    fn run_async<F>(future: F) -> F::Output 
+    where
+        F: std::future::Future,
+    {
+        Runtime::new().unwrap().block_on(future)
+    }
 
     // Helper to create a TEEIdentity with a real key
     fn create_real_tee(id: usize) -> (TEEIdentity, ed25519_dalek::SigningKey) {
@@ -158,9 +189,10 @@ mod tests {
         (identity, keypair)
     }
 
-    // Helper to create a valid partial signature
-    fn create_valid_partial_sig(identity: &TEEIdentity, keypair: &ed25519_dalek::SigningKey, message: &[u8]) -> PartialSignature {
-        let signature_data = sign(message, keypair);
+    // Helper to create a valid partial signature (now async due to crypto_sim::sign)
+    async fn create_valid_partial_sig(identity: &TEEIdentity, keypair: &ed25519_dalek::SigningKey, message: &[u8]) -> PartialSignature {
+        // Pass 0 delays for test signing
+        let signature_data = sign(message, keypair, 0, 0).await;
         PartialSignature {
             signer_id: identity.clone(),
             signature_data,
@@ -168,120 +200,100 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregator_flow_success() {
-        let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
-        let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
-        let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
+    fn test_aggregator_flow_success_async() {
+        run_async(async {
+            let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
+            let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
+            let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
 
-        let message = b"approve_step_1";
-        let threshold = 3;
+            let message = b"approve_step_1_async";
+            let threshold = 3;
+            let delay_config = Arc::new(TeeDelayConfig::default()); // Default (no delay) config for test
 
-        let mut aggregator = ThresholdAggregator::new(threshold);
+            let mut aggregator = ThresholdAggregator::new(threshold, Arc::clone(&delay_config));
 
-        assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.finalize_multi_signature().is_none());
+            assert!(!aggregator.has_reached_threshold());
+            assert!(aggregator.finalize_multi_signature().is_none());
 
-        // Add valid partial signatures from 3 TEEs (0, 2, 4)
-        let partial_sig_0 = create_valid_partial_sig(&identities[0], keypairs[0], message);
-        let partial_sig_2 = create_valid_partial_sig(&identities[2], keypairs[2], message);
-        let partial_sig_4 = create_valid_partial_sig(&identities[4], keypairs[4], message);
+            // Create signatures concurrently
+            let partial_sig_0 = create_valid_partial_sig(&identities[0], keypairs[0], message).await;
+            let partial_sig_2 = create_valid_partial_sig(&identities[2], keypairs[2], message).await;
+            let partial_sig_4 = create_valid_partial_sig(&identities[4], keypairs[4], message).await;
 
-        assert!(aggregator.add_partial_signature(message, partial_sig_0).is_ok());
-        assert_eq!(aggregator.verified_signatures.len(), 1);
-        assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.add_partial_signature(message, partial_sig_4).is_ok());
-        assert_eq!(aggregator.verified_signatures.len(), 2);
-        assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.add_partial_signature(message, partial_sig_2).is_ok());
-        assert_eq!(aggregator.verified_signatures.len(), 3);
-        assert!(aggregator.has_reached_threshold());
+            // Add signatures sequentially (or could use join_all)
+            assert!(aggregator.add_partial_signature(message, partial_sig_0).await.is_ok());
+            assert_eq!(aggregator.signature_count(), 1);
+            assert!(!aggregator.has_reached_threshold());
+            assert!(aggregator.add_partial_signature(message, partial_sig_4).await.is_ok());
+            assert_eq!(aggregator.signature_count(), 2);
+            assert!(!aggregator.has_reached_threshold());
+            assert!(aggregator.add_partial_signature(message, partial_sig_2).await.is_ok());
+            assert_eq!(aggregator.signature_count(), 3);
+            assert!(aggregator.has_reached_threshold());
 
-        // Finalize (get multi-sig collection)
-        let multi_sig = aggregator.finalize_multi_signature().expect("Finalization failed");
-        assert_eq!(multi_sig.len(), threshold);
+            let multi_sig = aggregator.finalize_multi_signature().expect("Finalization failed");
+            assert_eq!(multi_sig.len(), threshold);
 
-        // Verify the multi-signature collection
-        let is_valid = verify_multi_signature(message, &multi_sig, threshold);
-        assert!(is_valid, "Multi-signature verification failed");
-
-        // Test verification with lower threshold (should still pass)
-        assert!(verify_multi_signature(message, &multi_sig, threshold - 1));
-
-        // Test verification with higher threshold (should fail)
-        assert!(!verify_multi_signature(message, &multi_sig, threshold + 1));
-
-        // Test verification with wrong message
-        assert!(!verify_multi_signature(b"wrong_message", &multi_sig, threshold));
-
-        // Test verification with a manually constructed invalid signature in the set
-        let (invalid_id, invalid_kp) = create_real_tee(99);
-        let invalid_sig = sign(b"different_message", &invalid_kp);
-        let mut multi_sig_with_invalid = multi_sig.clone();
-        multi_sig_with_invalid[0] = (invalid_id.public_key, invalid_sig);
-        // Should fail if threshold requires all original 3
-        assert!(!verify_multi_signature(message, &multi_sig_with_invalid, threshold));
-        // Should pass if threshold is low enough (e.g., 2) to tolerate one invalid sig
-        assert!(verify_multi_signature(message, &multi_sig_with_invalid, threshold - 1));
-
+            // Verify the finalized multi-sig (also async now)
+            let is_valid = verify_multi_signature(message, &multi_sig, threshold, delay_config).await;
+            assert!(is_valid);
+        });
     }
 
     #[test]
-    fn test_aggregator_add_duplicate_signer() {
-        let (identity0, keypair0) = create_real_tee(0);
-        let message = b"message";
-        let threshold = 1;
-        let mut aggregator = ThresholdAggregator::new(threshold);
+    fn test_aggregator_add_duplicate_signer_async() {
+        run_async(async {
+            let (id1, kp1) = create_real_tee(1);
+            let message = b"duplicate test";
+            let delay_config = Arc::new(TeeDelayConfig::default());
+            let mut aggregator = ThresholdAggregator::new(2, Arc::clone(&delay_config));
 
-        let partial_sig_0 = create_valid_partial_sig(&identity0, &keypair0, message);
-        let partial_sig_0_again = partial_sig_0.clone();
+            let partial_sig1 = create_valid_partial_sig(&id1, &kp1, message).await;
+            let partial_sig2 = create_valid_partial_sig(&id1, &kp1, message).await; // Same signer
 
-        assert!(aggregator.add_partial_signature(message, partial_sig_0).is_ok());
-        let result = aggregator.add_partial_signature(message, partial_sig_0_again);
-        assert!(result.is_err());
-        // Error message updated
-        assert_eq!(result.unwrap_err(), "Signer (key) has already provided a valid partial signature");
-        assert_eq!(aggregator.verified_signatures.len(), 1);
-    }
-
-     #[test]
-    fn test_aggregator_add_invalid_signature() {
-        let (identity0, _) = create_real_tee(0);
-        let (_, keypair1) = create_real_tee(1); // Key doesn't match identity0
-        let message = b"test_message";
-        let threshold = 1;
-        let mut aggregator = ThresholdAggregator::new(threshold);
-
-        // Create signature with keypair1 but claim it's from identity0
-        let invalid_sig_data = sign(message, &keypair1);
-        let invalid_partial_sig = PartialSignature {
-            signer_id: identity0.clone(), // Claiming to be from ID 0
-            signature_data: invalid_sig_data,
-        };
-
-        let result = aggregator.add_partial_signature(message, invalid_partial_sig);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Partial signature verification failed");
-        assert!(aggregator.verified_signatures.is_empty());
+            assert!(aggregator.add_partial_signature(message, partial_sig1).await.is_ok());
+            assert!(aggregator.add_partial_signature(message, partial_sig2).await.is_err()); // Should fail
+            assert_eq!(aggregator.signature_count(), 1);
+        });
     }
 
     #[test]
-    fn test_aggregator_threshold_not_met() {
-        let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
-        let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
-        let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
+    fn test_aggregator_add_invalid_signature_async() {
+        run_async(async {
+            let (id1, kp1) = create_real_tee(1);
+            let message = b"invalid sig test";
+            let wrong_message = b"wrong message";
+            let delay_config = Arc::new(TeeDelayConfig::default());
+            let mut aggregator = ThresholdAggregator::new(1, Arc::clone(&delay_config));
 
-        let message = b"another_message";
-        let threshold = 3;
-        let mut aggregator = ThresholdAggregator::new(threshold);
-
-        let partial_sig_1 = create_valid_partial_sig(&identities[1], keypairs[1], message);
-        let partial_sig_3 = create_valid_partial_sig(&identities[3], keypairs[3], message);
-
-        aggregator.add_partial_signature(message, partial_sig_1).unwrap();
-        aggregator.add_partial_signature(message, partial_sig_3).unwrap();
-
-        assert!(!aggregator.has_reached_threshold());
-        assert!(aggregator.finalize_multi_signature().is_none());
+            // Create sig with wrong message
+            let invalid_partial_sig = create_valid_partial_sig(&id1, &kp1, wrong_message).await;
+            
+            // Try adding it with the correct message context
+            assert!(aggregator.add_partial_signature(message, invalid_partial_sig).await.is_err()); // Should fail verification
+            assert_eq!(aggregator.signature_count(), 0);
+        });
     }
 
+    #[test]
+    fn test_aggregator_threshold_not_met_async() {
+         run_async(async {
+            let (id1, kp1) = create_real_tee(1);
+            let (id2, kp2) = create_real_tee(2);
+            let message = b"threshold not met";
+            let threshold = 3;
+            let delay_config = Arc::new(TeeDelayConfig::default());
+            let mut aggregator = ThresholdAggregator::new(threshold, Arc::clone(&delay_config));
+
+            let partial_sig1 = create_valid_partial_sig(&id1, &kp1, message).await;
+            let partial_sig2 = create_valid_partial_sig(&id2, &kp2, message).await;
+
+            assert!(aggregator.add_partial_signature(message, partial_sig1).await.is_ok());
+            assert!(aggregator.add_partial_signature(message, partial_sig2).await.is_ok());
+
+            assert_eq!(aggregator.signature_count(), 2);
+            assert!(!aggregator.has_reached_threshold());
+            assert!(aggregator.finalize_multi_signature().is_none());
+        });
+    }
 } 

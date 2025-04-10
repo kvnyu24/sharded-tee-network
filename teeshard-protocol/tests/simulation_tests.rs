@@ -10,6 +10,7 @@ use teeshard_protocol::{
         node::SimulatedTeeNode,
         runtime::SignatureShare,
         node::{NodeQueryRequest, NodeQueryResponse, NodeQuery},
+        config::SimulationConfig,
     },
     tee_logic::{crypto_sim::{SecretKey, verify}, types::LockProofData},
 };
@@ -33,7 +34,7 @@ fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
 #[tokio::test]
 async fn test_simulation_runtime_and_node_startup() {
     println!("--- Starting Simulation Runtime Test ---");
-    let (runtime, _result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(); // Capture all 4, ignore 3
+    let (runtime, _result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(SimulationConfig::default()); // Capture all 4, ignore 3
     let config = SystemConfig::default();
     let num_nodes = 3;
     let mut node_handles = Vec::new();
@@ -98,7 +99,7 @@ async fn test_raft_state_machine_command_processing() {
     println!("--- Starting State Machine Command Processing Test ---");
 
     // 1. Setup Simulation Environment
-    let (runtime, mut result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(); // Capture all 4, ignore 2
+    let (runtime, mut result_rx, _attestation_rx, _isolation_rx) = SimulationRuntime::new(SimulationConfig::default()); // Capture all 4, ignore 2
     let config = SystemConfig::default();
     let num_nodes = 3;
     let mut node_handles = Vec::new();
@@ -293,8 +294,11 @@ async fn test_raft_state_machine_command_processing() {
         assert_eq!(received_lock_data, &lock_proof_data, "Share contained incorrect lock data");
 
         // Verify signature
-        let data_to_verify = bincode::encode_to_vec(received_lock_data, standard()).expect("Serialization failed for verification");
-        assert!(verify(&data_to_verify, signature, &signer_identity.public_key),
+        let data_to_verify = bincode::encode_to_vec(&lock_proof_data, standard()).unwrap();
+
+        // Verify the signature using the async verify function and await it
+        // Add missing delay arguments (0, 0 for test)
+        assert!(verify(&data_to_verify, signature, &signer_identity.public_key, 0, 0).await,
                 "Invalid signature in share from Node {}", signer_identity.id);
         signer_ids.insert(signer_identity.id);
     }

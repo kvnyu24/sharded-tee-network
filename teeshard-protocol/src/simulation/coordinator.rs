@@ -26,6 +26,8 @@ use std::{
 use tokio::sync::{oneshot, Mutex as TokioMutex}; // mpsc was duplicate
 use ed25519_dalek::SigningKey; // For test key generation
 use ethers::types::U256;
+use crate::simulation::config::SimulationConfig; // Import SimulationConfig
+use crate::tee_logic::crypto_sim::sign; // Add missing import for sign
 
 // --- Command Enum ---
 #[derive(Debug)]
@@ -126,7 +128,12 @@ impl SimulatedCoordinator {
             }
         };
 
-        if !verify(&message_bytes, &signature, &signer_id.public_key) {
+        // Get delays from config (stored in self.config, which is SystemConfig)
+        let verify_min_ms = self.config.tee_delays.verify_min_ms;
+        let verify_max_ms = self.config.tee_delays.verify_max_ms;
+
+        // Pass delays to verify call
+        if !verify(&message_bytes, &signature, &signer_id.public_key, verify_min_ms, verify_max_ms).await {
              eprintln!(
                  "[Coordinator {}] Invalid signature share received for tx {} from Node {}. Discarding.",
                  self.identity.id, tx_id, signer_id.id
@@ -141,10 +148,14 @@ impl SimulatedCoordinator {
 
         // Retrieve or create the aggregator specific to this tx_id
         let aggregator = shares_map.entry(tx_id.clone()) // Use entry API
-            .or_insert_with(|| ThresholdAggregator::new(self.config.coordinator_threshold));
+            // Get delay config from runtime
+            .or_insert_with(|| {
+                let delay_config = Arc::new(self.runtime.get_config().tee_delays.clone());
+                ThresholdAggregator::new(self.config.coordinator_threshold, delay_config)
+            });
 
-        // Add the share
-        if let Err(e) = aggregator.add_partial_signature(&message_bytes, partial_sig) {
+        // Add the share (now async)
+        if let Err(e) = aggregator.add_partial_signature(&message_bytes, partial_sig).await {
             eprintln!(
                 "[Coordinator {}] Failed to add share for tx {} from Node {}: {}. Discarding.",
                 self.identity.id, tx_id, signer_id.id, e
@@ -166,7 +177,8 @@ impl SimulatedCoordinator {
 
         // Check if threshold is met
         let threshold_met = aggregator.has_reached_threshold();
-        let finalized_sig_opt = if threshold_met {
+        // Need to store the finalized sig outside the mutex scope if threshold is met
+        let finalized_sig_collection_opt = if threshold_met {
             println!(
                 "[Coordinator {}] Threshold reached for tx {}. Finalizing multi-signature...",
                 self.identity.id,
@@ -183,7 +195,8 @@ impl SimulatedCoordinator {
         drop(shares_map);
 
         // If threshold was met and finalization succeeded, proceed to submit release
-        if let Some(multi_sig_collection) = finalized_sig_opt {
+        // Use the variable stored outside the lock scope
+        if let Some(multi_sig_collection) = finalized_sig_collection_opt {
             println!(
                 "[Coordinator {}] Multi-signature collection finalized for tx {}. Submitting release...",
                 self.identity.id,
@@ -288,6 +301,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex; // Keep alias for clarity
     use ethers::types::U256;
+    use crate::simulation::config::SimulationConfig; // Import SimulationConfig
 
     // Helper to create TEE Identity and SecretKey for tests
     fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -325,7 +339,8 @@ mod tests {
         
         let mock_relayer = Arc::new(MockBlockchainInterface::new());
         // Use the non-mock SimulationRuntime here, as the coordinator interacts with its handle
-        let (runtime, _result_rx, _, _) = SimulationRuntime::new(); 
+        // Pass SimulationConfig::default() to the constructor
+        let (runtime, _result_rx, _, _) = SimulationRuntime::new(SimulationConfig::default()); 
         let partition_mapping = PartitionMapping::new(); // Not needed for this specific test focus
 
         // No receiver needed for this test, as we call process_signature_share directly
@@ -349,12 +364,12 @@ mod tests {
         };
         let message_bytes = bincode::encode_to_vec(&lock_data, standard()).unwrap();
 
-        // Create valid shares
-        let sig1 = sign(&message_bytes, &tee1_sk);
-        let share1: SignatureShare = (tee1_id.clone(), lock_data.clone(), sig1.clone()); // Clone sig1
+        // Create valid shares (using async sign now)
+        let sig1 = sign(&message_bytes, &tee1_sk, 0, 0).await;
+        let share1: SignatureShare = (tee1_id.clone(), lock_data.clone(), sig1.clone());
         
-        let sig2 = sign(&message_bytes, &tee2_sk);
-        let share2: SignatureShare = (tee2_id.clone(), lock_data.clone(), sig2.clone()); // Clone sig2
+        let sig2 = sign(&message_bytes, &tee2_sk, 0, 0).await;
+        let share2: SignatureShare = (tee2_id.clone(), lock_data.clone(), sig2.clone());
         
         // Action & Verification
         // Initialize aggregator by processing first share
@@ -400,21 +415,9 @@ mod tests {
         assert_eq!(sig_bytes, expected_sig_bytes, "Aggregated signature bytes mismatch");
     }
 
-    #[tokio::test]
-    async fn test_coordinator_initiates_swap_and_collects_shares() {
-        // Setup: Coordinators, Network, Blockchain
-        let num_coordinators = 3;
-        let threshold = 2;
-        let config = create_test_config(num_coordinators, threshold);
-        let mock_network = Arc::new(MockNetwork::new());
-        let mock_blockchain = Arc::new(MockBlockchainInterface::new()); // Call ::new()
-
-        // Use the actual runtime for node interaction simulation if needed, 
-        // or stick with MockNetwork if only testing coordinator logic.
-        // Let's assume MockNetwork is sufficient for this specific unit test.
-        let (runtime, _result_rx, _att_rx, _iso_rx) = SimulationRuntime::new(); // Fix destructuring
-
-        let mut coordinators: HashMap<TEEIdentity, Arc<TokioMutex<SimulatedCoordinator>>> = HashMap::new();
-        let mut coordinator_keys: Vec<SecretKey> = Vec::new();
-    }
+    // This test was incomplete - removing for now as it doesn't test the coordinator logic yet.
+    // #[tokio::test]
+    // async fn test_coordinator_initiates_swap_and_collects_shares() {
+    //     // ... setup ...
+    // }
 }

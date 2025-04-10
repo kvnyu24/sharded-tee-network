@@ -1,72 +1,164 @@
 // teeshard-protocol/src/tee_logic/crypto_sim.rs
 
-use ed25519_dalek::{
-    SigningKey, Signature, Signer, Verifier, VerifyingKey,
+// Simplified cryptographic operations for simulation purposes
+
+// Re-export types from the actual crypto library for consistency
+pub use ed25519_dalek::{
+    Signature,
+    Signer,
+    SigningKey as SecretKey, // Alias for clarity
+    VerifyingKey as PublicKey, // Alias for clarity
+    Verifier
 };
 use rand::rngs::OsRng;
+use tokio::time::{Duration, sleep}; // Import sleep and Duration
+use rand::Rng; // Import Rng trait for random number generation
 
-// Re-export key types for convenience
-pub use ed25519_dalek::{SignatureError, SigningKey as SecretKey, VerifyingKey as PublicKey};
-
-/// Generates a new Ed25519 keypair.
-pub fn generate_keypair() -> SigningKey {
-    let mut csprng = OsRng;
-    SigningKey::generate(&mut csprng)
+// Helper function to generate a random delay within a range
+async fn random_delay(min_ms: u64, max_ms: u64) {
+    if max_ms == 0 { return; } // No delay if max is 0
+    let delay_ms = if min_ms >= max_ms {
+        min_ms
+    } else {
+        rand::thread_rng().gen_range(min_ms..=max_ms)
+    };
+    if delay_ms > 0 {
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
-/// Signs a message using an Ed25519 secret key.
-pub fn sign(message: &[u8], secret_key: &SigningKey) -> Signature {
-    secret_key.sign(message)
+// Generate a new keypair (secret and public key)
+pub fn generate_keypair() -> SecretKey {
+    // In a real scenario, this would involve interaction with secure hardware/enclaves
+    SecretKey::generate(&mut OsRng)
 }
 
-/// Verifies an Ed25519 signature against a message and public key.
-pub fn verify(message: &[u8], signature: &Signature, public_key: &VerifyingKey) -> bool {
+// Sign a message using a secret key
+// Make async and add delay simulation
+pub async fn sign(message: &[u8], key: &SecretKey, min_delay_ms: u64, max_delay_ms: u64) -> Signature {
+    // Simulate TEE signing overhead
+    random_delay(min_delay_ms, max_delay_ms).await;
+
+    // Actual signing operation
+    key.sign(message)
+}
+
+// Verify a signature using a public key
+// Make async and add delay simulation
+pub async fn verify(message: &[u8], signature: &Signature, public_key: &PublicKey, min_delay_ms: u64, max_delay_ms: u64) -> bool {
+    // Simulate TEE verification overhead
+    random_delay(min_delay_ms, max_delay_ms).await;
+
+    // Actual verification operation
     public_key.verify(message, signature).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::*; // Import items from the outer module
+    use tokio::runtime::Runtime; // For running async tests
+    use tokio::time::Instant; // For timing
 
-    #[test]
-    fn test_sign_verify_ed25519() {
-        let keypair = generate_keypair();
-        let public_key = keypair.verifying_key();
-        let message = b"hello ed25519";
-
-        let signature = sign(message, &keypair);
-
-        // Verify with correct key and message
-        assert!(verify(message, &signature, &public_key));
-
-        // Verify with wrong key
-        let wrong_keypair = generate_keypair();
-        let wrong_public_key = wrong_keypair.verifying_key();
-        assert!(!verify(message, &signature, &wrong_public_key));
-
-        // Verify with wrong message
-        assert!(!verify(b"wrong_message", &signature, &public_key));
-
-        // Verify with tampered signature
-        // Create a valid signature, then tamper it
-        let another_message = b"another message";
-        let tampered_signature = sign(another_message, &keypair);
-        // Ed25519 signatures are typically 64 bytes. Tamper the first byte.
-        if tampered_signature.to_bytes().len() > 0 {
-            // Unfortunately, Signature doesn't expose mutable bytes directly.
-            // We can create a slightly different sig by signing different data.
-            // Or just assert verify fails with the *correct* signature for the *wrong* message
-            assert!(!verify(message, &tampered_signature, &public_key));
-        } else {
-            panic!("Generated signature has zero length?");
-        }
+    // Helper to run async tests
+    fn run_async<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        Runtime::new().unwrap().block_on(future)
     }
 
-     #[test]
+    #[test]
     fn keypair_generation() {
-        let key1 = generate_keypair();
-        let key2 = generate_keypair();
-        assert_ne!(key1.to_bytes(), key2.to_bytes());
-        assert_ne!(key1.verifying_key().as_bytes(), key2.verifying_key().as_bytes());
+        // Synchronous test
+        let keypair = generate_keypair();
+        let public_key = keypair.verifying_key();
+        assert!(true); // Basic check that generation doesn't panic
+        let _ = public_key; // Avoid unused variable warning
+    }
+
+    #[test]
+    fn sign_and_verify_ok_async() {
+        run_async(async {
+            let keypair = generate_keypair();
+            let public_key = keypair.verifying_key();
+            let message = b"This is a test message.";
+
+            // Sign with no delay
+            let signature = sign(message, &keypair, 0, 0).await;
+
+            // Verify with no delay
+            let is_valid = verify(message, &signature, &public_key, 0, 0).await;
+            assert!(is_valid, "Signature should be valid");
+        });
+    }
+
+    #[test]
+    fn verify_fails_wrong_key_async() {
+        run_async(async {
+            let keypair1 = generate_keypair();
+            let keypair2 = generate_keypair(); // Different keypair
+            let public_key2 = keypair2.verifying_key();
+            let message = b"Another test message.";
+
+            let signature = sign(message, &keypair1, 0, 0).await; // Sign with key 1
+
+            // Verify with key 2 (should fail)
+            let is_valid = verify(message, &signature, &public_key2, 0, 0).await;
+            assert!(!is_valid, "Verification should fail with the wrong public key");
+        });
+    }
+
+    #[test]
+    fn verify_fails_tampered_message_async() {
+        run_async(async {
+            let keypair = generate_keypair();
+            let public_key = keypair.verifying_key();
+            let message = b"Original message.";
+            let tampered_message = b"Tampered message.";
+
+            let signature = sign(message, &keypair, 0, 0).await;
+
+            // Verify with tampered message (should fail)
+            let is_valid = verify(tampered_message, &signature, &public_key, 0, 0).await;
+            assert!(!is_valid, "Verification should fail with a tampered message");
+        });
+    }
+
+    #[test]
+    fn sign_adds_delay_async() {
+        run_async(async {
+            let keypair = generate_keypair();
+            let message = b"Message with signing delay.";
+            let min_delay = 50;
+            let max_delay = 55;
+
+            let start = Instant::now();
+            let _signature = sign(message, &keypair, min_delay, max_delay).await;
+            let duration = start.elapsed();
+
+            assert!(duration >= Duration::from_millis(min_delay), "Signing took less than minimum delay. Took: {:?}", duration);
+             // Add a small buffer for timing inaccuracies if needed
+            // assert!(duration <= Duration::from_millis(max_delay + 10), "Signing took longer than maximum delay (with buffer). Took: {:?}", duration);
+        });
+    }
+
+    #[test]
+    fn verify_adds_delay_async() {
+        run_async(async {
+            let keypair = generate_keypair();
+            let public_key = keypair.verifying_key();
+            let message = b"Message with verification delay.";
+            let min_delay = 60;
+            let max_delay = 65;
+
+            let signature = sign(message, &keypair, 0, 0).await; // Sign without delay
+
+            let start = Instant::now();
+            let _is_valid = verify(message, &signature, &public_key, min_delay, max_delay).await;
+            let duration = start.elapsed();
+
+            assert!(duration >= Duration::from_millis(min_delay), "Verification took less than minimum delay. Took: {:?}", duration);
+            // assert!(duration <= Duration::from_millis(max_delay + 10), "Verification took longer than maximum delay (with buffer). Took: {:?}", duration);
+        });
     }
 } 

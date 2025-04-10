@@ -9,11 +9,14 @@ use crate::data_structures::TEEIdentity;
 use crate::config::SystemConfig;
 use crate::raft::storage::RaftStorage; // Add InMemoryStorage for test
 use crate::tee_logic::enclave_sim::EnclaveSim;
+use crate::tee_logic::enclave_sim::TeeDelayConfig;
  // Import key generation
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use rand::Rng;
 use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 // Represents a Raft node participating in consensus within a shard
 // #[derive(Debug)] // Cannot derive because of Box<dyn RaftStorage>
@@ -600,7 +603,10 @@ mod tests {
     fn create_identity(id: u64) -> TEEIdentity {
         let keypair = generate_keypair();
         // Use the helper that generates a key internally, or pass None explicitly
-        let enclave = EnclaveSim::new_with_generated_key(id as usize);
+        let enclave = EnclaveSim::new_with_generated_key(
+            id as usize,
+            Arc::new(TeeDelayConfig::default())
+        );
         TEEIdentity {
             id: id as usize,
             public_key: enclave.identity.public_key.clone(),
@@ -679,7 +685,11 @@ mod tests {
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
             // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(id.id, None);
+            let enclave = EnclaveSim::new(
+                id.id,
+                None,
+                Arc::new(TeeDelayConfig::default())
+            );
             // Pass the enclave to the RaftNode constructor
             let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
@@ -816,7 +826,11 @@ mod tests {
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
             // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(id.id, None);
+            let enclave = EnclaveSim::new(
+                id.id,
+                None,
+                Arc::new(TeeDelayConfig::default())
+            );
             // Pass the enclave to the RaftNode constructor
             let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
@@ -1036,7 +1050,11 @@ mod tests {
         let node_id = create_identity(1); // Use helper from the same test module
         let peers = Vec::new(); // No peers for this simple test
         let storage = Box::new(InMemoryStorage::new());
-        let enclave = EnclaveSim::new(node_id.id, None); 
+        let enclave = EnclaveSim::new(
+            node_id.id,
+            None,
+            Arc::new(TeeDelayConfig::default())
+        ); 
         let mut node = RaftNode::new(node_id.clone(), peers, config, storage.clone(), enclave); 
 
         node.state.role = RaftRole::Leader; // Force leader state
