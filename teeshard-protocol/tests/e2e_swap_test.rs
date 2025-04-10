@@ -317,62 +317,6 @@ async fn fund_account(rpc_url: &str, recipient: Address, amount: U256) -> Result
     Ok(())
 }
 
-// Helper function to replicate TEEescrow._hashTEEDecisionMessage for RELEASE
-// Returns the raw payload bytes (before EIP-191 prefix)
-fn get_release_message_payload(
-    swap_id: &[u8; 32],
-    escrow_addr: Address,
-    chain_id: u64,
-    token_addr: Address,
-    amount: U256,
-    recipient_addr: Address,
-) -> Result<Vec<u8>, String> {
-    let prefix = b"RELEASE:";
-    let sender_addr = Address::zero(); // Sender is address(0) for RELEASE hash
-
-    let encoded = encode_packed(&[
-        Token::Bytes(prefix.to_vec()),
-        Token::FixedBytes(swap_id.to_vec()),
-        Token::Address(escrow_addr),
-        Token::Uint(U256::from(chain_id)),
-        Token::Address(token_addr),
-        Token::Uint(amount),
-        Token::Address(recipient_addr),
-        Token::Address(sender_addr),
-    ])
-    .map_err(|e| format!("ABI encode_packed failed: {}", e))?;
-    
-    // Return the raw encoded bytes, not the hash yet
-    println!("[ECDSA HELPER] Raw Payload Bytes (Rust): 0x{}", hex::encode(&encoded));
-    Ok(encoded)
-
-    // --- Old logic that returned final hash ---
-    // let payload_hash = keccak256(&encoded);
-    // println!("[ECDSA HELPER] Raw Hash Payload (Rust): 0x{}", hex::encode(payload_hash));
-    // // Apply EIP-191 prefix
-    // let prefix_bytes = b"\x19Ethereum Signed Message:\n32";
-    // let prefixed_encoded = encode_packed(&[
-    //     Token::Bytes(prefix_bytes.to_vec()),
-    //     Token::FixedBytes(payload_hash.to_vec()),
-    // ])
-    // .map_err(|e| format!("ABI encode_packed (prefix) failed: {}", e))?;
-    // let final_hash = keccak256(prefixed_encoded);
-    // println!("[ECDSA HELPER] Prefixed Hash (Rust):    0x{}", hex::encode(final_hash));
-    // Ok(final_hash)
-}
-
-// Helper function to sign a message payload with a private key (ECDSA)
-// Uses sign_message which applies EIP-191 prefix internally
-// Make it async again
-async fn sign_message_ecdsa(payload_bytes: &[u8], pk_hex: &str) -> Result<ethers::types::Signature, String> {
-    let wallet = LocalWallet::from_str(pk_hex)
-        .map_err(|e| format!("Invalid committee PK: {}", e))?;
-    // Use sign_message - it expects the raw message bytes
-    // Await the async call
-    wallet.sign_message(payload_bytes).await
-        .map_err(|e| format!("Failed to sign message: {}", e))
-}
-
 // --- Main E2E Test ---\n
 
 #[tokio::test]
@@ -465,7 +409,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("[Setup] CrossChainCoordinator created (Threshold=1).");
 
     // 4. Execution: Define Swap Transaction
-    let swap_seed = format!("e2e-swap-{}", rand::thread_rng().gen::<u32>());
+    let swap_seed = format!("e2e-swap-{}-{}", chain_a_id, chain_b_id); // Make seed chain-specific if running parallel tests
     // Generate bytes32 swap ID deterministically for contract calls
     let swap_id_bytes = generate_swap_id_bytes32(&swap_seed);
     let swap_id_hex = format!("0x{}", hex::encode(swap_id_bytes)); // For contract calls
@@ -478,11 +422,11 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     let release_amount = U256::from(amount_base) * scale;
 
     let _token_a_addr = Address::from_str(&contracts.token_a_addr).map_err(|_| "Invalid Token A address".to_string())?;
-    let token_b_addr = Address::from_str(&contracts.token_b_addr).map_err(|_| "Invalid Token B address".to_string())?;
+    let _token_b_addr = Address::from_str(&contracts.token_b_addr).map_err(|_| "Invalid Token B address".to_string())?;
     let _escrow_a_addr = Address::from_str(&contracts.escrow_a_addr).map_err(|_| "Invalid Escrow A address".to_string())?;
-    let escrow_b_addr = Address::from_str(&contracts.escrow_b_addr).map_err(|_| "Invalid Escrow B address".to_string())?;
+    let _escrow_b_addr = Address::from_str(&contracts.escrow_b_addr).map_err(|_| "Invalid Escrow B address".to_string())?;
     let _user_a_addr = Address::from_str(USER_A_ADDR).map_err(|_| "Invalid User A address".to_string())?;
-    let user_b_addr = Address::from_str(USER_B_ADDR).map_err(|_| "Invalid User B address".to_string())?;
+    let _user_b_addr = Address::from_str(USER_B_ADDR).map_err(|_| "Invalid User B address".to_string())?;
 
     let swap_tx = Transaction {
         tx_id: swap_id_str.clone(),
@@ -491,7 +435,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
             AccountId { chain_id: chain_a_id, address: USER_A_ADDR.to_string() }, 
             AccountId { chain_id: chain_b_id, address: USER_B_ADDR.to_string() }, 
         ],
-        amounts: vec![50u64], // Use raw amount 50 here
+        amounts: vec![amount_base], // Use raw amount here
         required_locks: vec![LockInfo {
             account: AccountId { chain_id: chain_a_id, address: USER_A_ADDR.to_string() }, 
             asset: AssetId { 
@@ -499,7 +443,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
                 token_symbol: "TKA".to_string(), 
                 token_address: contracts.token_a_addr.clone(), 
             },
-            amount: 50u64, // Use raw amount 50 here
+            amount: amount_base, // Use raw amount here
         }],
         target_asset: Some(AssetId { 
             chain_id: chain_b_id, 
@@ -549,10 +493,10 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
         signer_identity: mock_shard_tee_identity, 
         attestation_or_sig: proof_signature, // This is now correctly type Signature
     };
-     println!("[Exec] Created valid mock LockProof for shard 0.");
+     println!("[Exec] Created valid mock LockProof for shard {}.", chain_a_id);
 
-    // 7. Execution: Process the proof & Get Coordinator Decision (but don't rely on its blockchain submission)
-    println!("[Exec] Calling coordinator.process_proof_and_finalize to get decision...");
+    // 7. Execution: Process the proof and trigger Coordinator's internal finalization
+    println!("[Exec] Calling coordinator.process_proof_and_finalize (will trigger internal submission)...");
     // Ensure the swap exists before processing
     assert!(coordinator.active_swaps.contains_key(&swap_id_str), "Swap should exist before processing proof");
 
@@ -563,80 +507,33 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("[Verify] User B balance before release: {}", balance_b_before);
 
     // Await the async call and handle the Result/Option
+    // This call will now internally trigger the evm_relayer.submit_release
     let finalization_result = coordinator.process_proof_and_finalize(lock_proof).await;
 
-    // --- Check Coordinator Decision & Manually Submit with ECDSA Sigs ---
+    // --- Check Coordinator Decision ---
     match finalization_result {
         Ok(Some(decision)) => {
             assert!(decision.commit, "Coordinator finalization decision should be COMMIT");
             println!(
-                "[Exec] Coordinator decided COMMIT for swap {}. Now manually submitting with ECDSA sigs...", 
+                "[Exec] Coordinator decided COMMIT for swap {}. Submission was triggered internally.", 
                 swap_id_str
             );
-            
-            // Manually generate ECDSA signatures for the release
-            println!("[Exec] Generating ECDSA signatures for TEEescrow release...");
-            
-            // Get the raw message payload bytes (before EIP-191 prefix)
-            let message_payload_bytes = get_release_message_payload(
-                &swap_id_bytes, 
-                escrow_b_addr, 
-                chain_b_id, 
-                token_b_addr, 
-                release_amount, // Use U256 amount with decimals
-                user_b_addr
-            )?;
-            
-            // Sign the raw payload bytes using sign_message (await needed)
-            let sig1 = sign_message_ecdsa(&message_payload_bytes, COMMITTEE_MEMBER_1_PK).await?;
-            let sig2 = sign_message_ecdsa(&message_payload_bytes, COMMITTEE_MEMBER_2_PK).await?;
-            
-            // Concatenate signatures (r, s, v) -> bytes
-            let mut combined_sigs_bytes = Vec::new();
-            combined_sigs_bytes.extend_from_slice(&H256::from_uint(&sig1.r).to_fixed_bytes());
-            combined_sigs_bytes.extend_from_slice(&H256::from_uint(&sig1.s).to_fixed_bytes());
-            // Let's keep adding 27 for now, common pattern, but might need to remove if sign_message already includes it.
-            let v1 = sig1.v; // + 27; 
-            combined_sigs_bytes.push(v1 as u8); 
-
-            combined_sigs_bytes.extend_from_slice(&H256::from_uint(&sig2.r).to_fixed_bytes());
-            combined_sigs_bytes.extend_from_slice(&H256::from_uint(&sig2.s).to_fixed_bytes());
-            let v2 = sig2.v; // + 27; 
-            combined_sigs_bytes.push(v2 as u8);
-
-            let aggregated_signatures = Bytes::from(combined_sigs_bytes);
-            println!("[Exec] ECDSA signatures generated and combined: 0x{}", hex::encode(&aggregated_signatures));
-
-            // Manually call the relayer to submit the release
-            // Ensure amount passed here is the on-chain amount (with decimals)
-            // Fix argument order and types
-            evm_relayer.submit_release(
-                chain_b_id,         // Swapped
-                swap_id_bytes,    // Swapped
-                format!("{:?}", token_b_addr), // Convert Address to String
-                release_amount,   // U256 amount with decimals
-                format!("{:?}", user_b_addr),  // Convert Address to String
-                aggregated_signatures.to_vec() // Convert Bytes to Vec<u8>
-            )
-            .await
-            .map_err(|e| format!("Manual submit_release failed: {}", e))?;
-            
-            println!("[Exec] Manual submit_release called successfully.");
-
+            // NO manual submission here anymore
         }
         Ok(None) => {
             panic!("Coordinator did not reach final decision - Unexpected for threshold 1");
         }
         Err(abort_reason) => {
-            panic!("Coordinator aborted swap unexpectedly before submission stage: {:?}", abort_reason);
+            panic!("Coordinator aborted swap unexpectedly: {:?}", abort_reason);
         }
     }
-    // --- End Manual Submission ---
+    // --- End Coordinator Decision Check ---
 
-    // 8. Verification: Check EVM state after relayer call (should now succeed)
-    println!("[Verify] Verifying state on Chain B after *manual* release submission...");
+    // 8. Verification: Check EVM state after coordinator's internal relayer call
+    println!("[Verify] Verifying state on Chain B after coordinator's internal release submission...");
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Give some time for the transaction to be mined
+    tokio::time::sleep(Duration::from_secs(3)).await; // Increased slightly
 
     // Check recipient balance on Chain B - should be release_amount (with decimals)
     let balance_b_after = evm_relayer.get_balance(chain_b_id, USER_B_ADDR.to_string(), contracts.token_b_addr.clone()) 
@@ -645,7 +542,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("[Verify] User B balance on Chain B after release: {}", balance_b_after);
     
     // Assume User B starts with 0 TKB on Chain B
-    let expected_balance_b = release_amount; // U256 amount with decimals
+    let expected_balance_b = balance_b_before + release_amount; // Check relative change
     assert_eq!(balance_b_after, expected_balance_b, "User B balance is incorrect after release.");
 
     // Check finalization state on Escrow B
@@ -656,9 +553,13 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
         &[&swap_id_hex] 
     ).await?;
     println!("[Verify] isFinalized({}) on Chain B: {}", swap_id_hex, is_finalized_output);
-    assert!(is_finalized_output.ends_with("1"), "Swap should be finalized on Chain B");
+    // isFinalized returns a uint256 which cast outputs as hex (0x0...01 or 0x0...00)
+    assert!(is_finalized_output.ends_with("1"), "Swap should be finalized on Chain B. Output: {}", is_finalized_output);
 
-    println!("[Verify] Skipping check for swap removal from coordinator state as manual submission was used.");
+    // Optional: Check if coordinator cleaned up the swap state
+    assert!(!coordinator.active_swaps.contains_key(&swap_id_str), "Coordinator should remove finalized swap from active_swaps");
+    println!("[Verify] Coordinator successfully removed swap {} from internal state.", swap_id_str);
+
 
     println!("--- E2E Coordinator <> Relayer Test PASSED ---");
     Ok(())
