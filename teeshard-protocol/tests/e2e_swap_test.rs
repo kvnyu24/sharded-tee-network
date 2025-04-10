@@ -284,7 +284,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     // Use a known funded account (User A's PK from Anvil default set)
     const USER_A_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"; // Default Anvil PK for 0xf39... 
     const RELAYER_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"; // Relayer's address derived from RELAYER_PK
-    let funding_amount_wei = "10000000000000000000"; // 10 ETH in Wei
+    let funding_amount_wei = "100000000000000000000"; // 100 ETH in Wei
 
     fund_account_on_chain(
         RPC_URL_B, // Target Chain B
@@ -333,8 +333,10 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     // Create MockNetwork (coordinator needs a network interface)
     let mock_network = Arc::new(MockNetwork::new());
 
-    // Need shard assignments (even if empty/unused for this test flow)
-    let shard_assignments: HashMap<usize, Vec<TEEIdentity>> = HashMap::new();
+    // Create shard assignments map - MUST include the relevant shard ID
+    let mut shard_assignments: HashMap<usize, Vec<TEEIdentity>> = HashMap::new();
+    // Assign the coordinator itself as the handler for the relevant shard ID for this test
+    shard_assignments.insert(CHAIN_A_ID as usize, vec![coord_identity.clone()]);
 
     let mut coordinator = CrossChainCoordinator::new(
         coord_identity.clone(),
@@ -385,8 +387,8 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     println!("[Exec] Defined swap transaction: {}", swap_id_str);
 
     // 5. Execution: Initiate Swap (in coordinator memory)
-    // Define which shards are relevant (only shard 0 in this simplified setup)
-    let relevant_shards: HashSet<usize> = [0].into_iter().collect();
+    // The relevant "shard" is identified by the chain ID where the lock occurs.
+    let relevant_shards: HashSet<usize> = [CHAIN_A_ID as usize].into_iter().collect(); // Use CHAIN_A_ID
     coordinator.initiate_swap(swap_tx.clone(), relevant_shards);
     println!("[Exec] Coordinator initiated swap.");
 
@@ -400,7 +402,8 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     // Construct the data that the TEE would sign for the proof
     // Match the reconstruction logic in verify_lock_proof
     let mut proof_data_to_sign = swap_id_str.as_bytes().to_vec();
-    proof_data_to_sign.extend_from_slice(&0usize.to_le_bytes()); // shard_id = 0
+    // Use the correct shard ID (CHAIN_A_ID) in the signed data
+    proof_data_to_sign.extend_from_slice(&(CHAIN_A_ID as usize).to_le_bytes()); // shard_id = CHAIN_A_ID
     proof_data_to_sign.extend_from_slice(lock_info_for_proof.account.address.as_bytes());
     proof_data_to_sign.extend_from_slice(&lock_info_for_proof.asset.token_symbol.as_bytes());
     proof_data_to_sign.extend_from_slice(&lock_info_for_proof.amount.to_le_bytes());
@@ -410,7 +413,7 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
 
     let lock_proof = LockProof {
         tx_id: swap_id_str.clone(),
-        shard_id: 0,
+        shard_id: CHAIN_A_ID as usize, // Use the correct shard ID
         lock_info: lock_info_for_proof, // Add the missing lock_info
         signer_identity: mock_shard_tee_identity, 
         attestation_or_sig: proof_signature, // This is now correctly type Signature
