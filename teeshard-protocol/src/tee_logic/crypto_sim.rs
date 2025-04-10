@@ -13,6 +13,10 @@ pub use ed25519_dalek::{
 use rand::rngs::OsRng;
 use tokio::time::{Duration, sleep}; // Import sleep and Duration
 use rand::Rng; // Import Rng trait for random number generation
+use crate::simulation::metrics::MetricEvent; // Add metrics import
+use tokio::sync::mpsc; // Add mpsc import
+use std::time::Instant; // Add Instant import
+use crate::data_structures::TEEIdentity; // Add TEEIdentity import
 
 // Helper function to generate a random delay within a range
 async fn random_delay(min_ms: u64, max_ms: u64) {
@@ -33,24 +37,112 @@ pub fn generate_keypair() -> SecretKey {
     SecretKey::generate(&mut OsRng)
 }
 
+// Helper to send metric if sender is provided
+async fn send_metric(
+    metrics_tx: &Option<mpsc::Sender<MetricEvent>>, 
+    node_id: &Option<TEEIdentity>, 
+    function_name: String, 
+    start_time: Instant
+) {
+    if let (Some(tx), Some(id)) = (metrics_tx.as_ref(), node_id.as_ref()) {
+        let duration = start_time.elapsed();
+        let event = MetricEvent::TeeFunctionMeasured {
+            node_id: id.clone(),
+            function_name,
+            duration,
+        };
+        let tx_clone = tx.clone();
+        let id_clone = id.clone(); // Clone for error logging
+        tokio::spawn(async move {
+            if let Err(e) = tx_clone.send(event).await {
+                // eprintln!("[crypto_sim {}] Failed to send metric: {}", id_clone.id, e); // Avoid excessive logging
+            }
+        });
+    }
+}
+
 // Sign a message using a secret key
 // Make async and add delay simulation
-pub async fn sign(message: &[u8], key: &SecretKey, min_delay_ms: u64, max_delay_ms: u64) -> Signature {
-    // Simulate TEE signing overhead
+pub async fn sign(
+    message: &[u8], 
+    key: &SecretKey, 
+    min_delay_ms: u64, 
+    max_delay_ms: u64,
+    // Add optional metrics params
+    metrics_tx: &Option<mpsc::Sender<MetricEvent>>, 
+    node_id: &Option<TEEIdentity>, 
+) -> Signature {
+    let start_time = Instant::now();
+    let function_name = "sign".to_string();
+
+    // Simulate TEE signing overhead (delay)
     random_delay(min_delay_ms, max_delay_ms).await;
 
-    // Actual signing operation
-    key.sign(message)
+    // Actual signing operation (measure this part)
+    let work_start_time = Instant::now();
+    let signature = key.sign(message);
+    let work_duration = work_start_time.elapsed(); // Measure only the core work
+
+    // Send metric for the core work duration
+    if let (Some(tx), Some(id)) = (metrics_tx.as_ref(), node_id.as_ref()) {
+        let event = MetricEvent::TeeFunctionMeasured {
+            node_id: id.clone(),
+            function_name: function_name.clone(), // Function name is just "sign"
+            duration: work_duration, // Send the work duration, not total
+        };
+        let tx_clone = tx.clone();
+        let id_clone = id.clone(); // Clone for error logging
+        tokio::spawn(async move {
+            if let Err(e) = tx_clone.send(event).await {
+                // eprintln!("[crypto_sim {}] Failed to send sign metric: {}", id_clone.id, e);
+            }
+        });
+    }
+    
+    // The function returns the signature, total time is implicitly measured by caller if needed
+    signature
 }
 
 // Verify a signature using a public key
 // Make async and add delay simulation
-pub async fn verify(message: &[u8], signature: &Signature, public_key: &PublicKey, min_delay_ms: u64, max_delay_ms: u64) -> bool {
+pub async fn verify(
+    message: &[u8], 
+    signature: &Signature, 
+    public_key: &PublicKey, 
+    min_delay_ms: u64, 
+    max_delay_ms: u64,
+    // Add optional metrics params
+    metrics_tx: &Option<mpsc::Sender<MetricEvent>>, 
+    node_id: &Option<TEEIdentity>,
+) -> bool {
+     let start_time = Instant::now();
+    let function_name = "verify".to_string();
+    
     // Simulate TEE verification overhead
     random_delay(min_delay_ms, max_delay_ms).await;
 
-    // Actual verification operation
-    public_key.verify(message, signature).is_ok()
+    // Actual verification operation (measure this part)
+    let work_start_time = Instant::now();
+    let is_ok = public_key.verify(message, signature).is_ok();
+    let work_duration = work_start_time.elapsed();
+
+    // Send metric for the core work duration
+    if let (Some(tx), Some(id)) = (metrics_tx.as_ref(), node_id.as_ref()) {
+        let event = MetricEvent::TeeFunctionMeasured {
+            node_id: id.clone(),
+            function_name: function_name.clone(), // Function name is just "verify"
+            duration: work_duration, // Send the work duration, not total
+        };
+        let tx_clone = tx.clone();
+        let id_clone = id.clone(); // Clone for error logging
+        tokio::spawn(async move {
+            if let Err(e) = tx_clone.send(event).await {
+                 // eprintln!("[crypto_sim {}] Failed to send verify metric: {}", id_clone.id, e);
+            }
+        });
+    }
+    
+    is_ok
 }
 
 #[cfg(test)]
@@ -84,10 +176,10 @@ mod tests {
             let message = b"This is a test message.";
 
             // Sign with no delay
-            let signature = sign(message, &keypair, 0, 0).await;
+            let signature = sign(message, &keypair, 0, 0, &None, &None).await;
 
             // Verify with no delay
-            let is_valid = verify(message, &signature, &public_key, 0, 0).await;
+            let is_valid = verify(message, &signature, &public_key, 0, 0, &None, &None).await;
             assert!(is_valid, "Signature should be valid");
         });
     }
@@ -100,10 +192,10 @@ mod tests {
             let public_key2 = keypair2.verifying_key();
             let message = b"Another test message.";
 
-            let signature = sign(message, &keypair1, 0, 0).await; // Sign with key 1
+            let signature = sign(message, &keypair1, 0, 0, &None, &None).await; // Sign with key 1
 
             // Verify with key 2 (should fail)
-            let is_valid = verify(message, &signature, &public_key2, 0, 0).await;
+            let is_valid = verify(message, &signature, &public_key2, 0, 0, &None, &None).await;
             assert!(!is_valid, "Verification should fail with the wrong public key");
         });
     }
@@ -116,10 +208,10 @@ mod tests {
             let message = b"Original message.";
             let tampered_message = b"Tampered message.";
 
-            let signature = sign(message, &keypair, 0, 0).await;
+            let signature = sign(message, &keypair, 0, 0, &None, &None).await;
 
             // Verify with tampered message (should fail)
-            let is_valid = verify(tampered_message, &signature, &public_key, 0, 0).await;
+            let is_valid = verify(tampered_message, &signature, &public_key, 0, 0, &None, &None).await;
             assert!(!is_valid, "Verification should fail with a tampered message");
         });
     }
@@ -133,7 +225,8 @@ mod tests {
             let max_delay = 55;
 
             let start = Instant::now();
-            let _signature = sign(message, &keypair, min_delay, max_delay).await;
+            // Pass None for metrics params in test
+            let _signature = sign(message, &keypair, min_delay, max_delay, &None, &None).await;
             let duration = start.elapsed();
 
             assert!(duration >= Duration::from_millis(min_delay), "Signing took less than minimum delay. Took: {:?}", duration);
@@ -151,10 +244,11 @@ mod tests {
             let min_delay = 60;
             let max_delay = 65;
 
-            let signature = sign(message, &keypair, 0, 0).await; // Sign without delay
+            let signature = sign(message, &keypair, 0, 0, &None, &None).await; // Sign without delay
 
             let start = Instant::now();
-            let _is_valid = verify(message, &signature, &public_key, min_delay, max_delay).await;
+            // Pass None for metrics params in test
+            let _is_valid = verify(message, &signature, &public_key, min_delay, max_delay, &None, &None).await;
             let duration = start.elapsed();
 
             assert!(duration >= Duration::from_millis(min_delay), "Verification took less than minimum delay. Took: {:?}", duration);

@@ -1,11 +1,11 @@
 use std::hash::{Hash};
 // Import the PublicKey type
-use crate::tee_logic::crypto_sim::PublicKey; // VerifyingKey re-exported as PublicKey
+ // VerifyingKey re-exported as PublicKey
 // Import HashSet which was removed by cargo fix
-use std::collections::HashSet;
 use serde::{Serialize, Deserialize};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use std::time::Duration;
+use std::collections::HashSet;
 
 // Represent a user account on some chain
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub struct GraphEdge {
 
 // Represents a TEE Node Identity
 // Now using a real cryptographic public key type
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct TEEIdentity {
     pub id: usize,
     pub public_key: VerifyingKey,

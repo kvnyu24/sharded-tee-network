@@ -5,7 +5,6 @@ use crate::tee_logic::types::AttestationReport;
 use std::time::{Duration, Instant};
 use ed25519_dalek::Signature;
 use serde::{Serialize, Deserialize};
-use std::sync::Arc;
 // Import TeeDelayConfig
 use crate::tee_logic::enclave_sim::TeeDelayConfig;
 

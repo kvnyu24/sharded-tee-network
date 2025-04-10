@@ -2,7 +2,9 @@
 
 use crate::data_structures::TEEIdentity;
 use crate::raft::state::LogEntry;
+use serde::{Serialize, Deserialize};
 use crate::tee_logic::crypto_sim::generate_keypair;
+use std::time::Instant;
 
 // Sent by candidates to gather votes
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,7 +23,7 @@ pub struct RequestVoteReply {
 }
 
 // Sent by leader to replicate log entries and as heartbeat
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AppendEntriesArgs {
     pub term: u64,
     pub leader_id: TEEIdentity,
@@ -30,6 +32,25 @@ pub struct AppendEntriesArgs {
     pub entries: Vec<LogEntry>, // Log entries to store (empty for heartbeat)
     pub leader_commit: u64,   // Leader's commitIndex
 }
+
+// Manual PartialEq implementation for AppendEntriesArgs
+impl PartialEq for AppendEntriesArgs {
+    fn eq(&self, other: &Self) -> bool {
+        self.term == other.term &&
+        self.leader_id == other.leader_id &&
+        self.prev_log_index == other.prev_log_index &&
+        self.prev_log_term == other.prev_log_term &&
+        self.leader_commit == other.leader_commit &&
+        self.entries.len() == other.entries.len() &&
+        // Compare entries based on term and command only, ignore proposal_time
+        self.entries.iter().zip(other.entries.iter()).all(|(a, b)| {
+            a.term == b.term && a.command == b.command
+        })
+    }
+}
+
+// Add Eq implementation (safe because PartialEq is reflexive, symmetric, transitive)
+impl Eq for AppendEntriesArgs {}
 
 // Reply to AppendEntriesArgs
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,7 +108,10 @@ mod tests {
 
     #[test]
     fn append_entries_args_creation() {
-        let entries = vec![LogEntry { term: 1, command: Command::Dummy }, LogEntry { term: 2, command: Command::Dummy }];
+        let entries = vec![
+            LogEntry { term: 1, command: Command::Dummy, proposal_time: Instant::now() }, 
+            LogEntry { term: 2, command: Command::Dummy, proposal_time: Instant::now() }
+        ];
         let args = AppendEntriesArgs {
             term: 2,
             leader_id: create_test_tee(0),

@@ -1,10 +1,12 @@
 // Define Raft-specific state structures
 
 use crate::{
-    data_structures::{AccountId, AssetId, TEEIdentity},
+    data_structures::TEEIdentity,
     tee_logic::types::LockProofData, // Import the type for data to be signed
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::time::Instant; // Add Instant
 
 /// Commands that can be applied to the state machine via Raft consensus.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
@@ -18,10 +20,11 @@ pub enum Command {
 }
 
 /// Represents an entry in the Raft log.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone)]
 pub struct LogEntry {
     pub term: u64,
     pub command: Command, // The command for the state machine
+    pub proposal_time: Instant, // Added proposal time
 }
 
 /// Represents the role of a node in the Raft cluster
@@ -51,17 +54,25 @@ pub struct RaftNodeState {
     // Node's current role and ID
     pub role: RaftRole,
     pub id: TEEIdentity,
+
+    // Snapshot related fields (add these)
+    pub last_snapshot_index: u64,
+    pub last_snapshot_term: u64,
 }
 
 impl RaftNodeState {
     // Helper method to get the index of the last log entry
     pub fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.log.len() as u64 + self.last_snapshot_index
     }
 
     // Helper method to get the term of the last log entry
     pub fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |entry| entry.term)
+        if let Some(last_entry) = self.log.last() {
+            last_entry.term
+        } else {
+            self.last_snapshot_term
+        }
     }
 
      // Helper method to get the term of the entry at a specific index

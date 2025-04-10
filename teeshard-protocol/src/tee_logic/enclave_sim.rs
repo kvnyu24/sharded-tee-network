@@ -1,18 +1,19 @@
 // TEE Enclave Simulation logic
 
-use crate::data_structures::{LockInfo, TEEIdentity};
-use crate::tee_logic::types::{LockProofData, Signature, AttestationReport};
+use crate::data_structures::TEEIdentity;
+use crate::tee_logic::types::{Signature, AttestationReport};
 use crate::liveness::types::VerificationResult;
 use crate::liveness::types::ChallengeNonce;
 // Make crypto_sim methods async
-use crate::tee_logic::crypto_sim::{self, SecretKey, generate_keypair, sign, verify, PublicKey};
-use ed25519_dalek::{VerifyingKey, SigningKey, Verifier};
+use crate::tee_logic::crypto_sim::{self, SecretKey, generate_keypair, sign, PublicKey};
 use crate::tee_logic::threshold_sig::PartialSignature;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use rand::Rng;
+use crate::simulation::metrics::MetricEvent;
+use tokio::sync::mpsc;
+use std::time::Instant;
 
 /// Configuration for simulating TEE operation delays.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -57,48 +58,73 @@ pub struct EnclaveSim {
     secret_key: SecretKey,
     // Store delay config
     delay_config: Arc<TeeDelayConfig>,
+    metrics_tx: Option<mpsc::Sender<MetricEvent>>, // Added metrics sender
 }
 
 impl EnclaveSim {
-    /// Creates a new simulated enclave with a specific ID and optional key.
-    /// If key is None, generates a new one.
-    pub fn new(id: usize, key: Option<SecretKey>, delay_config: Arc<TeeDelayConfig>) -> Self {
-        let (secret_key, public_key) = match key {
-            Some(sk) => (sk.clone(), sk.verifying_key()),
-            None => {
-                let kp = generate_keypair();
-                // Clone kp before moving it into the tuple, kp.verifying_key() borrows kp
-                (kp.clone(), kp.verifying_key())
-            }
-        };
-        EnclaveSim {
-            identity: TEEIdentity { id, public_key },
-            secret_key,
-            delay_config, // Store the config
-        }
-    }
+    /// Creates a new simulated enclave with a specific TEEIdentity and associated SecretKey.
+    /// Asserts that the public key in the identity matches the provided secret key.
+    pub fn new(
+        identity: TEEIdentity, // Take full identity
+        key: SecretKey,        // Take secret key directly
+        delay_config: Arc<TeeDelayConfig>,
+        metrics_tx: Option<mpsc::Sender<MetricEvent>>,
+    ) -> Self {
+        // Assert that the provided identity's public key matches the secret key
+        assert_eq!(
+            identity.public_key,
+            key.verifying_key(),
+            "Public key in TEEIdentity does not match the provided SecretKey!"
+        );
 
-    /// Creates a new simulated enclave, always generating a new key.
-    pub fn new_with_generated_key(id: usize, delay_config: Arc<TeeDelayConfig>) -> Self {
-        Self::new(id, None, delay_config) // Call the primary constructor
+        EnclaveSim {
+            identity, // Store the provided identity
+            secret_key: key, // Store the provided secret key
+            delay_config,
+            metrics_tx,
+        }
     }
 
     /// Simulates the TEE signing operation with delay.
     pub async fn sign(&self, message: &[u8]) -> Signature {
+        let start_time = Instant::now();
+        let function_name = "sign".to_string();
+        
         let delay = get_delay(self.delay_config.sign_min_ms, self.delay_config.sign_max_ms).await;
         if delay > Duration::ZERO { sleep(delay).await; }
-        // Use the internal crypto_sim::sign which now expects delays itself
-        sign(message, &self.secret_key, self.delay_config.sign_min_ms, self.delay_config.sign_max_ms).await
+        
+        // Call the actual signing logic
+        let result = sign(
+            message,
+            &self.secret_key,
+            self.delay_config.sign_min_ms,
+            self.delay_config.sign_max_ms,
+            &self.metrics_tx,
+            &Some(self.identity.clone()),
+        ).await;
+        
+        let duration = start_time.elapsed();
+        self.send_tee_metric(function_name, duration).await;
+        
+        result // Return the actual result
     }
 
     /// Simulates the TEE generating an attestation report with delay.
     pub async fn generate_attestation(&self, nonce: ChallengeNonce) -> AttestationReport {
+        let start_time = Instant::now();
+        let function_name = "generate_attestation".to_string();
+        
         let delay = get_delay(self.delay_config.attest_min_ms, self.delay_config.attest_max_ms).await;
         if delay > Duration::ZERO { sleep(delay).await; }
 
         // ChallengeNonce is Vec<u8>, treat it as such for signing
         let signed_data: &[u8] = &nonce.nonce; // Access the inner Vec<u8>
         let signature = self.sign(signed_data).await;
+        
+        let duration = start_time.elapsed();
+        // Note: This duration includes the time spent in self.sign(), which also sends a metric.
+        // Depending on analysis needs, might want to subtract sign duration or only measure outer delay.
+        self.send_tee_metric(function_name, duration).await;
 
         AttestationReport {
             // AttestationReport expects Vec<u8>, clone the inner Vec<u8> from nonce
@@ -108,16 +134,23 @@ impl EnclaveSim {
     }
 
     /// Generates a partial signature share for the given message.
-    // Make async and add delay
     pub async fn generate_partial_signature(&self, message: &[u8]) -> PartialSignature {
          println!("EnclaveSim ({}): Generating partial signature for msg {:?}", self.identity.id, message);
+         let start_time = Instant::now();
+         let function_name = "generate_partial_signature".to_string();
+         
          // Use await and pass sign delays
          let signature_data = crypto_sim::sign(
             message,
             &self.secret_key, // Pass a reference to the key
             self.delay_config.sign_min_ms, // Use sign delays
-            self.delay_config.sign_max_ms
+            self.delay_config.sign_max_ms,
+            &self.metrics_tx,
+            &Some(self.identity.clone()),
          ).await;
+
+         let duration = start_time.elapsed();
+         self.send_tee_metric(function_name, duration).await;
 
          PartialSignature {
              signer_id: self.identity.clone(),
@@ -138,7 +171,9 @@ impl EnclaveSim {
             signature,
             public_key,
             self.delay_config.verify_min_ms, // Use verify delays
-            self.delay_config.verify_max_ms
+            self.delay_config.verify_max_ms,
+            &self.metrics_tx,
+            &Some(self.identity.clone()),
         ).await;
 
         if is_ok {
@@ -147,16 +182,34 @@ impl EnclaveSim {
             VerificationResult::InvalidSignature
         }
     }
+
+    /// Helper to send TeeFunctionMeasured metric.
+    async fn send_tee_metric(&self, function_name: String, duration: Duration) {
+        if let Some(metrics_tx) = self.metrics_tx.clone() {
+            let event = MetricEvent::TeeFunctionMeasured {
+                node_id: self.identity.clone(),
+                function_name,
+                duration,
+            };
+            // Spawn task to send asynchronously
+            tokio::spawn(async move {
+                if let Err(e) = metrics_tx.send(event).await {
+                    // Avoid logging in enclave sim itself, maybe log in collector or runtime?
+                    // eprintln!("[EnclaveSim {}] Failed to send TEE metric: {}", self.identity.id, e);
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tee_logic::crypto_sim; // Import module directly
-    use ed25519_dalek::{Verifier};
+    
     use tokio::runtime::Runtime; // Add tokio runtime for async tests
     use crate::liveness::types::ChallengeNonce; // Ensure ChallengeNonce is imported
-    use std::time::Instant; // For timing tests
+     // For timing tests
 
     // Helper function to run async tests
     fn run_async<F>(future: F) -> F::Output
@@ -166,17 +219,19 @@ mod tests {
         Runtime::new().unwrap().block_on(future)
     }
 
-    // Helper to create EnclaveSim for testing
+    // Helper to create EnclaveSim for testing (updated)
     fn create_test_enclave(id: usize) -> EnclaveSim {
         let signing_key = crypto_sim::generate_keypair();
-        // Pass default delay config for tests
-        EnclaveSim::new(id, Some(signing_key), Arc::new(TeeDelayConfig::default()))
+        let identity = TEEIdentity { id, public_key: signing_key.verifying_key() };
+        // Pass identity and key directly
+        EnclaveSim::new(identity, signing_key, Arc::new(TeeDelayConfig::default()), None)
     }
 
     #[test]
     fn enclave_sim_creation_with_key() {
-        // Remains synchronous
-        let sim = create_test_enclave(5);
+        let signing_key = crypto_sim::generate_keypair();
+        let identity = TEEIdentity { id: 5, public_key: signing_key.verifying_key() };
+        let sim = EnclaveSim::new(identity.clone(), signing_key, Arc::new(TeeDelayConfig::default()), None);
         assert_eq!(sim.identity.id, 5);
         assert_eq!(sim.identity.public_key, sim.secret_key.verifying_key());
     }
@@ -184,7 +239,7 @@ mod tests {
     #[test]
     fn enclave_sim_attestation_async() {
         run_async(async {
-            let sim = create_test_enclave(2);
+            let sim = create_test_enclave(2); // Uses updated helper
             // Initialize ChallengeNonce correctly
             let nonce_bytes: Vec<u8> = vec![1; 32]; // Ensure it's 32 bytes for try_into
             let nonce = ChallengeNonce {
@@ -203,7 +258,9 @@ mod tests {
                 &report.report_data,
                 &report.signature,
                 &sim.identity.public_key,
-                0, 0 // No delay for test verification
+                0, 0, // No delay for test verification
+                &sim.metrics_tx,
+                &Some(sim.identity.clone()),
             ).await;
             assert!(is_valid, "Attestation signature should be valid");
         });
@@ -212,7 +269,7 @@ mod tests {
      #[test]
     fn enclave_sim_generate_partial_sig_async() {
         run_async(async {
-            let sim = create_test_enclave(3);
+            let sim = create_test_enclave(3); // Uses updated helper
             let msg = b"message for partial sig async";
 
             let partial_sig = sim.generate_partial_signature(msg).await;
@@ -224,7 +281,9 @@ mod tests {
                 msg,
                 &partial_sig.signature_data,
                 &sim.identity.public_key,
-                0, 0 // No delay
+                0, 0, // No delay
+                &sim.metrics_tx,
+                &Some(sim.identity.clone()),
             ).await;
             assert!(is_valid);
         });
@@ -233,8 +292,8 @@ mod tests {
     #[test]
     fn enclave_sim_partial_sig_verify_fail_wrong_key_async() {
         run_async(async {
-            let sim1 = create_test_enclave(10);
-            let sim2 = create_test_enclave(11); // Different enclave with different key
+            let sim1 = create_test_enclave(10); // Uses updated helper
+            let sim2 = create_test_enclave(11); // Uses updated helper
             let msg = b"another async message";
 
             let partial_sig = sim1.generate_partial_signature(msg).await;
@@ -244,7 +303,9 @@ mod tests {
                 msg,
                 &partial_sig.signature_data,
                 &sim2.identity.public_key,
-                0, 0 // No delay
+                0, 0, // No delay
+                &sim2.metrics_tx,
+                &Some(sim2.identity.clone()),
             ).await;
             assert!(!is_valid);
         });
@@ -253,10 +314,14 @@ mod tests {
     #[test]
     fn test_enclave_sim_creation_and_signing_async() {
         run_async(async {
-            // Test creating enclave without a key remains sync
             let signing_key_for_test = generate_keypair();
-            let public_key_for_test = signing_key_for_test.verifying_key();
-            let enclave_gen_key = EnclaveSim::new(2, Some(signing_key_for_test.clone()), Arc::new(TeeDelayConfig::default()));
+            let identity_for_test = TEEIdentity { id: 2, public_key: signing_key_for_test.verifying_key() };
+            let enclave_gen_key = EnclaveSim::new(
+                identity_for_test.clone(), 
+                signing_key_for_test.clone(), 
+                Arc::new(TeeDelayConfig::default()), 
+                None
+            );
             assert_eq!(enclave_gen_key.identity.id, 2);
             assert!(enclave_gen_key.get_public_key().is_some());
 
@@ -269,7 +334,9 @@ mod tests {
                 message,
                 &signature1,
                 &public_key1,
-                0, 0 // No delay
+                0, 0, // No delay
+                &enclave_gen_key.metrics_tx,
+                &Some(enclave_gen_key.identity.clone()),
             ).await;
             assert!(is_valid);
         });

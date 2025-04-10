@@ -4,11 +4,14 @@ use crate::data_structures::{LockInfo, TEEIdentity};
 use crate::cross_chain::types::LockProof; // Assuming LockProof is defined here
 // Import crypto sim components and TeeDelayConfig from enclave_sim
 use crate::tee_logic::crypto_sim::{sign, verify}; // Keep sign/verify
-use crate::tee_logic::enclave_sim::TeeDelayConfig; // Correct path for TeeDelayConfig
+ // Correct path for TeeDelayConfig
 use crate::tee_logic::crypto_sim::{SecretKey, PublicKey}; // Need SecretKey/PublicKey for types
-use crate::tee_logic::types::{LockProofData, Signature};
-use tokio::time::{Duration, sleep}; // Import sleep/Duration
-use rand::Rng; // Import Rng
+ // Import sleep/Duration
+ // Import Rng
+ // Import MetricEvent
+ // Import mpsc
+use crate::tee_logic::types::Signature;
+use std::time::Duration;
 
 // Helper to serialize lock proof data for signing/verification
 fn serialize_lock_data(tx_id: &str, shard_id: usize, lock_info: &LockInfo) -> Vec<u8> {
@@ -43,7 +46,9 @@ pub async fn generate_lock_proof(
         &serialized_data,
         signing_key,
         min_delay_ms,
-        max_delay_ms
+        max_delay_ms,
+        &None, // metrics_tx
+        &None, // node_id
     ).await;
 
     LockProof {
@@ -72,7 +77,9 @@ pub async fn verify_lock_proof(
         &proof.attestation_or_sig,
         public_key,
         min_delay_ms,
-        max_delay_ms
+        max_delay_ms,
+        &None, // metrics_tx
+        &None, // node_id
     ).await
 }
 

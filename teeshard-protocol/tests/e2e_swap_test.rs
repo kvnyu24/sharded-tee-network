@@ -47,7 +47,6 @@ use ethers::middleware::SignerMiddleware; // Import SignerMiddleware
 use ethers::abi::{encode_packed, Token}; // Added abi encoding
 use std::sync::Arc as StdArc;
 use bincode;
-use bincode::{config::standard};
 
 // --- Test Configuration & Constants ---
 const RPC_URL_A: &str = "http://localhost:8545";
@@ -458,10 +457,10 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
         coord_identity.clone(),
         coord_secret_key,
         system_config.clone(),
+        system_config.coordinator_identities.clone(), // Add peers argument (arg 4)
         mock_network as Arc<dyn NetworkInterface + Send + Sync>,
-        // Pass the real relayer!
         evm_relayer.clone() as Arc<dyn BlockchainInterface + Send + Sync>,
-        shard_assignments,
+        shard_assignments
     );
     println!("[Setup] CrossChainCoordinator created (Threshold=1).");
 
@@ -534,7 +533,14 @@ async fn test_e2e_coordinator_relayer_swap() -> Result<(), String> {
     proof_data_to_sign.extend_from_slice(&lock_info_for_proof.amount.to_le_bytes());
     
     // Use async sign, provide delay args (0,0 for test), and await the result
-    let proof_signature: Signature = sign(&proof_data_to_sign, &mock_shard_secret_key, 0, 0).await;
+    let proof_signature: Signature = sign(
+        &proof_data_to_sign, 
+        &mock_shard_secret_key, 
+        0, 
+        0, 
+        &None, // Add metrics_tx argument (arg 5)
+        &None  // Add node_id argument (arg 6)
+    ).await;
 
     let lock_proof = LockProof {
         tx_id: swap_id_str.clone(),

@@ -1,11 +1,9 @@
 use crate::{
-    config::SystemConfig,
-    data_structures::{AccountId, TEEIdentity, Transaction},
+    data_structures::TEEIdentity,
     onchain::interface::{BlockchainInterface, BlockchainError, SwapId, TransactionId},
-    raft::{messages::RaftMessage, node::RaftNode, state::*, storage::*},
+    raft::state::*,
     simulation::runtime::{SimulationRuntime, SignatureShare},
-    tee_logic::types::{LockProofData, Signature},
-    liveness::types::LivenessAttestation,
+    simulation::node::NodeProposalRequest,
 };
 use crate::simulation::config::SimulationConfig;
 use std::{
@@ -16,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use hex;
 use ethers::types::U256;
-use ethers::types::Address;
+use crate::network::NetworkMessage;
 
 // --- Mock SimulationRuntime ---
 
@@ -31,8 +29,9 @@ pub struct MockSimulationRuntime {
 impl MockSimulationRuntime {
     // Creates a mock runtime and the result receiver
     pub fn new() -> (Self, mpsc::Receiver<SignatureShare>) {
-        // Capture all 4 return values from the real new(), ignore the last two
-        let (runtime_handle, result_rx, _liveness_rx, _isolation_rx) = SimulationRuntime::new(SimulationConfig::default());
+        // Capture 4 values, ignore the 4th (metrics handle)
+        let (runtime_handle, result_rx, _isolation_rx, _metrics_handle) = 
+            SimulationRuntime::new(SimulationConfig::default());
         (Self {
             handle: runtime_handle,
             sent_shard_commands: Arc::new(Mutex::new(Vec::new())),
@@ -50,10 +49,10 @@ impl MockSimulationRuntime {
     }
 
     // Mock method now calls the real handle
-    pub fn assign_nodes_to_shard(&self, shard_id: usize, nodes: Vec<TEEIdentity>) {
+    pub async fn assign_nodes_to_shard(&self, shard_id: usize, nodes: Vec<TEEIdentity>) {
          println!("[MockRuntime] assign_nodes_to_shard called for Shard {}. Forwarding to real handle.", shard_id);
-         // Call the real handle's method
-         self.handle.assign_nodes_to_shard(shard_id, nodes);
+         // Call the real handle's method - NOW AWAITS
+         self.handle.assign_nodes_to_shard(shard_id, nodes).await; // Add .await
     }
 
     // Helper to set up a basic simulation environment
@@ -63,15 +62,15 @@ impl MockSimulationRuntime {
         // blockchain_interface: Box<dyn BlockchainInterface + Send + Sync>,
     ) -> (
         SimulationRuntime,
-        tokio::sync::mpsc::Receiver<SignatureShare>, // Corrected type
-        tokio::sync::mpsc::Receiver<LivenessAttestation>,
-        tokio::sync::mpsc::Receiver<Vec<usize>>
+        tokio::sync::mpsc::Receiver<SignatureShare>, 
+        tokio::sync::mpsc::Receiver<Vec<usize>>, 
     )
     {
-        let (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx) =
-            SimulationRuntime::new(SimulationConfig::default()); // Call with config
+        // Capture 4 values, ignore the 4th (metrics handle)
+        let (runtime_handle, sig_share_rx, isolation_rx, _metrics_handle) = 
+            SimulationRuntime::new(SimulationConfig::default()); 
 
-        (runtime_handle, sig_share_rx, liveness_rx, shard_assignments_rx)
+        (runtime_handle, sig_share_rx, isolation_rx)
     }
 }
 
@@ -320,4 +319,26 @@ async fn test_mock_blockchain_interface_lock_release() {
     // TODO: Add state checks on the mock? e.g., did lock/release modify expected state?
 }
 
-// ... other tests ...
+// Mock Node Handle for testing Coordinator interactions with nodes
+pub struct MockNodeHandle {
+    pub identity: TEEIdentity,
+}
+
+impl MockNodeHandle {
+    pub async fn new(identity: TEEIdentity) -> Self {
+        // Runtime needed for registering the node's channels
+        let (runtime_handle, _sig_share_rx, _isolation_rx, _metrics_handle) = SimulationRuntime::new(SimulationConfig::default()); // Adjust destructuring
+
+        // Create necessary channels for node registration
+        let (network_sender_tx, _network_sender_rx) = mpsc::channel::<NetworkMessage>(100); // Specify type
+        let (proposal_tx, _proposal_rx) = mpsc::channel::<NodeProposalRequest>(10);
+        // let (challenge_tx, _) = mpsc::channel::<ChallengeNonce>(10);
+
+        // Register the node with the runtime - NOW AWAITS
+        runtime_handle.register_node(identity.clone(), proposal_tx).await; // Add .await
+
+        MockNodeHandle {
+            identity,
+        }
+    }
+}

@@ -6,6 +6,7 @@
 use teeshard_protocol::{
     config::SystemConfig as NodeSystemConfig,
     data_structures::{AccountId, AssetId, LockInfo, TEEIdentity, Transaction, TxType},
+    network::NetworkMessage,
     shard_manager::ShardManager,
     tee_logic::{crypto_sim::SecretKey, types::LockProofData},
     simulation::{
@@ -20,7 +21,7 @@ use teeshard_protocol::{
     liveness::{
         aggregator::Aggregator,
         challenger::Challenger,
-        types::{LivenessConfig},
+        types::LivenessConfig,
     },
     onchain::interface::{BlockchainInterface, BlockchainError, SwapId, TransactionId},
 };
@@ -33,6 +34,8 @@ use std::collections::HashMap;
 use regex::Regex;
 use teeshard_protocol::onchain::evm_relayer::{EvmRelayer, EvmRelayerConfig, ChainConfig};
 use tokio::process::Command as TokioCommand;
+use log::info;
+use teeshard_protocol::tee_logic::crypto_sim;
 
 // Helper to create TEE Identity and SecretKey (can be shared with other tests)
 fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -139,17 +142,21 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
 
     // 1. System Configuration & Identities
     let num_nodes = 6; // Example: 6 nodes total
+    let num_extra_identities = 2; // For Challenger, Aggregator
+    let total_identities_needed = num_nodes + num_extra_identities;
     let num_shards = 2; // Example: Target 2 shards
-    let mut identities = Vec::new();
-    for i in 0..num_nodes {
+    let mut all_identities = Vec::new(); // Rename to reflect all identities
+    for i in 0..total_identities_needed { // Generate identities for nodes + liveness
         let (identity, _) = create_test_tee(i);
-        identities.push(identity);
+        all_identities.push(identity);
     }
+    // Separate node identities for partitioning
+    let node_identities: Vec<_> = all_identities.iter().take(num_nodes).cloned().collect();
 
     let config = NodeSystemConfig {
         nodes_per_shard: num_nodes / num_shards, // Aim for even distribution
         // Coordinator config (placeholder for now)
-        coordinator_identities: vec![identities[0].clone()], // Node 0 is coordinator for now
+        coordinator_identities: vec![all_identities[0].clone()], // Node 0 is coordinator for now
         coordinator_threshold: 1,
         ..Default::default() // Use default raft timings etc.
     };
@@ -221,7 +228,7 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     println!("[Setup] Iterative refinement complete.");
 
     // Assign TEE nodes to the calculated partitions
-    shard_manager.assign_tee_nodes(&identities);
+    shard_manager.assign_tee_nodes(&node_identities);
     println!("[Setup] TEE nodes assigned to shards.");
 
     // Retrieve results from the manager's state
@@ -243,114 +250,112 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
 
     // 3. Setup Simulation Runtime & Nodes based on Sharding
     println!("[Setup] Setting up Simulation Runtime and Nodes...");
-    let (runtime, mut result_rx, attestation_rx_agg, mut isolation_rx) = SimulationRuntime::new(SimulationConfig::default());
+    // Initialize SimulationRuntime and channels
+    // Update destructuring to expect 3 return values
+    let (runtime, mut result_rx, mut isolation_rx, metrics_handle) = SimulationRuntime::new(SimulationConfig::default());
 
-    let mut node_handles = Vec::new();
-    let mut node_message_senders: HashMap<usize, tokio::sync::mpsc::Sender<(TEEIdentity, RaftMessage)>> = HashMap::new();
-    let mut node_proposal_senders: HashMap<usize, tokio::sync::mpsc::Sender<NodeProposalRequest>> = HashMap::new();
     let mut node_query_senders: HashMap<usize, tokio::sync::mpsc::Sender<NodeQuery>> = HashMap::new();
-    let mut nodes_to_spawn: Vec<SimulatedTeeNode> = Vec::new(); // Store nodes before spawning
+    let mut nodes_to_spawn: Vec<SimulatedTeeNode> = Vec::new(); // Store just the node
+    // Store Node ID along with handle
+    let mut node_handles: Vec<(usize, tokio::task::JoinHandle<()>)> = Vec::new();
 
-    // --- Create and Register Nodes for each Shard --- 
+    // --- Create Nodes and Register BEFORE Spawning --- 
     for partition in &final_partitions {
         let shard_id = partition.shard_id;
         let nodes_in_shard = &partition.tee_nodes;
-        println!("[Setup] Creating nodes for Shard {}: {:?}", shard_id, nodes_in_shard.iter().map(|n| n.id).collect::<Vec<_>>());
+        println!("[Setup] Preparing nodes for Shard {}: {:?}", shard_id, nodes_in_shard.iter().map(|n| n.id).collect::<Vec<_>>());
         for tee_identity in nodes_in_shard {
             let (_, secret_key) = create_test_tee(tee_identity.id);
             let peers: Vec<TEEIdentity> = nodes_in_shard.iter().filter(|&p| p.id != tee_identity.id).cloned().collect();
-            let (challenge_tx, challenge_rx) = mpsc::channel(10);
+            
+            let (proposal_tx, proposal_rx) = mpsc::channel::<NodeProposalRequest>(100);
+            let (query_tx, query_rx) = mpsc::channel::<NodeQuery>(100);
+
+            // 1. Register node with runtime first to get network_rx - NOW AWAITS
+            let network_rx = runtime.register_node(tee_identity.clone(), proposal_tx.clone()).await; // Add .await
+            node_query_senders.insert(tee_identity.id, query_tx.clone()); // Clone tx before moving
+
+            // 2. Create the node instance, passing the network_rx
             let node = SimulatedTeeNode::new(
-                tee_identity.clone(), secret_key, peers, config.clone(), runtime.clone(),
-                challenge_rx, challenge_tx.clone(), 
+                tee_identity.clone(), 
+                secret_key, 
+                peers, 
+                config.clone(), 
+                runtime.clone(),
+                network_rx, // Pass the receiver from runtime
+                proposal_tx, // Pass the proposal sender
+                proposal_rx, // Pass the proposal receiver
+                query_tx,    // Pass the query sender
+                query_rx,    // Pass the query receiver
+                0,           // Add shard_id argument
             );
-            runtime.register_node(tee_identity.clone(), node.get_message_sender(), node.get_proposal_sender(), node.get_challenge_sender());
+            // Store node only
             nodes_to_spawn.push(node);
         }
-        runtime.assign_nodes_to_shard(shard_id, nodes_in_shard.clone());
+        // NOW AWAITS
+        runtime.assign_nodes_to_shard(shard_id, nodes_in_shard.clone()).await; // Add .await
     }
     
-    // --- Get ID before moving nodes ---
-    let first_node_id = nodes_to_spawn.first().map(|n| n.identity.id).expect("Should have at least one node");
-
-    // --- Register Nodes with Runtime (BEFORE moving them) ---
-    println!("[Setup] Registering {} nodes with runtime...", nodes_to_spawn.len());
-    let mut node_challenge_rxs: HashMap<usize, mpsc::Receiver<ChallengeNonce>> = HashMap::new();
-    // Iterate by reference here to avoid moving nodes yet
-    for node in &nodes_to_spawn { 
-        let id = node.identity.id;
-        let (challenge_tx, challenge_rx) = mpsc::channel(10);
-        node_challenge_rxs.insert(id, challenge_rx);
-        // Pass challenge_tx to register_node (assuming it's the 4th arg)
-        runtime.register_node(
-            node.identity.clone(), 
-            node.get_message_sender(), 
-            node.get_proposal_sender(), 
-            challenge_tx // The sender for challenges TO the node
-        );
-    }
-
-    // --- Spawn Node Tasks ---
-    println!("[Setup] Spawning {} Node tasks...", nodes_to_spawn.len());
-    // Iterate by value to move nodes into spawn
-    for node in nodes_to_spawn { // This now consumes the vector
+    // --- Spawn Node Tasks --- 
+    for node in nodes_to_spawn {
+        let node_id = node.identity.id; // Capture ID before moving
         let handle = tokio::spawn(node.run());
-        node_handles.push(handle); // Store handles for cleanup
+        node_handles.push((node_id, handle)); // Store ID with handle
     }
-    println!("[Setup] Spawned/Managed {} node tasks.", node_handles.len());
-            
+    println!("[Setup] Spawned {} node tasks.", node_handles.len());
+    // --- End Node Spawning --- 
+
+    // --- Get ID before moving nodes --- (Keep this)
+    let first_node_id = 0; // Node ID to target for failure is 0
+
     // --- Setup Liveness Components --- 
     println!("[Setup] Setting up Liveness Challenger and Aggregator...");
-    let liveness_config = LivenessConfig::default();
-    let (challenge_tx_agg, challenge_rx_agg) = mpsc::channel(100); // Challenger -> Aggregator
-    
-    // Create Aggregator
-    let (aggregator, _challenge_rx_returned) = Aggregator::new(liveness_config.clone(), identities.clone(), runtime.clone(), challenge_rx_agg);
-    let agg_arc = Arc::new(aggregator);
-    
-    // Create Challenger
-    let challenger_identity = identities[0].clone();
-    let mut challenger = Challenger::new(challenger_identity, identities.clone(), runtime.clone(), challenge_tx_agg);
-    
-    // --- Register Aggregator Sender with Runtime --- 
-    let aggregator_attestation_sender = runtime.take_aggregator_attestation_sender()
-        .expect("Runtime should have an aggregator attestation sender to take");
-    runtime.register_aggregator(aggregator_attestation_sender);
-    println!("[Setup] Registered Aggregator attestation sender with Runtime.");
+    // ** Use custom config for faster detection in test **
+    let liveness_config = LivenessConfig {
+        min_interval: Duration::from_secs(1), // Challenge frequently
+        max_interval: Duration::from_secs(3),
+        challenge_window: Duration::from_secs(2), // Short window to respond
+        max_failures: 2, // Report after 2 failures
+        ..LivenessConfig::default() // Keep other defaults (trust scores, etc.)
+    };
+    println!("[Setup] Using custom LivenessConfig: {:?}", liveness_config); // Log the config
+    let (challenge_tx_challenger_to_agg, challenge_rx_agg) = mpsc::channel(100);
 
-    // Spawn Challenger Task
-    let challenger_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5)); // Example challenge interval
-        loop {
-            interval.tick().await;
-            challenger.issue_challenges().await;
-        }
-    });
-    println!("[Setup] Spawned Challenger task.");
+    let aggregator_identity = TEEIdentity { id: 999, public_key: crypto_sim::generate_keypair().verifying_key() };
+    let metrics_tx = runtime.get_metrics_sender();
 
-    // Spawn Aggregator Listener Tasks
-    let agg_challenge_listener_handle = {
-        let agg_clone = agg_arc.clone();
-        tokio::spawn(async move {
-            agg_clone.run_challenge_listener(_challenge_rx_returned).await;
-        })
-    };
-    let agg_attestation_listener_handle = {
-        let agg_clone = agg_arc.clone();
-        tokio::spawn(async move {
-            agg_clone.run_attestation_listener(attestation_rx_agg).await;
-        })
-    };
-    
-    // --- Add print BEFORE spawning timeout checker ---
-    println!("!!! [Setup] About to spawn run_timeout_checker task..."); 
-    let agg_timeout_checker_handle = {
-        tokio::spawn(async move {
-            let agg_clone = agg_arc.clone(); 
-            agg_clone.run_timeout_checker().await;
-        })
-    };
-    println!("[Setup] Spawned Aggregator listener and checker tasks."); // Original log remains
+    let (aggregator, _challenge_rx_listener) = Aggregator::new(
+        aggregator_identity.clone(),   // Arg 1: identity
+        liveness_config.clone(),       // Arg 2: config <-- Use custom config
+        all_identities.clone(),        // Arg 3: nodes
+        runtime.clone(),               // Arg 4: runtime
+        Some(metrics_tx.clone()),      // Arg 5: metrics_tx (Option<Sender<MetricEvent>>)
+        challenge_rx_agg,              // Arg 6: challenge_rx (Receiver<ChallengeNonce>)
+    );
+    let aggregator_arc = Arc::new(aggregator);
+
+    // Spawn separate Aggregator tasks
+    let agg_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_challenge_listener(_challenge_rx_listener));
+    let agg_timeout_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_timeout_checker());
+
+    // --- ADD Challenger Setup --- 
+    // Challenger needs its own identity (it's not a standard node or coordinator)
+    // Let's assume it's the next ID after the last coordinator - NO, use index num_nodes
+    let challenger_identity = all_identities.get(num_nodes) // Index 6 (0-5 are nodes)
+        .expect("Not enough identities generated for Challenger").clone();
+
+    let challenger = Challenger::new(
+        challenger_identity, // Pass the Challenger's identity
+        node_identities.clone(), // Challenger only challenges nodes
+        runtime.clone(),
+        challenge_tx_challenger_to_agg, // Pass the sender half of the channel
+    );
+    let challenger_handle = tokio::spawn(challenger.run()); // Correct method name is `run`
+    let mut liveness_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    liveness_handles.push(challenger_handle); // Add handle for cleanup
+    liveness_handles.push(agg_listener_handle); // Add listener handle
+    liveness_handles.push(agg_timeout_handle); // Add timeout handle
+    // --- End Challenger Setup ---
 
     // 4. Setup *Actual* EVM Relayer
     println!("[Setup] Setting up EVM Relayer...");
@@ -404,14 +409,14 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     let (coord_cmd_tx, coord_cmd_rx) = mpsc::channel::<CoordinatorCommand>(10);
 
     let (coord_identity, coord_secret) = create_test_tee(0); // Still assuming node 0 is coordinator
-    let coordinator = Arc::new(SimulatedCoordinator::new( // Wrap coordinator in Arc for cloning into tasks
+    let coordinator = Arc::new(SimulatedCoordinator::new(
         coord_identity.clone(),
         coord_secret,
-        config.clone(),
-        runtime.clone(), // Runtime handle is Clone
-        evm_relayer.clone(), // Relayer is Arc, clone is cheap
+        config.clone(), // Use system config
+        runtime.clone(),
+        evm_relayer.clone(),
         final_mapping,
-        // Don't pass receiver to new() anymore
+        metrics_tx.clone(), // Add metrics_tx (arg 7)
     ));
     println!("[Setup] Coordinator instance created.");
 
@@ -531,20 +536,31 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     let escrow_b_balance_ok = escrow_b_balance_final == U256::zero();
     let all_balances_ok = user_a_balance_ok && escrow_a_balance_ok && user_b_balance_ok && escrow_b_balance_ok;
 
-    // 8. Wait for Liveness Failure Detection and Isolation
-    let liveness_wait_secs = 60; 
-    // Use the stored first_node_id
-    println!("\n[Test] Waiting {} seconds for liveness system to isolate Node {}...", liveness_wait_secs, first_node_id);
-    tokio::time::sleep(Duration::from_secs(liveness_wait_secs)).await;
+    // Isolate one node (Node 0)
+    info!("[Test] Aborting Node 0 to trigger isolation...");
+    // Find the handle associated with first_node_id
+    if let Some((_id, handle)) = node_handles.iter().find(|(id, _h)| *id == first_node_id) {
+        println!("[Test] Aborting task for Node {} to simulate failure...", first_node_id);
+        handle.abort();
+    } else {
+        println!("[Test] Warning: Could not find handle for Node {} to abort.", first_node_id);
+    }
+
+    // Wait longer for liveness detection + report
+    println!("[Test] Waiting 10s for liveness detection...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // 9. Verify Isolation Report
     // Use the stored first_node_id
-    println!("[Test] Checking for isolation report for Node {}...", first_node_id);
-    let isolation_check_result = tokio::time::timeout(Duration::from_secs(1), isolation_rx.recv()).await;
+    println!("[Test] Checking for isolation report for Node {} (12s timeout)...", first_node_id);
+    // Increase timeout slightly, just in case, but the main fix is waiting *after* abort
+    // Increase the timeout for receiving the report to 12 seconds
+    let isolation_check_result = tokio::time::timeout(Duration::from_secs(12), isolation_rx.recv()).await;
 
-    // --- Store Liveness Check Result --- 
+    // --- Store Liveness Check Result ---
     let mut isolation_ok = false;
     let mut isolation_report_content = "None received".to_string();
+
     match isolation_check_result {
         Ok(Some(isolated_ids)) => {
             println!("[Test] Received isolation report: {:?}", isolated_ids);
@@ -594,13 +610,18 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
 
     // Abort tasks *before* final assert to avoid hangs on failure
     println!("\n[Cleanup] Aborting remaining tasks...");
-    challenger_handle.abort();
-    agg_challenge_listener_handle.abort();
-    agg_attestation_listener_handle.abort();
-    agg_timeout_checker_handle.abort();
+    // agg_timeout_handle.abort(); // Now handled by liveness_handles loop
     share_listener_handle.abort();
     command_listener_handle.abort();
-    for handle in node_handles { // Only abort nodes that weren't the failed one
+    // Abort the handles stored in node_handles
+    for (id, handle) in &node_handles { // Iterate over tuples
+        if *id == first_node_id { // Don't abort the one we already aborted
+            continue;
+        }
+        handle.abort();
+    }
+    // Abort liveness handles
+    for handle in liveness_handles {
         handle.abort();
     }
     

@@ -18,7 +18,7 @@ pub struct SimulationConfig {
     // Network simulation parameters
     pub network_min_delay_ms: u64,
     pub network_max_delay_ms: u64,
-    // pub network_drop_rate: f64, // Example: 0.0..1.0
+    pub network_drop_rate: f64,
 
     // TEE performance overhead simulation
     // pub tee_sign_delay_ms: u64,
@@ -44,6 +44,9 @@ pub struct SimulationConfig {
     pub log_level: log::LevelFilter,
     // pub output_metrics_file: Option<String>,
 
+    // Interval for the network emulation queue processing task
+    pub network_tick_interval_ms: Option<u64>,
+
     // Add other simulation-specific parameters as needed
     // E.g., duration of the simulation run
     pub simulation_duration_secs: Option<u64>,
@@ -65,6 +68,7 @@ impl Default for SimulationConfig {
 
             network_min_delay_ms: base_config.network_delay_range_ms.0,
             network_max_delay_ms: base_config.network_delay_range_ms.1,
+            network_drop_rate: 0.0, // Default to no packet drops
 
             // Use default TEE delays from SystemConfig
             tee_delays: base_config.tee_delays.clone(),
@@ -78,6 +82,7 @@ impl Default for SimulationConfig {
 
             log_level: log::LevelFilter::Info,
 
+            network_tick_interval_ms: Some(5), // Default queue check interval
             // Simulation Run Duration Default (None = run until total transactions)
             simulation_duration_secs: None,
         }

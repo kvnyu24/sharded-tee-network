@@ -3,20 +3,26 @@
 // This file will eventually contain the RaftNode struct and its methods
 // for handling timers, messages, and state transitions.
 
-use crate::raft::messages::*;
-use crate::raft::state::{Command, LogEntry, RaftNodeState, RaftRole};
-use crate::data_structures::TEEIdentity;
-use crate::config::SystemConfig;
-use crate::raft::storage::RaftStorage; // Add InMemoryStorage for test
-use crate::tee_logic::enclave_sim::EnclaveSim;
-use crate::tee_logic::enclave_sim::TeeDelayConfig;
- // Import key generation
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use crate::{
+    config::SystemConfig,
+    data_structures::TEEIdentity,
+    raft::{messages::{AppendEntriesArgs, AppendEntriesReply, RaftMessage, RequestVoteArgs, RequestVoteReply}, state::{Command, LogEntry, RaftNodeState, RaftRole}, storage::RaftStorage},
+    tee_logic::{crypto_sim::SecretKey, enclave_sim::{EnclaveSim, TeeDelayConfig}},
+    simulation::metrics::MetricEvent,
+};
 use rand::Rng;
-use std::fmt;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+    fmt,
+};
+use tokio::sync::mpsc; // Import mpsc
+use tokio::time::sleep; // Only import sleep
+
+// Define ShardId as usize for now within this module context
+// TODO: Define ShardId globally if needed, e.g., in data_structures.rs or types.rs
+pub type ShardId = usize;
 
 // Represents a Raft node participating in consensus within a shard
 // #[derive(Debug)] // Cannot derive because of Box<dyn RaftStorage>
@@ -29,6 +35,7 @@ pub struct RaftNode {
     // Persistent Storage Interface
     // Use Box<dyn Trait> for dynamic dispatch - Add Send + Sync bounds
     storage: Box<dyn RaftStorage + Send + Sync>,
+    shard_id: ShardId,
     // Timers
     election_timeout: Duration,
     last_activity: Instant, // Time of last heartbeat/vote received or granted vote
@@ -40,6 +47,7 @@ pub struct RaftNode {
     pub enclave: EnclaveSim,
     // Interface for network communication handled via RaftEvent::SendMessage / BroadcastMessage
     // Interface for applying committed entries handled via RaftEvent::ApplyToStateMachine
+    metrics_tx: Option<mpsc::Sender<MetricEvent>>, // Added optional metrics sender
 }
 
 // Manual Debug implementation
@@ -49,14 +57,15 @@ impl fmt::Debug for RaftNode {
          .field("state", &self.state)
          .field("peers", &self.peers)
          .field("config", &self.config)
+         .field("shard_id", &self.shard_id)
          // Skip storage field for Debug formatting
          .field("election_timeout", &self.election_timeout)
          .field("last_activity", &self.last_activity)
          .field("heartbeat_interval", &self.heartbeat_interval)
          .field("last_heartbeat_sent", &self.last_heartbeat_sent)
          .field("votes_received", &self.votes_received)
-         // Add enclave (uses its own Debug impl)
          .field("enclave", &self.enclave)
+         .field("metrics_tx_present", &self.metrics_tx.is_some())
          .finish()
     }
 }
@@ -72,49 +81,75 @@ pub enum RaftEvent {
 }
 
 impl RaftNode {
-    pub fn new(id: TEEIdentity, peers: Vec<TEEIdentity>, config: SystemConfig, storage: Box<dyn RaftStorage + Send + Sync>, enclave: EnclaveSim) -> Self {
-        // Load persistent state using new storage methods
-        let current_term = storage.get_term();
-        let voted_for = storage.get_voted_for();
-        // Eagerly load the entire log for simplicity in this implementation
-        // A production system might load entries on demand
-        let log = storage.get_log_entries_from(1);
-
-        let initial_state = RaftNodeState {
+    pub fn new(
+        identity: TEEIdentity,
+        peers: Vec<TEEIdentity>,
+        config: SystemConfig,
+        storage: Box<dyn RaftStorage + Send + Sync>,
+        signing_key: SecretKey,
+        shard_id: ShardId,
+        delay_config: Arc<TeeDelayConfig>,
+        metrics_tx: Option<mpsc::Sender<MetricEvent>>,
+    ) -> Self {
+        println!("[RaftNode::new START] Creating Node {}", identity.id);
+        // Initialize RaftNodeState fields directly here
+        let (current_term, voted_for) = storage.load_term_and_vote();
+        let log = storage.load_log();
+        let state = RaftNodeState {
+            id: identity.clone(),
+            role: RaftRole::Follower,
             current_term,
             voted_for,
             log,
-            commit_index: 0, // Volatile state, initialized to 0
-            last_applied: 0, // Volatile state, initialized to 0
-            // Volatile leader state, reinitialized after election
+            commit_index: 0,
+            last_applied: 0,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
-            role: RaftRole::Follower,
-            id: id.clone(),
+            // TODO: Load snapshot info from storage if implemented
+            last_snapshot_index: 0, 
+            last_snapshot_term: 0,  
         };
-
+        
+        let enclave = EnclaveSim::new(
+            identity.clone(), // Pass the full identity
+            signing_key, // Pass the key directly
+            delay_config,   
+            metrics_tx.clone(),
+        );
+        
         let mut node = RaftNode {
-            state: initial_state,
+            state,
             peers,
             config: config.clone(),
-            storage, // Store the storage interface
-            election_timeout: Duration::from_millis(0), // Will be randomized
+            storage,
+            shard_id,
+            election_timeout: Duration::from_millis(config.raft_election_timeout_max_ms),
             last_activity: Instant::now(),
             heartbeat_interval: Duration::from_millis(config.raft_heartbeat_ms),
-            last_heartbeat_sent: Instant::now(), // Reset for followers/candidates
+            last_heartbeat_sent: Instant::now(),
             votes_received: HashSet::new(),
-            enclave, // Store the provided enclave instance
+            enclave,
+            metrics_tx,
         };
-        node.randomize_election_timeout();
+        println!("[RaftNode::new END] Node {} created. Calling reset_election_timer...", identity.id);
+        node.reset_election_timer();
+        
+        // No initial events needed as state is initialized directly
+        // if !initial_events.is_empty() {
+        //      eprintln!("[RaftNode {}] Warning: Initial events detected from RaftNodeState::new: {:?}. Handling may be needed.", node.state.id.id, initial_events);
+        // }
         node
     }
 
     fn randomize_election_timeout(&mut self) {
         let min = self.config.raft_election_timeout_min_ms;
         let max = self.config.raft_election_timeout_max_ms;
-        let timeout_ms = rand::thread_rng().gen_range(min..=max);
+        // println!("[RaftNode {}] randomize_election_timeout: Calling rand::thread_rng().gen_range({}..={})", self.state.id.id, min, max);
+        let timeout_ms = rand::thread_rng().gen_range(min..=max); // Restore random generation
+        // let timeout_ms = min; // TEMP FIX: Use fixed minimum timeout - REMOVE THIS
+        // println!("[RaftNode {}] randomize_election_timeout: Using fixed timeout_ms = {}", self.state.id.id, timeout_ms); // REMOVE THIS LOG
         self.election_timeout = Duration::from_millis(timeout_ms);
-        // println!("Node {}: Randomized election timeout to {}ms", self.state.id.id, timeout_ms);
+        // println!("[RaftNode {}] randomize_election_timeout: Got timeout_ms = {}", self.state.id.id, timeout_ms);
     }
 
     fn reset_election_timer(&mut self) {
@@ -125,6 +160,8 @@ impl RaftNode {
     // Called periodically to drive state machine (timers, etc.)
     // Returns a list of events/actions to be performed
     pub fn tick(&mut self) -> Vec<RaftEvent> {
+        println!("[Tick Node {} Term {} Role {:?}] last_activity {:?}, election_timeout {:?}, last_heartbeat {:?}, heartbeat_interval {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, self.last_activity.elapsed(), self.election_timeout, self.last_heartbeat_sent.elapsed(), self.heartbeat_interval);
         let mut events = Vec::new();
         match self.state.role {
             RaftRole::Follower | RaftRole::Candidate => {
@@ -152,7 +189,8 @@ impl RaftNode {
 
     // Convert to follower state
     fn become_follower(&mut self, term: u64) {
-        println!("Node {}: Becoming follower for term {}. Current role: {:?}", self.state.id.id, term, self.state.role);
+        println!("[State Node {} Term {} Role {:?}] Becoming follower for term {}. Current role: {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, term, self.state.role);
         let old_term = self.state.current_term;
         self.state.role = RaftRole::Follower;
         self.state.current_term = term;
@@ -168,6 +206,8 @@ impl RaftNode {
 
     // Transition to candidate state and request votes
     fn become_candidate(&mut self) -> Vec<RaftEvent> {
+        println!("[State Node {} Term {} Role {:?}] Becoming candidate for term {}.", 
+                 self.state.id.id, self.state.current_term, self.state.role, self.state.current_term + 1);
         let new_term = self.state.current_term + 1;
         self.state.current_term = new_term;
         println!("Node {}: Transitioning to Candidate for term {}", self.state.id.id, self.state.current_term);
@@ -194,8 +234,10 @@ impl RaftNode {
 
     // Transition to leader state
     fn become_leader(&mut self) -> Vec<RaftEvent> {
+        println!("[State Node {} Term {} Role {:?}] Attempting to become leader.", 
+                 self.state.id.id, self.state.current_term, self.state.role);
         if self.state.role != RaftRole::Candidate {
-            println!("Node {}: Non-candidate {:?} tried to become leader. Ignoring.", self.state.id.id, self.state.role);
+            println!("[State Node {}] Non-candidate {:?} tried to become leader. Ignoring.", self.state.id.id, self.state.role);
             return vec![]; // Only candidates can become leaders
         }
         println!("Node {}: Becoming Leader for term {}!", self.state.id.id, self.state.current_term);
@@ -208,7 +250,29 @@ impl RaftNode {
             self.state.match_index.insert(peer.clone(), 0);
         }
         self.last_heartbeat_sent = Instant::now(); // Send initial heartbeats immediately
-        self.send_append_entries() // Return initial heartbeat events
+
+        // --- Send Metric --- 
+        /* // Temporarily comment out metrics spawn to check for deadlocks
+        if let Some(metrics_tx) = self.metrics_tx.clone() { // Clone sender if it exists
+            let event = MetricEvent::RaftLeaderElected {
+                shard_id: self.shard_id,
+                node_id: self.state.id.clone(),
+                term: self.state.current_term,
+            };
+            // Send asynchronously, log error if channel closed
+            let node_id_clone = self.state.id.clone(); // Clone for async block
+            tokio::spawn(async move {
+                if let Err(e) = metrics_tx.send(event).await {
+                    // Use cloned node_id for logging
+                    eprintln!("[RaftNode {}] Failed to send RaftLeaderElected metric: {}", node_id_clone.id, e);
+                }
+            });
+        }
+        */
+        // --- End Metric --- 
+
+        // Send initial empty AppendEntries (heartbeats)
+        self.send_append_entries() 
     }
 
     // Send AppendEntries (heartbeats or with entries) to peers
@@ -222,6 +286,8 @@ impl RaftNode {
 
     // Handle incoming Raft messages
     pub fn handle_message(&mut self, sender: TEEIdentity, message: RaftMessage) -> Vec<RaftEvent> {
+        println!("[HandleMsg Node {} Term {} Role {:?}] Received msg from {}: {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, sender.id, message);
         match message {
             RaftMessage::RequestVote(args) => self.handle_request_vote(sender, args),
             RaftMessage::RequestVoteReply(reply) => self.handle_request_vote_reply(sender, reply),
@@ -232,6 +298,8 @@ impl RaftNode {
 
     // Algorithm 3, HandleRequestVote RPC
     fn handle_request_vote(&mut self, candidate_id: TEEIdentity, args: RequestVoteArgs) -> Vec<RaftEvent> {
+        println!("[HandleRequestVote Node {} Term {} Role {:?}] Args: {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, args);
         let mut vote_granted = false;
         let _persist_term = false; // Prefix unused variable
         let mut persist_vote = false;
@@ -283,6 +351,8 @@ impl RaftNode {
 
     // Handle reply to our vote request (when we are a candidate)
     fn handle_request_vote_reply(&mut self, voter_id: TEEIdentity, reply: RequestVoteReply) -> Vec<RaftEvent> {
+        println!("[HandleVoteReply Node {} Term {} Role {:?}] Reply from {}: {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, voter_id.id, reply);
         if self.state.role != RaftRole::Candidate {
              // println!("Node {}: Received vote reply from {}, but not a candidate. Ignoring.", self.state.id.id, voter_id.id);
             return vec![RaftEvent::Noop];
@@ -314,6 +384,8 @@ impl RaftNode {
 
     // Algorithm 3, HandleAppendEntries RPC
     fn handle_append_entries(&mut self, leader_id: TEEIdentity, args: AppendEntriesArgs) -> Vec<RaftEvent> {
+        println!("[HandleAppendEntries Node {} Term {} Role {:?}] Args from {}: PrevIdx={}, PrevTerm={}, Entries={}, LeaderCommit={}", 
+                 self.state.id.id, self.state.current_term, self.state.role, leader_id.id, args.prev_log_index, args.prev_log_term, args.entries.len(), args.leader_commit);
         let mut success = false;
         let mut mismatch_index: Option<u64> = None;
         let mut match_index: Option<u64> = None;
@@ -427,6 +499,8 @@ impl RaftNode {
 
     // Handle reply to our AppendEntries (when we are leader)
     fn handle_append_entries_reply(&mut self, follower_id: TEEIdentity, reply: AppendEntriesReply) -> Vec<RaftEvent> {
+        println!("[HandleAppendReply Node {} Term {} Role {:?}] Reply from {}: {:?}", 
+                 self.state.id.id, self.state.current_term, self.state.role, follower_id.id, reply);
         if self.state.role != RaftRole::Leader {
              return vec![RaftEvent::Noop];
         }
@@ -460,14 +534,14 @@ impl RaftNode {
                 std::cmp::max(1, current_next.saturating_sub(1))
             });
             self.state.next_index.insert(follower_id.clone(), new_next_index);
-            println!("Node {}: AppendEntries failed from {}. Updated nextIndex to {}. Resending immediately.",
+            println!("Node {}: AppendEntries failed from {}. Updated nextIndex to {}. Will retry on next tick.",
                      self.state.id.id, follower_id.id, new_next_index);
             
-            // Resend AppendEntries immediately
-            return self.send_append_entries_to_peer(&follower_id);
+            // DO NOT Resend AppendEntries immediately. Let the next tick handle it.
+            // return self.send_append_entries_to_peer(&follower_id);
         }
 
-        vec![RaftEvent::Noop]
+        vec![RaftEvent::Noop] // Return Noop in both success and failure cases (after processing)
     }
 
     // Helper function to send AppendEntries to a specific peer
@@ -517,6 +591,7 @@ impl RaftNode {
         let new_entry = LogEntry {
             term: self.state.current_term,
             command,
+            proposal_time: Instant::now(), // Record proposal time
         };
 
         // Append to leader's log
@@ -539,22 +614,66 @@ impl RaftNode {
         let cluster_size = self.peers.len() + 1;
         let majority = (cluster_size / 2) + 1;
 
+        // Sort all match indices (including leader's) to find the majority threshold
         let mut potential_commit_indices: Vec<u64> = self.state.match_index.values().cloned().collect();
-        potential_commit_indices.push(self.state.last_log_index());
+        // Include the leader's own progress (last log index)
+        potential_commit_indices.push(self.state.last_log_index()); 
         potential_commit_indices.sort_unstable();
         potential_commit_indices.reverse();
 
         let majority_threshold_idx = majority.saturating_sub(1);
         if majority_threshold_idx < potential_commit_indices.len() {
             let n = potential_commit_indices[majority_threshold_idx];
+            // Only advance commit_index if the entry at index n is from the current term
+            // and n is greater than the current commit_index.
             if n > self.state.commit_index {
                 if let Some(entry) = self.state.log.get(n as usize - 1) { // 1-based index N
                     if entry.term == self.state.current_term {
-                        println!("Node {}: Updating commitIndex to {} based on majority match.", self.state.id.id, n);
+                        println!("Node {}: Updating commitIndex from {} to {} based on majority match.", 
+                                 self.state.id.id, self.state.commit_index, n);
+                        
+                        let old_commit_index = self.state.commit_index;
                         self.state.commit_index = n;
+
+                        // --- Send Metrics for newly committed entries --- 
+                        /* // Temporarily comment out metrics spawn
+                        if let Some(metrics_tx) = self.metrics_tx.clone() {
+                            // Iterate from the old commit index + 1 up to the new commit index
+                            for i in (old_commit_index + 1)..=self.state.commit_index {
+                                if let Some(committed_entry) = self.state.log.get(i as usize - 1) {
+                                    let latency = committed_entry.proposal_time.elapsed();
+                                    let event = MetricEvent::RaftCommit {
+                                        shard_id: self.shard_id,
+                                        leader_id: self.state.id.clone(),
+                                        latency,
+                                    };
+                                    let metrics_tx_clone = metrics_tx.clone();
+                                    let node_id_clone = self.state.id.clone(); // Clone for async block
+                                    // Send asynchronously
+                                    tokio::spawn(async move {
+                                        if let Err(e) = metrics_tx_clone.send(event).await {
+                                            eprintln!("[RaftNode {}] Failed to send RaftCommit metric for index {}: {}", 
+                                                     node_id_clone.id, i, e);
+                                        }
+                                    });
+                                } else {
+                                    // This shouldn't happen if commit_index logic is correct
+                                     eprintln!("[RaftNode {}] Error: Committed entry at index {} not found in log for metrics!", 
+                                              self.state.id.id, i);
+                                }
+                            }
+                        }
+                        */
+                        // --- End Metrics --- 
+
                     } else {
-                        println!("Node {}: Cannot update commitIndex to {} because log term is different ({})", self.state.id.id, n, entry.term);
+                        // Not safe to commit index n because it's from a previous term
+                        println!("Node {}: Cannot update commitIndex to {} because log term is different ({})", 
+                                 self.state.id.id, n, entry.term);
                     }
+                } else {
+                     // This shouldn't happen if n <= last_log_index
+                     eprintln!("[RaftNode {}] Error: Log entry at potential commit index {} not found!", self.state.id.id, n);
                 }
             }
         }
@@ -591,26 +710,22 @@ mod tests {
     use super::*;
     use crate::config::SystemConfig;
     use crate::data_structures::TEEIdentity;
-    use crate::tee_logic::crypto_sim::generate_keypair; // Import key generation
+    use crate::tee_logic::crypto_sim::{generate_keypair, SecretKey}; // Import key generation and SecretKey
     // Try absolute path from crate root
     use crate::raft::storage::InMemoryStorage;
+    use crate::simulation::metrics::MetricEvent; // Add import for metrics
+    use crate::tee_logic::enclave_sim::{EnclaveSim, TeeDelayConfig}; // Import EnclaveSim and config
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
-    use std::thread;
-    use std::time::Duration;
 
-    // Helper function to create a TEEIdentity
-    fn create_identity(id: u64) -> TEEIdentity {
+    // Helper function to create a TEEIdentity and its SecretKey
+    fn create_identity_with_key(id: u64) -> (TEEIdentity, SecretKey) {
         let keypair = generate_keypair();
-        // Use the helper that generates a key internally, or pass None explicitly
-        let enclave = EnclaveSim::new_with_generated_key(
-            id as usize,
-            Arc::new(TeeDelayConfig::default())
-        );
-        TEEIdentity {
+        let identity = TEEIdentity {
             id: id as usize,
-            public_key: enclave.identity.public_key.clone(),
-        }
+            public_key: keypair.verifying_key(),
+        };
+        (identity, keypair) // Return both identity and secret key
     }
 
     // Helper function to deliver messages between nodes
@@ -620,8 +735,10 @@ mod tests {
         messages: Vec<(TEEIdentity, TEEIdentity, RaftMessage)>, // (sender, recipient, message)
         network: &mut HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>>, // Queue stores (sender, message)
     ) {
+        println!("[TestHarness] deliver_messages: Delivering {} messages", messages.len());
         for (sender_id, recipient_id, msg) in messages {
             if let Some(queue) = network.get_mut(&recipient_id) {
+                println!("[TestHarness] deliver_messages: Queuing msg from {} to {}: {:?}", sender_id.id, recipient_id.id, msg);
                 // Queue the sender ID along with the message
                 queue.push_back((sender_id, msg));
             } else {
@@ -639,19 +756,26 @@ mod tests {
         network: &mut HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>>,
     ) -> Vec<(TEEIdentity, TEEIdentity, RaftMessage)> { // Returns (sender, recipient, message)
         let mut outgoing_messages = Vec::new();
+        println!("[TestHarness] process_network_queue: Checking queue for Node {}", node_id.id);
         if let Some(queue) = network.get_mut(node_id) {
             while let Some((sender_id, msg)) = queue.pop_front() {
+                println!("[TestHarness] process_network_queue: Processing msg for Node {} from {}: {:?}", node_id.id, sender_id.id, msg);
                 if let Some(node_arc) = nodes.get(node_id) {
+                    println!("[TestHarness] process_network_queue: Locking Node {}...", node_id.id);
                     let mut node = node_arc.lock().unwrap();
+                    println!("[TestHarness] process_network_queue: Locked Node {}. Calling handle_message...", node_id.id);
                     // handle_message expects TEEIdentity, sender_id is now TEEIdentity
                     let events = node.handle_message(sender_id, msg);
+                    println!("[TestHarness] process_network_queue: Node {} handle_message returned {} events. Processing events...", node_id.id, events.len());
                     for event in events {
                         match event {
                             RaftEvent::SendMessage(recipient, message) => {
+                                println!("[TestHarness] process_network_queue: Node {} generated SendMessage to {}: {:?}", node_id.id, recipient.id, message);
                                 // Sender is the current node processing the queue
                                 outgoing_messages.push((node_id.clone(), recipient, message));
                             }
                             RaftEvent::BroadcastMessage(message) => {
+                                println!("[TestHarness] process_network_queue: Node {} generated BroadcastMessage: {:?}", node_id.id, message);
                                 for peer_id in node.peers.iter().cloned() {
                                     if &peer_id != node_id { // Compare TEEIdentity directly
                                         // Sender is the current node
@@ -660,86 +784,122 @@ mod tests {
                                 }
                             }
                             RaftEvent::ApplyToStateMachine(commands) => {
+                                println!("[TestHarness] process_network_queue: Node {} generated ApplyToStateMachine ({} commands)", node_id.id, commands.len());
                                 // Use node_id.id which is usize
                                 println!("Node {}: Applying {} commands", node_id.id, commands.len());
                             }
                             RaftEvent::Noop => {}
                         }
                     }
+                    println!("[TestHarness] process_network_queue: Unlocking Node {}...", node_id.id);
+                    // Mutex automatically unlocked here when `node` goes out of scope
+                } else {
+                    println!("[TestHarness] process_network_queue: Node {} Arc not found in map!", node_id.id);
                 }
             }
         }
         outgoing_messages
     }
 
-    #[test]
-    fn test_leader_election_basic() {
+    // Mark test as async tokio test
+    #[tokio::test]
+    async fn test_leader_election_basic() {
+        println!("[TestHarness START] test_leader_election_basic");
         // Use TEEIdentity
-        let node_ids: Vec<TEEIdentity> = (1..=3).map(create_identity).collect();
+        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(create_identity_with_key).collect();
+        let node_ids: Vec<TEEIdentity> = nodes_data.iter().map(|(id, _)| id.clone()).collect();
         let mut nodes: HashMap<TEEIdentity, Arc<Mutex<RaftNode>>> = HashMap::new();
         let mut network: HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>> = HashMap::new();
         let config = SystemConfig::default();
+        let delay_config = Arc::new(TeeDelayConfig::default()); // Create default delay config
+        let (metrics_tx, _metrics_rx) = mpsc::channel::<MetricEvent>(100); // Use bounded channel
 
-        for id in &node_ids {
-            // Use TEEIdentity
+        // 4. Loop to create RaftNode instances
+        println!("[TestHarness SETUP] Starting node creation loop...");
+        for (id, secret_key) in &nodes_data { // <--- Problem could be in this loop
+            println!("[TestHarness SETUP] Creating Node {}...", id.id);
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
-            // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(
-                id.id,
-                None,
-                Arc::new(TeeDelayConfig::default())
+            // No need for EnclaveSim instance here, it's created inside RaftNode::new
+            let node = RaftNode::new(
+                id.clone(),
+                peers,
+                config.clone(),
+                storage,
+                secret_key.clone(), // Pass the actual secret key
+                0, // shard_id (using 0 for tests)
+                delay_config.clone(),
+                Some(metrics_tx.clone())
             );
-            // Pass the enclave to the RaftNode constructor
-            let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
+            println!("[TestHarness SETUP] Node {} RaftNode::new returned. Inserting into map...", id.id);
+             // Insert into maps
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
             network.insert(id.clone(), VecDeque::new());
         }
+        println!("[TestHarness SETUP] Node creation loop finished.");
 
         println!("Simulating Raft ticks and message passing...");
 
-        // Use TEEIdentity
         let mut outgoing_messages: Vec<(TEEIdentity, TEEIdentity, RaftMessage)> = Vec::new();
 
-        for _ in 0..20 { 
+        for i in 0..20 { 
+            println!("\n[TestHarness] Starting Loop Iteration {}", i);
             let mut current_tick_outgoing = Vec::new();
+            
+            println!("[TestHarness] Step 1: deliver_messages ({} messages)", outgoing_messages.len());
             deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
 
+            println!("[TestHarness] Step 2: process_network_queues for all nodes");
             for id in &node_ids {
                 current_tick_outgoing.extend(process_network_queue(id, &mut nodes, &mut network));
             }
 
+            println!("[TestHarness] Step 3: Ticking all nodes");
             for id in &node_ids {
                 if let Some(node_arc) = nodes.get(id) {
+                    println!("[TestHarness] Ticking: Locking Node {}...", id.id);
                     let mut node = node_arc.lock().unwrap();
+                    println!("[TestHarness] Ticking: Locked Node {}. Calling tick()...", id.id);
                     let events = node.tick();
+                    println!("[TestHarness] Ticking: Node {} tick() returned {} events. Processing...", id.id, events.len());
                     for event in events {
                         match event {
                             RaftEvent::SendMessage(recipient, message) => {
+                                println!("[TestHarness] Ticking: Node {} generated SendMessage to {}: {:?}", id.id, recipient.id, message);
                                 current_tick_outgoing.push((id.clone(), recipient, message));
                             }
                             RaftEvent::BroadcastMessage(message) => {
+                                println!("[TestHarness] Ticking: Node {} generated BroadcastMessage: {:?}", id.id, message);
                                 for peer_id in node.peers.iter().cloned() {
-                                    if &peer_id != id { // Compare TEEIdentity directly
+                                    if &peer_id != id {
                                         current_tick_outgoing.push((id.clone(), peer_id, message.clone()));
                                     }
                                 }
                             }
                             RaftEvent::ApplyToStateMachine(commands) => {
+                                println!("[TestHarness] Ticking: Node {} generated ApplyToStateMachine ({} commands)", id.id, commands.len());
                                 // Use id.id which is usize
-                                println!("Node {}: Applying {} commands during tick", id.id, commands.len());
+                                println!("Node {}: Applying {} commands", id.id, commands.len());
                             }
                             RaftEvent::Noop => {}
                         }
                     }
+                    println!("[TestHarness] Ticking: Unlocking Node {}...", id.id);
+                     // Mutex automatically unlocked here
+                } else {
+                    println!("[TestHarness] Ticking: Node {} Arc not found in map!", id.id);
                 }
             }
 
+            println!("[TestHarness] Step 4: Collecting outgoing messages ({} new)", current_tick_outgoing.len());
             outgoing_messages.extend(current_tick_outgoing);
 
+            println!("[TestHarness] Step 5: Checking for leader and potentially sleeping");
             let leader = find_leader(&nodes);
             if leader.is_some() {
-                thread::sleep(Duration::from_millis(config.raft_election_timeout_max_ms / 2)); 
+                println!("[TestHarness] Leader found: {:?}. Waiting to stabilize...", leader.as_ref().unwrap().id);
+                // Use tokio::time::sleep and qualify Duration
+                sleep(tokio::time::Duration::from_millis(config.raft_election_timeout_max_ms / 2)).await;
                 let mut final_tick_outgoing = Vec::new();
                 deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
                 for id in &node_ids {
@@ -755,11 +915,13 @@ mod tests {
                      break;
                 } else {
                      println!("Leader lost after waiting, continuing simulation.");
-                     outgoing_messages.clear();
+                     outgoing_messages.clear(); // Clear messages if leader lost
                 }
             }
-
-            thread::sleep(Duration::from_millis(50)); 
+            println!("[TestHarness] Sleeping for 50ms...");
+            // Use tokio::time::sleep and qualify Duration
+            sleep(tokio::time::Duration::from_millis(50)).await;
+            println!("[TestHarness] End Loop Iteration {}", i);
         }
 
         let leader = find_leader(&nodes);
@@ -800,7 +962,7 @@ mod tests {
                     } else {
                         leader_count += 1;
                         leader_id = None; 
-                        println!("Warning: Multiple leaders detected in term {}", leader_term);
+                        println!("Warning: Potential multiple leaders detected in term {}", leader_term);
                     }
                 }
             }
@@ -815,24 +977,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_log_replication_and_commit() {
-        let node_ids: Vec<TEEIdentity> = (1..=3).map(create_identity).collect();
+    // Mark test as async tokio test
+    #[tokio::test]
+    async fn test_log_replication_and_commit() {
+        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(create_identity_with_key).collect();
+        let node_ids: Vec<TEEIdentity> = nodes_data.iter().map(|(id, _)| id.clone()).collect();
         let mut nodes: HashMap<TEEIdentity, Arc<Mutex<RaftNode>>> = HashMap::new();
         let mut network: HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>> = HashMap::new();
         let config = SystemConfig::default();
+        let delay_config = Arc::new(TeeDelayConfig::default()); // Create default delay config
+        let (metrics_tx, _metrics_rx) = mpsc::channel::<MetricEvent>(100); // Use bounded channel
 
-        for id in &node_ids {
+        for (id, secret_key) in &nodes_data {
             let peers: Vec<TEEIdentity> = node_ids.iter().filter(|&p| p != id).cloned().collect();
             let storage = Box::new(InMemoryStorage::new());
-            // Create an EnclaveSim for this node - EnclaveSim::new now takes usize ID
-            let enclave = EnclaveSim::new(
-                id.id,
-                None,
-                Arc::new(TeeDelayConfig::default())
+             // No need for EnclaveSim instance here, it's created inside RaftNode::new
+            let node = RaftNode::new(
+                id.clone(),
+                peers,
+                config.clone(),
+                storage,
+                secret_key.clone(), // Pass the actual secret key
+                0, // shard_id (using 0 for tests)
+                delay_config.clone(), // Pass delay config
+                Some(metrics_tx.clone()) // Pass metrics_tx
             );
-            // Pass the enclave to the RaftNode constructor
-            let node = RaftNode::new(id.clone(), peers, config.clone(), storage, enclave);
             nodes.insert(id.clone(), Arc::new(Mutex::new(node)));
             network.insert(id.clone(), VecDeque::new());
         }
@@ -909,7 +1078,8 @@ mod tests {
                          }
                      }
                      outgoing_messages.extend(stabilization_outgoing);
-                     thread::sleep(Duration::from_millis(config.raft_heartbeat_ms / 2));
+                     // Use tokio::time::sleep and qualify Duration
+                     sleep(tokio::time::Duration::from_millis(config.raft_heartbeat_ms / 2)).await;
                 }
                  // Final delivery before proposing
                  deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
@@ -919,7 +1089,8 @@ mod tests {
                  leader_id_opt = find_leader(&nodes); // Re-confirm leader
                  if leader_id_opt.is_some() { break; } else { println!("Leader lost during stabilization, continuing..."); }
             }
-            thread::sleep(Duration::from_millis(50));
+            // Use tokio::time::sleep and qualify Duration
+            sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
         assert!(leader_id_opt.is_some(), "No stable leader elected.");
@@ -998,7 +1169,8 @@ mod tests {
                  }
              }
              outgoing_messages.extend(current_tick_outgoing);
-             thread::sleep(Duration::from_millis(config.raft_heartbeat_ms / 2));
+             // Use tokio::time::sleep and qualify Duration
+             sleep(tokio::time::Duration::from_millis(config.raft_heartbeat_ms / 2)).await;
 
              // Check if commit index has advanced on the leader
              let leader_commit_index = nodes.get(&leader_id).unwrap().lock().unwrap().state.commit_index;
@@ -1043,19 +1215,28 @@ mod tests {
          println!("Log replication and commit test passed.");
     }
 
-    #[test]
-    fn test_propose_command_as_leader() {
+    // Mark test as async tokio test
+    #[tokio::test]
+    async fn test_propose_command_as_leader() {
         // Manual setup for a single node
         let config = SystemConfig::default();
-        let node_id = create_identity(1); // Use helper from the same test module
+        let (node_id, secret_key) = create_identity_with_key(1); // Use helper
         let peers = Vec::new(); // No peers for this simple test
         let storage = Box::new(InMemoryStorage::new());
-        let enclave = EnclaveSim::new(
-            node_id.id,
-            None,
-            Arc::new(TeeDelayConfig::default())
-        ); 
-        let mut node = RaftNode::new(node_id.clone(), peers, config, storage.clone(), enclave); 
+         // No need for EnclaveSim instance here, it's created inside RaftNode::new
+        let delay_config = Arc::new(TeeDelayConfig::default()); // Create default delay config
+        let (metrics_tx, _metrics_rx) = mpsc::channel::<MetricEvent>(100); // Use bounded channel
+
+        let mut node = RaftNode::new(
+            node_id.clone(),
+            peers,
+            config,
+            storage, // Remove clone, RaftNode takes ownership
+            secret_key.clone(), // Pass the actual secret key
+            0, // shard_id
+            delay_config.clone(), // Pass delay config
+            Some(metrics_tx) // Pass metrics_tx
+        );
 
         node.state.role = RaftRole::Leader; // Force leader state
         let prev_log_index = node.state.last_log_index();
@@ -1064,7 +1245,7 @@ mod tests {
         let command_to_propose = Command::Dummy; // Use Dummy variant
         let events = node.propose_command(command_to_propose.clone()); 
 
-        // Assertions for a leader with NO peers:
+        // No async operations needed for the assertions themselves
         assert_eq!(events.len(), 0, "Leader with no peers should not generate network events on propose");
 
         let new_log_index = node.state.last_log_index();

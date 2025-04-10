@@ -5,6 +5,8 @@ pub mod runtime;
 pub mod coordinator;
 pub mod mocks;
 pub mod config;
+pub mod network;
+pub mod metrics;
 
 // Re-export key simulation components
 pub use node::SimulatedTeeNode;
@@ -13,13 +15,19 @@ pub use coordinator::CoordinatorCommand;
 pub use config::SimulationConfig;
 
 use crate::data_structures::TEEIdentity;
-use crate::tee_logic::crypto_sim::{generate_keypair, SecretKey};
+use crate::tee_logic::crypto_sim::generate_keypair;
 use crate::liveness::{challenger::Challenger, aggregator::Aggregator};
-use crate::liveness::types::{LivenessConfig as LivenessSystemConfig, ChallengeNonce};
-use crate::cross_chain::swap_coordinator::CrossChainCoordinator; // Assuming this will be refactored
-use crate::raft::storage::InMemoryStorage;
+use crate::liveness::types::LivenessConfig as LivenessSystemConfig;
+ // Assuming this will be refactored
 use crate::config::SystemConfig as NodeSystemConfig; // Rename to avoid clash
-use crate::tee_logic::enclave_sim::EnclaveSim;
+use crate::simulation::node::{NodeProposalRequest, NodeQuery};
+// Correct imports for mocks
+use crate::network::MockNetwork;
+use crate::simulation::mocks::MockBlockchainInterface; // Use this mock
+use crate::shard_manager::PartitionMapping;
+use crate::simulation::coordinator::SimulatedCoordinator;
+use crate::tee_logic::crypto_sim::SecretKey; // Corrected Import Path
+use rand::rngs::OsRng;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +49,9 @@ impl Simulation {
     /// Builds the simulation environment based on the provided configuration.
     pub async fn build(config: SimulationConfig) -> Self {
         // Create runtime first
-        let (runtime, _result_rx, attestation_rx_agg_to_runtime, _isolation_rx_agg) = SimulationRuntime::new(config.clone());
-        let config_arc = runtime.get_config(); // Get Arc<SimulationConfig>
+        let (runtime, _result_rx, _isolation_rx_agg_to_runtime, _metrics_handle) = 
+            SimulationRuntime::new(config.clone());
+        let _config_arc = runtime.get_config(); // Prefix unused config_arc
 
         let mut node_handles = Vec::new();
         let mut coordinator_handles = Vec::new();
@@ -95,7 +104,7 @@ impl Simulation {
                     break;
                 }
             }
-            runtime.assign_nodes_to_shard(shard_id, nodes_in_shard.clone());
+            runtime.assign_nodes_to_shard(shard_id, nodes_in_shard.clone()).await;
             shard_assignments.insert(shard_id, nodes_in_shard);
         }
 
@@ -105,7 +114,7 @@ impl Simulation {
             let node_id = identity.id;
             let signing_key = all_tee_keys.get(&node_id).expect("Node key must exist").clone();
 
-            // Determine peers for this node
+            // Determine shard_id and peers for this node
             let shard_id = shard_assignments.iter()
                 .find_map(|(sid, nodes)| if nodes.contains(identity) { Some(*sid) } else { None })
                 .expect("Node must belong to a shard");
@@ -114,28 +123,26 @@ impl Simulation {
                 .cloned()
                 .collect();
 
-            // Create channels for this node
-            let (raft_tx_for_runtime_reg, raft_rx_for_node) = mpsc::channel(100);
-            let (proposal_tx_for_runtime_reg, _proposal_rx_for_node) = mpsc::channel(100);
-            let (challenge_tx_for_runtime_reg, challenge_rx_for_node) = mpsc::channel(100);
+            // Create proposal/query channels for this node
+            let (proposal_tx, proposal_rx) = mpsc::channel::<NodeProposalRequest>(10);
+            let (query_tx, query_rx) = mpsc::channel::<NodeQuery>(10);
 
-            // Register senders with the runtime
-            runtime.register_node(
-                identity.clone(),
-                raft_tx_for_runtime_reg, 
-                proposal_tx_for_runtime_reg, 
-                challenge_tx_for_runtime_reg.clone(),
-            );
+            // Register the node with the runtime
+            let network_rx = runtime.register_node(identity.clone(), proposal_tx.clone()).await;
 
-            // Create the node instance with 7 arguments
+            // Now create the node, passing all channels AND shard_id
             let node = SimulatedTeeNode::new(
-                identity.clone(),
+                identity.clone(), 
                 signing_key, 
-                peers,
+                peers, 
                 node_sys_config.clone(), 
                 runtime.clone(),
-                challenge_rx_for_node,     // 6: Node receives challenges on this Receiver
-                challenge_tx_for_runtime_reg, // 7: Node might send challenges? (Matches Sender type)
+                network_rx, // Pass receiver from runtime
+                proposal_tx, // Pass proposal sender
+                proposal_rx, // Pass proposal receiver
+                query_tx,    // Pass query sender
+                query_rx,    // Pass query receiver
+                shard_id,    // Pass the determined shard_id
             );
 
             // Spawn the node's main loop
@@ -148,12 +155,43 @@ impl Simulation {
 
         // 4. Instantiate and Spawn Coordinator Tasks (Placeholder/Needs Refactor)
         log::info!("Spawning {} Coordinator tasks...", config.num_coordinators);
-        // ... existing coordinator placeholder logic ...
-        log::warn!("Coordinator task spawning is placeholder - requires refactoring CrossChainCoordinator and runtime interface implementations.");
+        for i in 0..config.num_coordinators {
+            if let Some(identity) = coordinator_identities.get(i) {
+                let secret_key = all_tee_keys.get(&identity.id).expect("Coordinator key must exist").clone();
+                let coordinator_runtime = runtime.clone(); // Clone runtime for coordinator
+                let metrics_tx_clone = runtime.get_metrics_sender(); // Get metrics sender
+
+                // NOTE: This part uses MockNetwork and needs full refactor for EmulatedNetwork
+                let mock_network = Arc::new(MockNetwork::new()); 
+                let mock_relayer = Arc::new(MockBlockchainInterface::new()); // Replace with actual relayer later
+                let partition_mapping = PartitionMapping::new(); // Example, needs real mapping
+
+                let coordinator = SimulatedCoordinator::new(
+                    identity.clone(),
+                    secret_key,
+                    node_sys_config.clone(), // Using the node config for now
+                    coordinator_runtime,
+                    mock_relayer, // Using mock relayer
+                    partition_mapping,
+                    metrics_tx_clone, // Pass the metrics sender
+                );
+
+                // Spawn coordinator task(s) - Placeholder, needs run methods
+                let coord_handle = tokio::spawn(async move {
+                    log::warn!("SimulatedCoordinator run loop not implemented!");
+                    // coordinator.run_command_listener(...).await;
+                    // coordinator.run_share_listener(...).await;
+                });
+                coordinator_handles.push(coord_handle);
+            } else {
+                log::error!("Could not get identity for coordinator index {}", i);
+            }
+        }
+        // log::warn!("Coordinator task spawning is placeholder - requires refactoring CrossChainCoordinator and runtime interface implementations.");
 
         // 5. Instantiate and Spawn Liveness Tasks
         log::info!("Spawning Liveness Challenger and Aggregator tasks...");
-        if let (Some(challenger_id), Some(aggregator_id)) = (challenger_identity.clone(), aggregator_identity.clone()) {
+        if let (Some(challenger_id), Some(_aggregator_id)) = (challenger_identity.clone(), aggregator_identity.clone()) {
             // 5.1 Create LivenessSystemConfig from SimulationConfig
             let liveness_config = LivenessSystemConfig {
                 tee_delays: config.tee_delays.clone(),
@@ -170,24 +208,30 @@ impl Simulation {
 
             // --- Aggregator --- 
             let (challenge_tx_for_agg, challenge_rx_for_agg) = mpsc::channel(100); // Aggregator listens for challenges issued by Challenger
-            // Aggregator::new takes 4 arguments now: config, nodes, runtime, challenge_rx
+            // Aggregator::new takes 6 arguments now
             // It returns a tuple: (Aggregator, mpsc::Receiver<ChallengeNonce>)
+            let metrics_tx_agg = runtime.get_metrics_sender(); // Get metrics sender
+            let aggregator_id = aggregator_identity.clone().unwrap(); 
             let (aggregator, _challenge_rx_returned) = Aggregator::new(
-                liveness_config.clone(), // 1st: config
-                node_identities.clone(), // 2nd: initial nodes
-                runtime.clone(),         // 3rd: runtime
-                challenge_rx_for_agg,    // 4th: challenge receiver (Aggregator needs this to listen)
+                aggregator_id,           // 1st: identity
+                liveness_config.clone(), // 2nd: config
+                node_identities.clone(), // 3rd: initial nodes
+                runtime.clone(),         // 4th: runtime
+                Some(metrics_tx_agg),    // 5th: metrics sender
+                challenge_rx_for_agg,    // 6th: challenge receiver
             );
             // We capture the returned receiver but might not need it immediately,
             // as run_challenge_listener takes the original 'challenge_rx_for_agg'.
 
             let aggregator_arc = Arc::new(aggregator); // Wrap the instance from the tuple
             // Aggregator needs the receiver for attestations FROM the runtime
-            let agg_attestation_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_attestation_listener(attestation_rx_agg_to_runtime));
+            // TODO: Refactor Aggregator to receive attestations via EmulatedNetwork
+            // Commenting out listener spawn for now as it uses the wrong channel type
+            // let agg_attestation_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_attestation_listener(???)); 
             let agg_timeout_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_timeout_checker());
             // Spawn challenge listener with the original receiver channel
             let agg_challenge_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_challenge_listener(_challenge_rx_returned)); // Use the returned rx here
-            liveness_handles.push(agg_attestation_listener_handle);
+            // liveness_handles.push(agg_attestation_listener_handle);
             liveness_handles.push(agg_timeout_handle);
             liveness_handles.push(agg_challenge_listener_handle);
 

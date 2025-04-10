@@ -1,17 +1,24 @@
 // teeshard-protocol/src/simulation/runtime.rs
 use crate::{
     data_structures::TEEIdentity,
-    liveness::types::{ChallengeNonce, LivenessAttestation}, // Import liveness types
+    liveness::types::LivenessAttestation, // Removed ChallengeNonce, NonceChallenge will be imported separately or confirmed
     raft::{messages::RaftMessage, state::Command}, // Import Command
     tee_logic::types::{LockProofData, Signature},
     simulation::node::NodeProposalRequest, // Import NodeProposalRequest
     simulation::config::SimulationConfig, // Import the new SimulationConfig
+    network::{NetworkInterface, NetworkMessage, Message}, // Import Message enum
+    simulation::network::EmulatedNetwork, // Import EmulatedNetwork
+    simulation::metrics::{MetricsCollector, MetricEvent},
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot}; // Import oneshot
-use futures;
+use std::sync::{Arc}; // Remove std Mutex import
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex}; // Add TokioMutex
+use log::{debug, warn, error}; // Import log macros
 use std::collections::HashSet;
+use crate::liveness::types::NonceChallenge; // Import specifically
+ // Need this for Message::LivenessResponse
+use std::time::Duration; // Add Duration import
+ // Import std::sync::Mutex
 
 // Type for results sent back from nodes (e.g., signature shares)
 // Tuple: (Signer Identity, Data Signed (e.g., LockProofData), Signature)
@@ -22,22 +29,32 @@ pub type SignatureShare = (TEEIdentity, LockProofData, Signature); // Use Signat
 #[derive(Clone, Debug)]
 pub struct SimulationRuntime {
     // Simulation Configuration
-    config: Arc<SimulationConfig>, // Store the config
+    config: Arc<SimulationConfig>,
+    // Emulated Network Interface
+    network: Arc<EmulatedNetwork>,
 
-    // Map Node ID -> Sender channel for RaftMessages
-    node_raft_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<(TEEIdentity, RaftMessage)>>>>,
-    // NEW: Map Node ID -> Sender channel for Command Proposals
-    node_proposal_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<NodeProposalRequest>>>>,
-    // Map Node ID -> Sender channel for Liveness Challenges
-    node_challenge_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<ChallengeNonce>>>>,
-    // Map Shard ID -> List of Node Identities in that shard
-    shard_assignments: Arc<Mutex<HashMap<usize, Vec<TEEIdentity>>>>,
-    // Channel for nodes to send results (e.g., signature shares) back to the test/coordinator
+    // Map Node ID -> Full TEEIdentity (needed for constructing NetworkMessage)
+    node_identities: Arc<TokioMutex<HashMap<usize, TEEIdentity>>>,
+    // Identity of the registered Aggregator (if any)
+    aggregator_identity: Arc<TokioMutex<Option<TEEIdentity>>>,
+
+    // --- Channels for INTERNAL Runtime -> Node communication (e.g., command proposal) ---
+    // These might not go through the EmulatedNetwork
+    node_proposal_senders: Arc<TokioMutex<HashMap<usize, mpsc::Sender<NodeProposalRequest>>>>,
+
+    // --- Channels for Component -> Runtime communication (results, reports) ---
     result_tx: mpsc::Sender<SignatureShare>,
-    // Channel for Aggregator to receive Liveness Attestations
-    aggregator_attestation_tx: Arc<Mutex<Option<mpsc::Sender<LivenessAttestation>>>>,
-    // Channel for Aggregator to report isolated node IDs
     isolation_report_tx: mpsc::Sender<Vec<usize>>,
+    metrics_tx: mpsc::Sender<MetricEvent>,
+
+    // --- Component Registration State (managed by Runtime) ---
+    shard_assignments: Arc<TokioMutex<HashMap<usize, Vec<TEEIdentity>>>>,
+
+    // --- OBSOLETE? Channels previously used for direct Runtime -> Component message sending ---
+    // These will likely be replaced by sending via EmulatedNetwork
+    // node_raft_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<(TEEIdentity, RaftMessage)>>>>,
+    // node_challenge_senders: Arc<Mutex<HashMap<usize, mpsc::Sender<ChallengeNonce>>>>,
+    aggregator_attestation_tx: Arc<TokioMutex<Option<mpsc::Sender<LivenessAttestation>>>>,
 }
 
 impl SimulationRuntime {
@@ -45,28 +62,52 @@ impl SimulationRuntime {
     pub fn new(config: SimulationConfig) -> (
         Self, 
         mpsc::Receiver<SignatureShare>, 
-        mpsc::Receiver<LivenessAttestation>, 
         mpsc::Receiver<Vec<usize>>, // Return Vec<usize> receiver
+        tokio::task::JoinHandle<Vec<MetricEvent>>, // Return JoinHandle for metrics collector
     ) {
         let (result_tx, result_rx) = mpsc::channel(100);
-        let (attestation_tx, attestation_rx) = mpsc::channel(100);
-        // Create channel for isolation reports (Vec<usize>)
-        let (isolation_tx, isolation_rx): (mpsc::Sender<Vec<usize>>, mpsc::Receiver<Vec<usize>>) = mpsc::channel(10); 
+        let (isolation_tx, isolation_rx) = mpsc::channel(100); // For isolation reports (Vec<usize>)
+        // Create channel for metrics
+        let (metrics_tx, metrics_rx) = mpsc::channel(1000); // Buffer size 1000
+        // Create MetricsCollector instance with the receiver
+        let mut metrics_collector = MetricsCollector::new(metrics_rx);
+
+        let config_arc = Arc::new(config);
+        let network = Arc::new(EmulatedNetwork::new(Arc::clone(&config_arc)));
 
         let runtime = SimulationRuntime {
-            config: Arc::new(config), // Store the config in an Arc
-            node_raft_senders: Arc::new(Mutex::new(HashMap::new())),
-            node_proposal_senders: Arc::new(Mutex::new(HashMap::new())),
-            node_challenge_senders: Arc::new(Mutex::new(HashMap::new())), // Initialize new map
-            shard_assignments: Arc::new(Mutex::new(HashMap::new())),
+            config: config_arc,
+            network, // Store the emulated network
+            node_identities: Arc::new(TokioMutex::new(HashMap::new())), // Initialize map
+            aggregator_identity: Arc::new(TokioMutex::new(None)), // Initialize aggregator identity
+
+            // Keep internal command proposal channel map
+            node_proposal_senders: Arc::new(TokioMutex::new(HashMap::new())),
+
+            // Keep result/report channels
             result_tx,
-            // Store the sender end for attestations
-            aggregator_attestation_tx: Arc::new(Mutex::new(Some(attestation_tx))),
-            isolation_report_tx: isolation_tx, // Store Vec<usize> sender
+            isolation_report_tx: isolation_tx,
+            metrics_tx: metrics_tx.clone(), // Store the metrics sender
+
+            // Keep shard assignments map
+            shard_assignments: Arc::new(TokioMutex::new(HashMap::new())),
+
+            // Remove obsolete direct senders
+            // node_raft_senders: Arc::new(Mutex::new(HashMap::new())),
+            // node_challenge_senders: Arc::new(Mutex::new(HashMap::new())),
+            aggregator_attestation_tx: Arc::new(TokioMutex::new(None)),
         };
 
-        // Return runtime and Vec<usize> receiver
-        (runtime, result_rx, attestation_rx, isolation_rx)
+        // Spawn the metrics collector task
+        let metrics_handle = tokio::spawn(async move {
+            metrics_collector.run().await;
+            // Once the run loop finishes (sender dropped), return the collected events
+            // Await the async function first, then clone the result
+            metrics_collector.get_collected_events().await.clone() 
+        });
+
+        // Return runtime, receivers, and the metrics collector handle
+        (runtime, result_rx, isolation_rx, metrics_handle)
     }
 
     /// Returns a clone of the simulation configuration.
@@ -74,111 +115,164 @@ impl SimulationRuntime {
         Arc::clone(&self.config)
     }
 
-    /// Registers a node's communication channels.
-    pub fn register_node(
+    /// Returns a clone of the sender channel for metric events.
+    pub fn get_metrics_sender(&self) -> mpsc::Sender<MetricEvent> {
+        self.metrics_tx.clone()
+    }
+
+    /// Registers a node's communication channels and returns the receiver for network messages.
+    pub async fn register_node(
         &self, 
         identity: TEEIdentity, 
-        raft_sender: mpsc::Sender<(TEEIdentity, RaftMessage)>,
         proposal_sender: mpsc::Sender<NodeProposalRequest>,
-        challenge_sender: mpsc::Sender<ChallengeNonce>, // Add challenge sender
-    ) {
+        // challenge_sender: mpsc::Sender<ChallengeNonce> // Removed challenge sender - handled separately if needed
+    ) -> mpsc::Receiver<NetworkMessage> { // Return the network receiver
+        
         let node_id = identity.id;
-        self.node_raft_senders.lock().unwrap().insert(node_id, raft_sender);
-        println!("[Runtime] Registered Raft sender for Node {}", node_id);
-        self.node_proposal_senders.lock().unwrap().insert(node_id, proposal_sender);
-        println!("[Runtime] Registered Proposal sender for Node {}", node_id);
-        // Register challenge sender
-        self.node_challenge_senders.lock().unwrap().insert(node_id, challenge_sender);
-        println!("[Runtime] Registered Challenge sender for Node {}", node_id);
+        // Store node identity
+        self.node_identities.lock().await.insert(node_id, identity.clone());
+
+        // Create the channel for the node to receive NetworkMessages
+        let (network_tx, network_rx) = mpsc::channel::<NetworkMessage>(100); // Use a reasonable buffer size
+
+        // Register the sender side with the emulated network
+        let network_interface = self.network.clone();
+        let identity_clone = identity.clone();
+        tokio::spawn(async move {
+            network_interface.register_recipient(identity_clone, network_tx).await;
+        });
+
+        // Store other senders associated with the node
+        let mut proposal_senders = self.node_proposal_senders.lock().await;
+        proposal_senders.insert(identity.id, proposal_sender);
+        // Removed challenge sender storage
+        // let mut challenge_senders = self.node_challenge_senders.lock().unwrap();
+        // challenge_senders.insert(identity.id, challenge_sender);
+
+        debug!("[Runtime] Registered node {} channels.", identity.id);
+        network_rx // Return the receiver end for the node
     }
 
-    /// Registers the Aggregator's attestation receiving channel.
-    pub fn register_aggregator(&self, attestation_sender: mpsc::Sender<LivenessAttestation>) {
-        // This might overwrite if called multiple times, consider alternatives if needed.
-        println!("[Runtime] Registering Aggregator attestation channel.");
-        *self.aggregator_attestation_tx.lock().unwrap() = Some(attestation_sender);
+    /// Registers an Aggregator's attestation channel.
+    pub async fn register_aggregator(&self, attestation_sender: mpsc::Sender<LivenessAttestation>) {
+        // Use .lock().await for Tokio Mutex
+        *self.aggregator_attestation_tx.lock().await = Some(attestation_sender);
     }
 
-    // --- Add method to take the aggregator sender (for the aggregator task) --- 
-    // This prevents the runtime from holding a sender that the aggregator needs to receive from.
-    pub fn take_aggregator_attestation_sender(&self) -> Option<mpsc::Sender<LivenessAttestation>> {
-        self.aggregator_attestation_tx.lock().unwrap().take()
+    /// Registers a generic component (like Aggregator or Coordinator) with the network.
+    pub async fn register_component(&self, identity: TEEIdentity, network_message_sender: mpsc::Sender<NetworkMessage>) {
+        let id = identity.id;
+        // Store identity if it's the aggregator (based on configuration or a dedicated field)
+        // TODO: Determine how to reliably identify the aggregator identity
+        // For now, assume any non-node registering might be the aggregator
+        let is_aggregator = { // Example logic - needs refinement
+            let nodes = self.node_identities.lock().await;
+            !nodes.contains_key(&id)
+        };
+        if is_aggregator {
+             println!("[Runtime] Storing identity for potential Aggregator: {}", id);
+             *self.aggregator_identity.lock().await = Some(identity.clone());
+        }
+        // Register with the network
+        self.network.register_recipient(identity, network_message_sender).await;
     }
 
-    /// Routes a RaftMessage from a sender to a specific target node.
+    /// Routes a RaftMessage from a sender node to a specific target node via the EmulatedNetwork.
     pub async fn route_message(&self, sender_identity: TEEIdentity, target_node_id: usize, message: RaftMessage) {
-        let target_sender = {
-            // Lock, clone the sender if found, and immediately drop the guard
-            let senders = self.node_raft_senders.lock().unwrap();
-            senders.get(&target_node_id).cloned()
-            // guard is dropped here
+        // Get the full TEEIdentity of the target node
+        let target_identity = {
+            let identities = self.node_identities.lock().await;
+            identities.get(&target_node_id).cloned()
         };
 
-        if let Some(sender) = target_sender {
-            // println!("[Runtime] Routing message from Node {} to Node {}: {:?}", sender_identity.id, target_node_id, message);
-            if let Err(e) = sender.send((sender_identity, message)).await { // Await happens *after* lock is released
-                eprintln!("[Runtime] Error sending message to Node {}: {}", target_node_id, e);
-            }
+        if let Some(receiver_identity) = target_identity {
+            let network_msg = NetworkMessage {
+                sender: sender_identity,
+                receiver: receiver_identity,
+                message: Message::from(message), // Correct field name: message
+            };
+            debug!("[Runtime] Sending network message from {} to {}: {:?}", 
+                   network_msg.sender.id, network_msg.receiver.id, network_msg.message); // Log the message
+            self.network.send_message(network_msg); // Send via emulated network
         } else {
-            println!("[Runtime] Warning: No Raft sender found for target Node {}. Message dropped.", target_node_id);
+            warn!("[Runtime] Warning: No identity found for target Node {}. Cannot route message.", target_node_id);
         }
     }
 
-    /// Broadcasts a RaftMessage from a sender to all registered nodes (except sender).
-    pub async fn broadcast_message(&self, sender_identity: TEEIdentity, message: RaftMessage) {
-        let channels_to_send: Vec<(usize, mpsc::Sender<(TEEIdentity, RaftMessage)>)> = {
-            // Lock, collect cloned senders, drop guard
-            let senders = self.node_raft_senders.lock().unwrap();
-            senders.iter()
-                 .filter(|(node_id, _)| **node_id != sender_identity.id)
-                 .map(|(node_id, tx)| (*node_id, tx.clone()))
-                 .collect()
-            // guard is dropped here
-        };
+    /// Broadcasts a RaftMessage to all nodes *except* the sender.
+    pub async fn broadcast_message(&self, sender: TEEIdentity, message: RaftMessage) {
+        // Lock the node identities map once to get all potential recipients
+        let identities_map = self.node_identities.lock().await; // Use unwrap() for std::sync::Mutex
+        let all_recipient_identities: Vec<TEEIdentity> = identities_map.values().cloned().collect();
+        // Drop the lock quickly
+        drop(identities_map);
 
-        // println!("[Runtime] Broadcasting message from Node {}: {:?}", sender_identity.id, message);
-        for (node_id, sender) in channels_to_send {
-            // Clone message and sender_identity for each send task
-            let msg_clone = message.clone();
-            let sender_clone = sender_identity.clone();
-            // Await happens after lock release, within the loop/spawned task if using spawn
-            if let Err(e) = sender.send((sender_clone, msg_clone)).await {
-                 eprintln!("[Runtime] Error broadcasting message to Node {}: {}", node_id, e);
-            }
-            // Original implementation used spawn, which is fine too, but direct await works
-            // send_futures.push(tokio::spawn(async move { ... sender.send(...).await ... }));
+        let message_payload = Message::from(message); // Use From trait
+
+        for recipient_identity in all_recipient_identities {
+            // Don't send back to self
+            if recipient_identity.id == sender.id { continue; }
+
+            let network_msg = NetworkMessage {
+                sender: sender.clone(),
+                receiver: recipient_identity, 
+                message: message_payload.clone(), // Correct field name: message
+            };
+            // Use the generic send_message which handles queuing/delay
+            self.network.send_message(network_msg); 
         }
-        // if using spawn: futures::future::join_all(send_futures).await;
     }
 
-    /// Routes a Liveness Challenge to a specific target node.
-    pub async fn route_challenge(&self, target_node_id: usize, challenge: ChallengeNonce) {
-        let target_sender = {
-            let senders = self.node_challenge_senders.lock().unwrap();
-            senders.get(&target_node_id).cloned()
+    /// Routes a Liveness Challenge to a specific target node via the EmulatedNetwork.
+    pub async fn route_challenge(&self, target_node_id: usize, challenge: NonceChallenge) {
+        // Get sender identity (Should be the Liveness Aggregator)
+        let sender_identity = {
+            self.aggregator_identity.lock().await.clone() // Clone the Option<TEEIdentity>
         };
 
-        if let Some(sender) = target_sender {
-            // println!("[Runtime] Routing challenge to Node {}: {:?}", target_node_id, challenge);
-            if let Err(e) = sender.send(challenge).await { 
-                eprintln!("[Runtime] Error sending challenge to Node {}: {}", target_node_id, e);
+        // Ensure aggregator identity is set
+        let actual_sender = match sender_identity {
+            Some(id) => id,
+            None => {
+                warn!("[Runtime] Cannot route challenge: Liveness Aggregator identity not yet registered.");
+                return; // Cannot send without sender
             }
+        };
+
+        // Get the full TEEIdentity of the target node
+        let target_identity = {
+            let identities = self.node_identities.lock().await;
+            identities.get(&target_node_id).cloned()
+        };
+
+        if let Some(receiver_identity) = target_identity {
+            let network_msg = NetworkMessage {
+                sender: actual_sender, // Use the retrieved aggregator identity
+                receiver: receiver_identity,
+                message: Message::from(challenge), // Convert NonceChallenge to Message enum
+            };
+            debug!("[Runtime] Sending Liveness Challenge from Aggregator {} to Node {}: {:?}", 
+                   network_msg.sender.id, network_msg.receiver.id, network_msg.message);
+            self.network.send_message(network_msg); // Send via emulated network
         } else {
-            println!("[Runtime] Warning: No challenge sender found for target Node {}. Challenge dropped.", target_node_id);
+            warn!("[Runtime] Warning: No identity found for target Node {}. Cannot route challenge.", target_node_id);
         }
     }
 
-    /// Forwards a Liveness Attestation from a node to the registered Aggregator.
+    /// Forwards a liveness attestation directly to the registered aggregator's channel.
     pub async fn forward_attestation_to_aggregator(&self, attestation: LivenessAttestation) {
-        let agg_sender_opt = {
-            self.aggregator_attestation_tx.lock().unwrap().clone()
-        };
-        if let Some(sender) = agg_sender_opt {
-             if let Err(e) = sender.send(attestation).await {
-                 eprintln!("[Runtime] Failed to forward attestation to aggregator: {}. Receiver likely dropped.", e);
+        // Lock the Tokio Mutex using .lock().await
+        let maybe_sender_guard = self.aggregator_attestation_tx.lock().await;
+        if let Some(sender) = maybe_sender_guard.as_ref() {
+            // Sender is cloned within the guard, guard dropped before await
+            let sender_clone = sender.clone();
+            drop(maybe_sender_guard);
+            if let Err(e) = sender_clone.send(attestation).await {
+                error!("[Runtime] Failed to forward attestation to aggregator: {}", e);
             }
         } else {
-             println!("[Runtime] Warning: No aggregator attestation channel registered. Attestation dropped.");
+            // Guard is dropped automatically here
+            warn!("[Runtime] Aggregator attestation channel not registered. Cannot forward attestation.");
         }
     }
 
@@ -190,48 +284,41 @@ impl SimulationRuntime {
     }
 
     /// Assigns a list of nodes to a specific shard ID.
-    pub fn assign_nodes_to_shard(&self, shard_id: usize, nodes: Vec<TEEIdentity>) {
-        let mut assignments = self.shard_assignments.lock().unwrap();
+    pub async fn assign_nodes_to_shard(&self, shard_id: usize, nodes: Vec<TEEIdentity>) {
+        let mut assignments = self.shard_assignments.lock().await;
         println!("[Runtime] Assigning nodes {:?} to Shard {}", nodes.iter().map(|n| n.id).collect::<Vec<_>>(), shard_id);
         assignments.insert(shard_id, nodes);
     }
 
-    /// Sends a command proposal to all nodes within a specific shard.
+    /// Sends a command directly to the Raft leader of a specific shard.
     pub async fn send_command_to_shard(&self, shard_id: usize, command: Command) {
-        let node_identities_in_shard = {
-            let assignments = self.shard_assignments.lock().unwrap();
-            match assignments.get(&shard_id) {
-                Some(nodes) => nodes.clone(),
-                None => {
-                    eprintln!("[Runtime] Error: Cannot send command to non-existent Shard {}", shard_id);
-                    return;
+        let proposal_senders = self.node_proposal_senders.lock().await;
+        let shard_nodes = self.shard_assignments.lock().await;
+
+        if let Some(nodes_in_shard) = shard_nodes.get(&shard_id) {
+            if let Some(leader_identity) = nodes_in_shard.get(0) { // Simple: assume first node is leader for now
+                if let Some(leader_sender) = proposal_senders.get(&leader_identity.id) {
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    if leader_sender.send((command, resp_tx)).await.is_ok() {
+                        debug!("[Runtime] Sent command to potential leader {} of shard {}.", leader_identity.id, shard_id);
+                        // Optionally wait for response/ack from leader via resp_rx
+                        match tokio::time::timeout(Duration::from_secs(1), resp_rx).await {
+                            Ok(Ok(Ok(events))) => debug!("[Runtime] Leader {} acked proposal. Events: {:?}", leader_identity.id, events),
+                            Ok(Ok(Err(e))) => warn!("[Runtime] Leader {} rejected proposal: {}", leader_identity.id, e),
+                            Ok(Err(_)) => warn!("[Runtime] Leader {} proposal response channel closed.", leader_identity.id),
+                            Err(_) => warn!("[Runtime] Timeout waiting for leader {} proposal ack.", leader_identity.id),
+                        }
+                    } else {
+                        warn!("[Runtime] Failed to send command to potential leader {} channel (closed?).", leader_identity.id);
+                    }
+                } else {
+                    warn!("[Runtime] Leader node {} for shard {} not found in proposal senders.", leader_identity.id, shard_id);
                 }
+            } else {
+                 warn!("[Runtime] No nodes found for shard {}. Cannot send command.", shard_id);
             }
-            // guard dropped here
-        };
-
-        let senders_to_use: Vec<(usize, mpsc::Sender<NodeProposalRequest>)> = {
-            // Lock, collect cloned senders, drop guard
-            let senders_map = self.node_proposal_senders.lock().unwrap();
-            node_identities_in_shard.iter()
-                .filter_map(|identity| 
-                    senders_map.get(&identity.id).map(|sender| (identity.id, sender.clone()))
-                )
-                .collect()
-             // guard dropped here
-        };
-
-        println!("[Runtime] Sending command proposal {:?} to Shard {} (Nodes: {:?})", 
-                 command, shard_id, senders_to_use.iter().map(|(id,_)| id).collect::<Vec<_>>());
-
-        for (identity_id, sender) in senders_to_use {
-            let (ack_tx, _ack_rx) = oneshot::channel();
-            let proposal: NodeProposalRequest = (command.clone(), ack_tx);
-            // Await happens after lock release
-            if let Err(e) = sender.send(proposal).await { 
-                eprintln!("[Runtime] Error sending command proposal to Node {}: {}", identity_id, e);
-            }
-            // Removed warning about missing sender here, handled by filter_map above
+        } else {
+            warn!("[Runtime] Shard ID {} not found in assignments. Cannot send command.", shard_id);
         }
     }
 
@@ -244,35 +331,19 @@ impl SimulationRuntime {
 
          let isolated_set: HashSet<usize> = isolated_node_ids.iter().cloned().collect();
 
-         // Remove senders (Use .lock().unwrap() for std::sync::Mutex)
-         {
-            let mut raft_senders = self.node_raft_senders.lock().unwrap(); // Use unwrap()
-            for node_id in &isolated_node_ids {
-                if raft_senders.remove(node_id).is_some() {
-                    println!("[Runtime] Removed Raft sender for isolated node {}", node_id);
-                }
-            }
-         } 
-         {
-            let mut proposal_senders = self.node_proposal_senders.lock().unwrap(); // Use unwrap()
+         // Remove internal proposal senders
+         { 
+             let mut proposal_senders = self.node_proposal_senders.lock().await; // Use unwrap()
              for node_id in &isolated_node_ids {
                 if proposal_senders.remove(node_id).is_some() {
                      println!("[Runtime] Removed Proposal sender for isolated node {}", node_id);
                  }
             }
          } 
-          {
-            let mut challenge_senders = self.node_challenge_senders.lock().unwrap(); // Use unwrap()
-             for node_id in &isolated_node_ids {
-                 if challenge_senders.remove(node_id).is_some() {
-                     println!("[Runtime] Removed Challenge sender for isolated node {}", node_id);
-                 }
-            }
-         } 
 
          // Update shard assignments (Use .lock().unwrap())
          {
-             let mut assignments = self.shard_assignments.lock().unwrap(); // Use unwrap()
+             let mut assignments = self.shard_assignments.lock().await; // Use unwrap()
              for (_shard_id, nodes_in_shard) in assignments.iter_mut() {
                  nodes_in_shard.retain(|identity| !isolated_set.contains(&identity.id));
              }
@@ -286,6 +357,11 @@ impl SimulationRuntime {
              // --- ADD THIS LOG --- 
              println!("[Runtime] Successfully sent isolation report for {:?} via channel.", isolated_node_ids);
          }
+    }
+
+    // Renamed from route_message - now just uses the generic send_message interface
+    pub fn send_message(&self, msg: NetworkMessage) {
+        self.network.send_message(msg);
     }
 
     // TODO: Add methods for coordinator interaction, logging, etc.

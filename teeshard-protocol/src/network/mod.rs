@@ -1,12 +1,15 @@
 // Network message types module
 
 use crate::raft::messages::{AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
-use crate::liveness::types::{NonceChallenge, AttestationResponse};
+use crate::liveness::types::{NonceChallenge, LivenessAttestation};
 use crate::cross_chain::types::LockRequest;
 use crate::tee_logic::threshold_sig::PartialSignature;
+use crate::raft::messages::RaftMessage;
 use crate::data_structures::TEEIdentity;
-use crate::tee_logic::crypto_sim::generate_keypair;
 use std::sync::Mutex;
+use crate::tee_logic::crypto_sim::generate_keypair;
+use crate::simulation::metrics::MetricEvent;
+use tokio::sync::mpsc;
 
 // Represents the types of messages that can be sent over the network
 #[derive(Debug, Clone)] // Added Clone
@@ -18,8 +21,8 @@ pub enum Message {
     RaftRequestVoteReply(RequestVoteReply),
 
     // Liveness messages
-    LivenessChallenge(NonceChallenge),
-    LivenessResponse(AttestationResponse),
+    LivenessChallenge(NonceChallenge),     // Liveness Aggregator -> Node
+    LivenessResponse(LivenessAttestation),   // Node -> Liveness Aggregator
 
     // Cross-Chain messages
     ShardLockRequest(LockRequest), // Coordinator -> Shard TEEs
@@ -94,6 +97,33 @@ impl MockNetwork {
         recipient_messages
     }
 }
+
+// --- Add From implementations to convert specific messages to the generic Message enum ---
+impl From<RaftMessage> for Message {
+    fn from(raft_msg: RaftMessage) -> Self {
+        match raft_msg {
+            RaftMessage::AppendEntries(args) => Message::RaftAppendEntries(args),
+            RaftMessage::AppendEntriesReply(reply) => Message::RaftAppendEntriesReply(reply),
+            RaftMessage::RequestVote(args) => Message::RaftRequestVote(args),
+            RaftMessage::RequestVoteReply(reply) => Message::RaftRequestVoteReply(reply),
+        }
+    }
+}
+
+impl From<NonceChallenge> for Message {
+    fn from(challenge: NonceChallenge) -> Self {
+        Message::LivenessChallenge(challenge)
+    }
+}
+
+impl From<LivenessAttestation> for Message {
+    fn from(attestation: LivenessAttestation) -> Self {
+        Message::LivenessResponse(attestation)
+    }
+}
+
+// Add other From implementations as needed (e.g., for LockRequest, PartialSig)
+// --- End From implementations ---
 
 
 #[cfg(test)]

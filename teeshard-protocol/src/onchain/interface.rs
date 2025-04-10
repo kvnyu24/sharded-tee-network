@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use std::error::Error;
-use ethers::types::{U256, Address};
+use ethers::types::U256;
 use crate::onchain::evm_relayer::EvmRelayerError;
 
 // Define a generic error type for blockchain operations

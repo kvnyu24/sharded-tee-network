@@ -3,14 +3,14 @@
 use crate::{
     config::SystemConfig,
     data_structures::TEEIdentity,
-    liveness::types::{ChallengeNonce, LivenessAttestation}, // Import liveness types
+    liveness::types::LivenessAttestation, // Import liveness types
     raft::{
         messages::RaftMessage,
-        node::{RaftNode, RaftEvent},
+        node::{RaftNode, RaftEvent, ShardId},
         state::{Command, RaftRole}, // Import Command and RaftRole enum
         storage::InMemoryStorage, // Using InMemoryStorage for simulation
     },
-    tee_logic::{crypto_sim::SecretKey, enclave_sim::{EnclaveSim, TeeDelayConfig}, types::{Signature, LockProofData}},
+    tee_logic::types::Signature,
 };
 // Use crate::simulation::runtime::SimulationRuntime;
 // Corrected import path assumption
@@ -24,6 +24,12 @@ use bincode::config::standard; // Import standard config
 use std::collections::HashSet; // Import HashSet
 use ed25519_dalek::SigningKey; // Import SigningKey
 use ed25519_dalek::Signer; // Add Signer trait
+use crate::network::{NetworkMessage, Message}; // Add NetworkMessage, Message
+use log::warn; // Add warn import
+use ethers::utils::keccak256; // Import keccak256
+use crate::simulation::metrics::MetricEvent;
+use hex; // Add hex import
+use crate::tee_logic::enclave_sim::EnclaveSim; // Corrected Import Path
 
 // Type for proposal requests received by the node's run loop
 pub type NodeProposalRequest = (Command, oneshot::Sender<Result<Vec<RaftEvent>, String>>);
@@ -48,74 +54,73 @@ pub type NodeQuery = (NodeQueryRequest, oneshot::Sender<NodeQueryResponse>);
 /// Represents a single TEE node within the simulation.
 pub struct SimulatedTeeNode {
     pub identity: TEEIdentity,
-    // Use SigningKey from ed25519_dalek for consistency
     signing_key: SigningKey,
     raft_node: RaftNode,
-    // Track processed command identifiers (e.g., tx_id for ConfirmLockAndSign)
+    shard_id: ShardId,
     processed_commands: HashSet<String>,
-    runtime: SimulationRuntime,                   // Handle to the runtime for sending messages
-    // Channel now receives (sender_identity, message)
-    message_rx: mpsc::Receiver<(TEEIdentity, RaftMessage)>,
-    _message_tx: mpsc::Sender<(TEEIdentity, RaftMessage)>, // Keep sender to prevent channel closure
-    // Channel specifically for receiving external command proposals
+    runtime: SimulationRuntime,
+    network_rx: mpsc::Receiver<NetworkMessage>,
     proposal_rx: mpsc::Receiver<NodeProposalRequest>,
-    proposal_tx: mpsc::Sender<NodeProposalRequest>, // Public sender for tests
-    // NEW: Channel for state queries
+    proposal_tx: mpsc::Sender<NodeProposalRequest>,
     query_rx: mpsc::Receiver<NodeQuery>,
     query_tx: mpsc::Sender<NodeQuery>,
-    // Channel for receiving liveness challenges
-    challenge_rx: mpsc::Receiver<ChallengeNonce>,
-    _challenge_tx: mpsc::Sender<ChallengeNonce>, // Keep sender for registration
+    metrics_tx: mpsc::Sender<MetricEvent>,
 }
 
 impl SimulatedTeeNode {
-    /// Creates a new simulated TEE node.
+    /// Creates a new SimulatedTeeNode instance.
     pub fn new(
         identity: TEEIdentity,
-        signing_key: SigningKey, // Accept SigningKey
-        peers: Vec<TEEIdentity>, // Peers within the same shard
+        signing_key: SigningKey,
+        peers: Vec<TEEIdentity>,
         config: SystemConfig,
         runtime: SimulationRuntime,
-        // Accept liveness channel senders/receivers
-        challenge_rx: mpsc::Receiver<ChallengeNonce>,
-        _challenge_tx: mpsc::Sender<ChallengeNonce>,
+        network_rx: mpsc::Receiver<NetworkMessage>,
+        proposal_tx: mpsc::Sender<NodeProposalRequest>,
+        proposal_rx: mpsc::Receiver<NodeProposalRequest>,
+        query_tx: mpsc::Sender<NodeQuery>,
+        query_rx: mpsc::Receiver<NodeQuery>,
+        shard_id: ShardId,
     ) -> Self {
-        let storage = Box::new(InMemoryStorage::new()); // Each node gets its own storage
-
-        // Get the Arc<SimulationConfig> from the runtime
+        let storage = Box::new(InMemoryStorage::new());
         let sim_config = runtime.get_config();
-        // Clone the TeeDelayConfig from the SimulationConfig
-        let tee_delay_config = sim_config.tee_delays.clone();
-
-        // Create EnclaveSim with the specific delay config wrapped in Arc
-        let enclave = EnclaveSim::new(identity.id, Some(signing_key.clone()), Arc::new(tee_delay_config));
-        let raft_node = RaftNode::new(identity.clone(), peers, config, storage, enclave);
-
-        // Create a channel for this node to receive messages (now tuple)
-        let (tx, rx): (mpsc::Sender<(TEEIdentity, RaftMessage)>, mpsc::Receiver<(TEEIdentity, RaftMessage)>) = mpsc::channel(100);
-        let (prop_tx, prop_rx) = mpsc::channel(10); // Proposal channel
-        let (query_tx, query_rx) = mpsc::channel(10); // Query channel
+        let tee_delay_config = Arc::new(sim_config.tee_delays.clone()); // Clone for Arc
+        let metrics_tx_clone = runtime.get_metrics_sender(); // Clone for enclave and raft
+        
+        // Remove enclave creation here, it happens inside RaftNode::new - REVERTING THIS
+        let enclave = Arc::new(EnclaveSim::new(
+            identity.clone(), // Pass the full identity
+            signing_key.clone(), // Pass the key directly (cloned for Arc)
+            tee_delay_config.clone(), // Clone the Arc *before* moving it to EnclaveSim
+            Some(metrics_tx_clone.clone())
+        ));
+        
+        // Update RaftNode::new call signature: re-add enclave, pass metrics_tx
+        let raft_node = RaftNode::new(
+            identity.clone(),
+            peers, // peers comes before config
+            config, 
+            storage,
+            signing_key.clone(), // signing_key comes after storage
+            shard_id, // shard_id comes after signing_key
+            tee_delay_config, // Pass the original Arc here (ownership transfer)
+            Some(metrics_tx_clone.clone()), // Pass metrics sender
+        );
 
         SimulatedTeeNode {
             identity,
             signing_key,
             raft_node,
-            processed_commands: HashSet::new(), // Initialize the set
+            shard_id,
+            processed_commands: HashSet::new(),
             runtime,
-            message_rx: rx,
-            _message_tx: tx, // Store sender side
-            proposal_rx: prop_rx,
-            proposal_tx: prop_tx, // Store proposal sender
-            query_rx, // Store query receiver
-            query_tx, // Store query sender
-            challenge_rx,
-            _challenge_tx,
+            network_rx,
+            proposal_rx,
+            proposal_tx,
+            query_rx,
+            query_tx,
+            metrics_tx: metrics_tx_clone, // Store the original sender
         }
-    }
-
-    /// Returns the sender channel for this node.
-    pub fn get_message_sender(&self) -> mpsc::Sender<(TEEIdentity, RaftMessage)> {
-        self._message_tx.clone()
     }
 
     /// Returns the sender channel for command proposals.
@@ -128,55 +133,60 @@ impl SimulatedTeeNode {
         self.query_tx.clone()
     }
 
-    /// Returns the sender channel for challenge sender (needed for runtime registration)
-    pub fn get_challenge_sender(&self) -> mpsc::Sender<ChallengeNonce> {
-        self._challenge_tx.clone()
-    }
-
     /// Starts the node's main event loop in a separate Tokio task.
     pub async fn run(mut self) {
-         println!("[Node {}] Starting run loop...", self.identity.id);
-        // Example: Tick Raft periodically
-        let tick_duration = Duration::from_millis(50); // Adjust as needed
+        println!("[Node {}] Starting run loop...", self.identity.id);
+        let tick_duration = Duration::from_millis(50);
         let mut tick_timer = interval(tick_duration);
 
         loop {
             tokio::select! {
                 _ = tick_timer.tick() => {
-                    // println!("[Node {}] Tick", self.identity.id);
                     let events = self.raft_node.tick();
                     self.handle_raft_events(events).await;
                 }
-                // Receive tuple (sender_identity, message)
-                Some((sender_identity, message)) = self.message_rx.recv() => {
-                     println!("[Node {}] Received message from {}: {:?}", self.identity.id, sender_identity.id, message);
-                    // Pass both sender and message to handle_message
-                    let events = self.raft_node.handle_message(sender_identity, message);
-                     self.handle_raft_events(events).await;
+                Some(network_msg) = self.network_rx.recv() => {
+                    println!("[Node {}] Received network message from {}: {:?}", 
+                        self.identity.id, network_msg.sender.id, network_msg.message);
+                    match network_msg.message {
+                        Message::RaftAppendEntries(args) => {
+                            let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::AppendEntries(args));
+                            self.handle_raft_events(events).await;
+                        }
+                        Message::RaftAppendEntriesReply(reply) => {
+                            let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::AppendEntriesReply(reply));
+                            self.handle_raft_events(events).await;
+                        }
+                        Message::RaftRequestVote(args) => {
+                            let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::RequestVote(args));
+                            self.handle_raft_events(events).await;
+                        }
+                        Message::RaftRequestVoteReply(reply) => {
+                            let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::RequestVoteReply(reply));
+                            self.handle_raft_events(events).await;
+                        }
+                        Message::LivenessChallenge(challenge_struct) => {
+                            println!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge_struct.nonce);
+                            // Pass the u64 nonce to the handler
+                            self.handle_liveness_challenge(challenge_struct.nonce).await; // Pass u64
+                        }
+                        _ => {
+                            warn!("[Node {}] Received unhandled message type: {:?}", self.identity.id, network_msg.message);
+                        }
+                    }
                 }
-                // Handle incoming command proposals
                 Some((command, result_sender)) = self.proposal_rx.recv() => {
                     println!("[Node {}] Received external command proposal: {:?}", self.identity.id, command);
-                    // Directly call propose_command on the internal RaftNode
                     let result = self.raft_node.propose_command(command);
-                    // Send the result back to the caller via the oneshot channel
                     if result_sender.send(Ok(result.clone())).is_err() {
                         eprintln!("[Node {}] Failed to send proposal result back.", self.identity.id);
                     }
-                    // Also handle the events generated by the proposal itself
                     self.handle_raft_events(result).await;
                 }
-                // NEW: Handle state queries
                 Some((query, response_sender)) = self.query_rx.recv() => {
                     self.handle_query(query, response_sender).await;
                 }
-                // Handle incoming liveness challenges
-                Some(challenge) = self.challenge_rx.recv() => {
-                    println!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge.nonce);
-                    self.handle_liveness_challenge(challenge).await;
-                }
                 else => {
-                    // Channel closed or other condition, break the loop
                     println!("[Node {}] Message/Query channel closed or select! completed. Stopping run loop.", self.identity.id);
                     break;
                 }
@@ -202,12 +212,23 @@ impl SimulatedTeeNode {
     }
 
     /// Handles a received liveness challenge by generating and sending an attestation
-    async fn handle_liveness_challenge(&self, challenge: ChallengeNonce) {
+    async fn handle_liveness_challenge(&self, nonce: u64) {
         // Construct the message to sign: (node_id || nonce || timestamp)
+        // NOTE: Timestamp is missing here! Liveness challenge logic needs revision.
+        // Using a placeholder timestamp for now.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(); // Use millis as u128
+
+        // Convert u64 nonce to [u8; 32] by hashing
+        let nonce_bytes = nonce.to_ne_bytes();
+        let nonce_hash: [u8; 32] = keccak256(&nonce_bytes); 
+
         let mut message = Vec::new();
         message.extend_from_slice(&self.identity.id.to_ne_bytes());
-        message.extend_from_slice(&challenge.nonce);
-        message.extend_from_slice(&challenge.timestamp.to_ne_bytes());
+        message.extend_from_slice(&nonce_hash); // Use the 32-byte hash for signing
+        message.extend_from_slice(&(timestamp as u64).to_ne_bytes()); 
 
         // Sign the message using the node's signing key
         let signature = self.signing_key.sign(&message);
@@ -215,8 +236,8 @@ impl SimulatedTeeNode {
         // Create the attestation response
         let attestation = LivenessAttestation {
             node_id: self.identity.id,
-            nonce: challenge.nonce,
-            timestamp: challenge.timestamp,
+            nonce: nonce_hash, // Use the 32-byte hash
+            timestamp: timestamp as u64, // Cast timestamp to u64
             signature,
         };
 
@@ -229,7 +250,12 @@ impl SimulatedTeeNode {
         for event in events {
             match event {
                 RaftEvent::SendMessage(target_identity, message) => {
-                    self.runtime.route_message(self.identity.clone(), target_identity.id, message).await;
+                    let network_msg = NetworkMessage {
+                        sender: self.identity.clone(),
+                        receiver: target_identity,
+                        message: Message::from(message),
+                    };
+                    self.runtime.send_message(network_msg);
                 }
                 RaftEvent::BroadcastMessage(message) => {
                     println!("[Node {}] Broadcasting message: {:?}", self.identity.id, message);
@@ -258,8 +284,11 @@ impl SimulatedTeeNode {
 
                     match bincode::encode_to_vec(&lock_data, standard()) {
                         Ok(data_to_sign) => {
+                            // DEBUG: Print data and key before signing
+                            println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
+                            println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
+                            
                             println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
-                            // Use the correct `sign` method from EnclaveSim
                             let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
                             let share = (self.identity.clone(), lock_data.clone(), signature);
                             println!("[Node {}][StateMachine] Submitting signature share for tx_id: {}", self.identity.id, lock_data.tx_id);

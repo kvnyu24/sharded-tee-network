@@ -3,9 +3,13 @@
 use crate::{
     data_structures::TEEIdentity,
     // Correct: Command and LogEntry are defined in raft::state
-    raft::state::{Command, LogEntry},
+    raft::state::LogEntry,
 };
 // Import key generation
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+// Add missing import
+use std::time::Instant;
 
 /// Trait for Raft persistent storage.
 /// Implementors must be Send + Sync to be used across threads.
@@ -34,12 +38,17 @@ pub trait RaftStorage: Send + Sync {
     // Truncate the log starting from a given index (1-based)
     fn truncate_log(&mut self, from_index: u64);
 
+    // Load term and vote
+    fn load_term_and_vote(&self) -> (u64, Option<TEEIdentity>);
+
+    // Load the entire log
+    fn load_log(&self) -> Vec<LogEntry>;
+
     // Compact the log up to a certain index (snapshotting)
     // fn compact_log(&mut self, up_to_index: u64) -> Result<(), Error>;
 }
 
 // Example in-memory storage (for testing/simulation)
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)] // Clone needed if used in multiple places without Arc
@@ -132,6 +141,16 @@ impl RaftStorage for InMemoryStorage {
         }
         // In a real implementation, update persistent storage
     }
+
+    fn load_term_and_vote(&self) -> (u64, Option<TEEIdentity>) {
+        // Lock the data ONCE to get both term and vote
+        let data = self.data.lock().unwrap(); 
+        (data.current_term, data.voted_for.clone())
+    }
+
+    fn load_log(&self) -> Vec<LogEntry> {
+        self.data.lock().unwrap().log.clone()
+    }
 }
 
 #[cfg(test)]
@@ -166,9 +185,9 @@ mod tests {
         assert!(storage.get_voted_for().is_none());
 
         let entries = vec![
-            LogEntry { term: 1, command: Command::Dummy },
-            LogEntry { term: 2, command: Command::Dummy },
-            LogEntry { term: 3, command: Command::Dummy },
+            LogEntry { term: 1, command: Command::Dummy, proposal_time: Instant::now() },
+            LogEntry { term: 2, command: Command::Dummy, proposal_time: Instant::now() },
+            LogEntry { term: 3, command: Command::Dummy, proposal_time: Instant::now() },
         ];
         storage.append_log_entries(&entries);
         assert_eq!(storage.get_log_len(), 3);
@@ -193,7 +212,7 @@ mod tests {
          assert_eq!(storage.get_last_log_term(), 0);
 
          // Test appending again after truncation
-         let new_entries = vec![LogEntry { term: 4, command: Command::Dummy }];
+         let new_entries = vec![LogEntry { term: 4, command: Command::Dummy, proposal_time: Instant::now() }];
          storage.append_log_entries(&new_entries);
          assert_eq!(storage.get_log_len(), 1);
          assert_eq!(storage.get_last_log_index(), 1);

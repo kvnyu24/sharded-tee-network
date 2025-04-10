@@ -1,13 +1,19 @@
 // Threshold Signature generation and verification
 
-use crate::data_structures::TEEIdentity;
+use crate::data_structures::TEEIdentity; // Remove unused: LockProofData, ShardId, Signature
 // Use the real Signature type
 use crate::tee_logic::types::Signature;
-use std::collections::{BTreeMap, HashSet}; // Use BTreeMap for deterministic iteration, HashSet for verify_multi
+ // Use BTreeMap for deterministic iteration, HashSet for verify_multi
 // Import crypto sim components
-use crate::tee_logic::crypto_sim::{PublicKey, verify}; 
+use crate::tee_logic::crypto_sim::{PublicKey, verify};
 use crate::tee_logic::enclave_sim::TeeDelayConfig; // Correct path
-use std::sync::Arc; // Need Arc for passing config
+ // Need Arc for passing config
+use crate::simulation::metrics::MetricEvent; // Import MetricEvent
+use tokio::sync::mpsc; // Import mpsc
+use std::time::{Duration, Instant}; // Import Instant
+use tokio::time::sleep; // Import sleep
+use rand::Rng; // Import Rng for random_delay
+use std::collections::HashMap; // Add this import
 
 // Represents a signature share from a single TEE
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,283 +23,430 @@ pub struct PartialSignature {
     pub signature_data: Signature,
 }
 
-// Aggregates partial signatures to form a final threshold signature
+/// Aggregates partial signatures until a threshold is met.
 #[derive(Debug, Clone)]
 pub struct ThresholdAggregator {
-    required_threshold: usize,
-    // Store verified partial signatures: Map PublicKey bytes -> Signature
-    // Key: Signer PK bytes, Value: (Signer PK, Verified Signature)
-    verified_signatures: BTreeMap<Vec<u8>, (PublicKey, Signature)>,
-    // Store delay config for verify operations
-    delay_config: Arc<TeeDelayConfig>, // Use Arc for shared ownership
+    message: Vec<u8>,
+    threshold: usize,
+    committee: HashMap<TEEIdentity, PublicKey>,
+    partial_signatures: HashMap<TEEIdentity, Signature>,
+    combined_signature: Option<Signature>, // Store the final signature
+    delay_config: TeeDelayConfig,
+    // Add metrics sender and node ID
+    metrics_tx: Option<mpsc::Sender<MetricEvent>>,
+    node_id: Option<TEEIdentity>,
 }
 
 impl ThresholdAggregator {
-    /// Creates a new aggregator for a given threshold and delay config.
-    pub fn new(required_threshold: usize, delay_config: Arc<TeeDelayConfig>) -> Self {
+    /// Creates a new ThresholdAggregator.
+    pub fn new(
+        message: Vec<u8>,
+        threshold: usize,
+        committee: HashMap<TEEIdentity, PublicKey>,
+        delay_config: TeeDelayConfig,
+        // Accept metrics sender and node ID
+        metrics_tx: Option<mpsc::Sender<MetricEvent>>,
+        node_id: Option<TEEIdentity>,
+    ) -> Self {
         ThresholdAggregator {
-            required_threshold,
-            verified_signatures: BTreeMap::new(),
-            delay_config, // Store the config Arc
+            message,
+            threshold,
+            committee,
+            partial_signatures: HashMap::new(),
+            combined_signature: None,
+            delay_config,
+            // Store metrics fields
+            metrics_tx,
+            node_id,
         }
     }
 
-    /// Adds and verifies a partial signature against the provided message context.
-    /// Returns Err if the signature is invalid or the signer has already added one.
-    pub async fn add_partial_signature(&mut self, message: &[u8], partial_sig: PartialSignature) -> Result<(), &'static str> {
+    /// Adds a partial signature from a TEE node.
+    pub async fn add_partial_signature(&mut self, signer_id: TEEIdentity, signature: Signature) -> Result<bool, String> {
+        // Check if the signer is part of the committee
+        let public_key = match self.committee.get(&signer_id) {
+            Some(pk) => pk,
+            None => return Err(format!("Signer {} is not part of the committee.", signer_id.id)),
+        };
 
-        // Verify the partial signature using the signer's public key against the provided message
+        // Verify the partial signature (uses TEE simulation delay)
         let is_valid = verify(
-            message, 
-            &partial_sig.signature_data, 
-            &partial_sig.signer_id.public_key,
+            &self.message,
+            &signature,
+            public_key,
             self.delay_config.verify_min_ms,
             self.delay_config.verify_max_ms,
+            &self.metrics_tx,
+            &self.node_id,
         ).await;
 
         if !is_valid {
-            println!(
-                "Aggregator: Partial signature verification failed for signer {}. Sig: {:?}, Msg: {:?}, Key: {:?}",
-                partial_sig.signer_id.id,
-                partial_sig.signature_data,
-                message, // Log the message used for verification
-                partial_sig.signer_id.public_key
-            );
-            return Err("Partial signature verification failed");
+            return Err(format!("Invalid partial signature from signer {}.
+", signer_id.id));
         }
 
-        let pk_bytes = partial_sig.signer_id.public_key.to_bytes().to_vec();
-        if self.verified_signatures.contains_key(&pk_bytes) {
-            // Note: We check based on public key bytes now, not TEEIdentity ID
-            return Err("Signer (key) has already provided a valid partial signature");
+        // Add the valid signature if not already present
+        if self.partial_signatures.insert(signer_id, signature).is_none() {
+            // Check if the threshold is met
+            if self.partial_signatures.len() >= self.threshold {
+                match self.aggregate_signatures().await {
+                    Ok(combined_sig) => {
+                        self.combined_signature = Some(combined_sig);
+                        return Ok(true); // Threshold met and aggregation successful
+                    }
+                    Err(e) => {
+                        // Aggregation failed, log error but don't block forever
+                        eprintln!("Error aggregating signatures: {}", e); // Keep this minimal
+                        return Err(format!("Failed to aggregate signatures after reaching threshold: {}", e));
+                    }
+                }
+            }
         }
 
-        println!("Aggregator: Adding verified partial signature from signer ID {} (Key: {:?})",
-                partial_sig.signer_id.id, pk_bytes);
-        self.verified_signatures.insert(pk_bytes, (partial_sig.signer_id.public_key, partial_sig.signature_data));
-        Ok(())
+        Ok(false) // Threshold not yet met or signature was a duplicate
     }
 
-    /// Returns the number of verified signatures currently held.
-    pub fn signature_count(&self) -> usize {
-        self.verified_signatures.len()
-    }
+    /// Attempts to aggregate the collected partial signatures.
+    /// This is a simplified placeholder. Real aggregation is complex.
+    async fn aggregate_signatures(&self) -> Result<Signature, String> {
+        let start_time = Instant::now();
+        let function_name = "aggregate_signatures".to_string();
 
-    /// Returns the required signature threshold.
-    pub fn get_required_threshold(&self) -> usize {
-        self.required_threshold
-    }
+        // Simulate aggregation overhead
+        random_delay(self.delay_config.sign_min_ms, self.delay_config.sign_max_ms).await;
 
-    /// Checks if the threshold has been met.
-    pub fn has_reached_threshold(&self) -> bool {
-        self.verified_signatures.len() >= self.required_threshold
-    }
+        // **Placeholder:** Real aggregation is complex.
+        // Here, sort keys by ID and take the first one's signature.
+        if self.partial_signatures.len() >= self.threshold {
+            // Sort keys by ID to deterministically pick one
+            let mut sorted_keys: Vec<&TEEIdentity> = self.partial_signatures.keys().collect();
+            sorted_keys.sort_by_key(|k| k.id);
+            
+            let chosen_signer_id = sorted_keys.first()
+                .ok_or("No signatures available to aggregate after sorting")?;
+            
+            let work_duration = start_time.elapsed(); // Measure including the simulated delay
 
-    /// Attempts to finalize the threshold signature (simulated as multi-sig) if the threshold is met.
-    /// Returns None if the threshold is not met.
-    /// Returns a Vec of (PublicKey, Signature) pairs meeting the threshold.
-    pub fn finalize_multi_signature(&self) -> Option<Vec<(PublicKey, Signature)>> {
-        if !self.has_reached_threshold() {
-            println!("Aggregator: Threshold not met ({} < {})", self.verified_signatures.len(), self.required_threshold);
-            return None;
-        }
+            // Send metric
+            if let (Some(tx), Some(id)) = (self.metrics_tx.as_ref(), self.node_id.as_ref()) {
+                let event = MetricEvent::TeeFunctionMeasured {
+                    node_id: id.clone(),
+                    function_name,
+                    duration: work_duration, // includes simulated delay
+                };
+                let tx_clone = tx.clone();
+                let _id_clone = id.clone(); // Prefix unused clone
+                 tokio::spawn(async move {
+                    if let Err(_e) = tx_clone.send(event).await { // Prefix unused error
+                        // eprintln!("[threshold_sig {}] Failed to send aggregate metric: {}", _id_clone.id, _e);
+                    }
+                });
+            }
 
-        println!("Aggregator: Threshold met ({} >= {}). Finalizing multi-signature collection.",
-                 self.verified_signatures.len(), self.required_threshold);
-
-        // In this multi-signature simulation, "finalizing" just means returning the collection
-        // of verified signatures that meet the threshold.
-        // We take the first `required_threshold` signatures based on the BTreeMap iteration order (sorted by PK bytes).
-        let multi_sig: Vec<(PublicKey, Signature)> = self.verified_signatures.values().cloned().take(self.required_threshold).collect();
-
-        // Double-check we collected enough (should always be true if threshold was met)
-        if multi_sig.len() == self.required_threshold {
-             Some(multi_sig)
+            // Return the chosen signature (PLACEHOLDER)
+            Ok(self.partial_signatures[*chosen_signer_id].clone())
         } else {
-            eprintln!("Error: Could not collect enough signatures ({}) for threshold ({}) during finalization.", multi_sig.len(), self.required_threshold);
-            None
+            Err(format!("Threshold not met. Required: {}, Available: {}", self.threshold, self.partial_signatures.len()))
         }
     }
 
-    // Remove old finalize_signature which simulated a single hash output
-    // pub fn finalize_signature(&self) -> Option<Signature> { ... }
-}
+    /// Verifies the combined multi-signature against the message.
+    /// This currently just verifies the placeholder 'combined' signature.
+    pub async fn verify_multi_signature(&self, combined_signature: &Signature) -> bool {
+         // In a real threshold scheme, verification uses the combined signature
+        // and the group's public key. Here we just verify the placeholder.
+        // Find the public key corresponding to the placeholder signature (first signer by ID).
+        let mut sorted_keys: Vec<&TEEIdentity> = self.partial_signatures.keys().collect();
+        sorted_keys.sort_by_key(|k| k.id);
 
-
-// Verify a multi-signature collection produced by the aggregator
-pub async fn verify_multi_signature(
-    message: &[u8],
-    multi_sig: &[(PublicKey, Signature)],
-    required_threshold: usize,
-    delay_config: Arc<TeeDelayConfig>, // Accept delay config
-) -> bool {
-    println!("VerifyMultiSig: Verifying {} signatures for message {:?} against threshold {}",
-              multi_sig.len(), message, required_threshold);
-
-    if multi_sig.len() < required_threshold {
-        println!("VerifyMultiSig: Not enough signatures provided ({}) to meet threshold ({})",
-                 multi_sig.len(), required_threshold);
-        return false;
-    }
-
-    let mut verified_keys = HashSet::new();
-    let mut valid_sig_count = 0;
-
-    for (public_key, signature) in multi_sig {
-        // Call async verify with delays
-        let is_valid = verify(
-            message, 
-            signature, 
-            public_key,
-            delay_config.verify_min_ms,
-            delay_config.verify_max_ms
-        ).await;
-
-        if is_valid {
-            if verified_keys.insert(public_key.to_bytes()) {
-                valid_sig_count += 1;
+        if let Some(chosen_signer_id) = sorted_keys.first() {
+             if let Some(pk) = self.committee.get(chosen_signer_id) {
+                 verify(
+                    &self.message,
+                    combined_signature,
+                    pk, // Use the specific signer's PK for the placeholder
+                    self.delay_config.verify_min_ms,
+                    self.delay_config.verify_max_ms,
+                    &self.metrics_tx, // Pass metrics sender
+                    &self.node_id,    // Pass node ID
+                ).await
+            } else {
+                false // Signer not found (shouldn't happen if aggregation succeeded)
             }
         } else {
-            println!("VerifyMultiSig: Found invalid signature for key {:?}", public_key);
-            // Depending on policy, finding even one invalid signature might invalidate the whole set.
-            // For threshold, we just need enough valid ones.
+            false // No signatures were ever added
         }
     }
 
-    println!("VerifyMultiSig: Found {} valid unique signatures.", valid_sig_count);
-    valid_sig_count >= required_threshold
+    /// Returns the combined signature if the threshold has been met and aggregation was successful.
+    pub fn get_combined_signature(&self) -> Option<&Signature> {
+        self.combined_signature.as_ref()
+    }
+
+    /// Returns the number of valid partial signatures collected so far.
+    pub fn signature_count(&self) -> usize {
+        self.partial_signatures.len()
+    }
+
+    /// Returns the required threshold for this aggregator.
+    pub fn get_threshold(&self) -> usize {
+        self.threshold
+    }
+}
+
+// Helper function to generate a random delay within a range
+// Moved outside the test module
+async fn random_delay(min_ms: u64, max_ms: u64) {
+    if min_ms == 0 && max_ms == 0 {
+        return; // No delay configured
+    }
+    let delay_ms = if min_ms >= max_ms {
+        min_ms
+    } else {
+        rand::thread_rng().gen_range(min_ms..=max_ms)
+    };
+    if delay_ms > 0 {
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Import sign/generate from crypto_sim and TeeDelayConfig from enclave_sim
-    use crate::tee_logic::crypto_sim::{generate_keypair, sign}; 
-    use crate::tee_logic::enclave_sim::TeeDelayConfig; // Correct path
-    use crate::data_structures::TEEIdentity; // Import TEEIdentity
-    use tokio::runtime::Runtime; // Add tokio runtime for async tests
-    use std::sync::Arc; // Import Arc
+    // Comment out unresolved import
+    // use crate::test_utils::run_async; 
+    use crate::tee_logic::crypto_sim::{self, SecretKey};
+    use std::collections::HashMap;
+    
+    
 
-    // Helper function to run async tests
-    fn run_async<F>(future: F) -> F::Output 
-    where
-        F: std::future::Future,
-    {
-        Runtime::new().unwrap().block_on(future)
-    }
+    // Helper to create identities and keys for tests
+    fn setup_committee(num_nodes: usize) -> (Vec<TEEIdentity>, HashMap<TEEIdentity, PublicKey>, Vec<SecretKey>) {
+        let mut identities = Vec::new();
+        let mut public_keys = HashMap::new();
+        let mut secret_keys = Vec::new();
 
-    // Helper to create a TEEIdentity with a real key
-    fn create_real_tee(id: usize) -> (TEEIdentity, ed25519_dalek::SigningKey) {
-        let keypair = generate_keypair();
-        let identity = TEEIdentity { id, public_key: keypair.verifying_key() };
-        (identity, keypair)
-    }
-
-    // Helper to create a valid partial signature (now async due to crypto_sim::sign)
-    async fn create_valid_partial_sig(identity: &TEEIdentity, keypair: &ed25519_dalek::SigningKey, message: &[u8]) -> PartialSignature {
-        // Pass 0 delays for test signing
-        let signature_data = sign(message, keypair, 0, 0).await;
-        PartialSignature {
-            signer_id: identity.clone(),
-            signature_data,
+        for i in 0..num_nodes {
+            let secret_key = crypto_sim::generate_keypair();
+            let public_key = secret_key.verifying_key().clone();
+            let identity = TEEIdentity { id: i, public_key: public_key.clone() };
+            identities.push(identity.clone());
+            public_keys.insert(identity.clone(), public_key);
+            secret_keys.push(secret_key);
         }
+        (identities, public_keys, secret_keys)
     }
 
-    #[test]
-    fn test_aggregator_flow_success_async() {
-        run_async(async {
-            let identities_keys: Vec<_> = (0..5).map(create_real_tee).collect();
-            let identities: Vec<_> = identities_keys.iter().map(|(id, _)| id.clone()).collect();
-            let keypairs: Vec<_> = identities_keys.iter().map(|(_, kp)| kp).collect();
+    // Basic test for successful aggregation
+    #[tokio::test]
+    async fn threshold_aggregation_success() {
+        // run_async(async {
+            let num_nodes = 5;
+        let threshold = 3;
+            let (identities, committee, secret_keys) = setup_committee(num_nodes);
+            let message = b"Test message for threshold signature".to_vec();
+            let delay_config = TeeDelayConfig::default(); // No delay for simplicity
+            let (metrics_tx, mut metrics_rx) = mpsc::channel(100); // Mock metrics channel
+            let node_id = Some(identities[0].clone()); // Mock node ID
 
-            let message = b"approve_step_1_async";
-            let threshold = 3;
-            let delay_config = Arc::new(TeeDelayConfig::default()); // Default (no delay) config for test
+            let mut aggregator = ThresholdAggregator::new(
+                message.clone(),
+                threshold,
+                committee.clone(),
+                delay_config,
+                Some(metrics_tx.clone()), // Pass the sender
+                node_id,
+            );
 
-            let mut aggregator = ThresholdAggregator::new(threshold, Arc::clone(&delay_config));
+            let mut threshold_met = false;
+            for i in 0..threshold {
+                // Sign synchronously for test simplicity
+                // Pass borrowed &None
+                let sig = crypto_sim::sign(&message, &secret_keys[i], 0, 0, &None, &None).await;
+                let result = aggregator.add_partial_signature(identities[i].clone(), sig).await;
+                assert!(result.is_ok());
+                threshold_met = result.unwrap();
+                if threshold_met {
+                    break;
+                }
+            }
 
-            assert!(!aggregator.has_reached_threshold());
-            assert!(aggregator.finalize_multi_signature().is_none());
+            assert!(threshold_met, "Threshold should have been met");
+            assert!(aggregator.get_combined_signature().is_some(), "Combined signature should be available");
+            assert_eq!(aggregator.signature_count(), threshold);
 
-            // Create signatures concurrently
-            let partial_sig_0 = create_valid_partial_sig(&identities[0], keypairs[0], message).await;
-            let partial_sig_2 = create_valid_partial_sig(&identities[2], keypairs[2], message).await;
-            let partial_sig_4 = create_valid_partial_sig(&identities[4], keypairs[4], message).await;
+            // Wait briefly for the async metric tasks to send
+            tokio::time::sleep(Duration::from_millis(50)).await; // Increased sleep slightly
 
-            // Add signatures sequentially (or could use join_all)
-            assert!(aggregator.add_partial_signature(message, partial_sig_0).await.is_ok());
-            assert_eq!(aggregator.signature_count(), 1);
-            assert!(!aggregator.has_reached_threshold());
-            assert!(aggregator.add_partial_signature(message, partial_sig_4).await.is_ok());
-            assert_eq!(aggregator.signature_count(), 2);
-            assert!(!aggregator.has_reached_threshold());
-            assert!(aggregator.add_partial_signature(message, partial_sig_2).await.is_ok());
-            assert_eq!(aggregator.signature_count(), 3);
-            assert!(aggregator.has_reached_threshold());
+            // Expect `threshold` number of "verify" metrics, followed by one "aggregate"
+            for i in 0..threshold {
+                match tokio::time::timeout(Duration::from_millis(100), metrics_rx.recv()).await {
+                    Ok(Some(MetricEvent::TeeFunctionMeasured { function_name, node_id: metric_node_id, .. })) => {
+                        assert_eq!(function_name, "verify", "Expected metric for verify on signature {}", i);
+                        assert_eq!(metric_node_id, identities[0], "Metric node ID mismatch for verify {}", i);
+                    }
+                    Ok(Some(other)) => panic!("Received unexpected metric type while expecting verify {}: {:?}", i, other),
+                    Ok(None) => panic!("Metrics channel closed unexpectedly before verify metric {}", i),
+                    Err(_) => panic!("Timeout waiting for verify metric event {}", i),
+                }
+            }
 
-            let multi_sig = aggregator.finalize_multi_signature().expect("Finalization failed");
-            assert_eq!(multi_sig.len(), threshold);
+            // Now expect the "aggregate_signatures" metric
+            match tokio::time::timeout(Duration::from_millis(100), metrics_rx.recv()).await {
+                Ok(Some(MetricEvent::TeeFunctionMeasured { function_name, node_id: metric_node_id, .. })) => {
+                    assert_eq!(function_name, "aggregate_signatures", "Expected metric for aggregate_signatures");
+                    assert_eq!(metric_node_id, identities[0], "Metric node ID mismatch for aggregate");
+                }
+                Ok(Some(other)) => panic!("Received unexpected metric type while expecting aggregate: {:?}", other),
+                Ok(None) => panic!("Metrics channel closed unexpectedly before aggregate metric"),
+                Err(_) => panic!("Timeout waiting for aggregate_signatures metric event"),
+            }
 
-            // Verify the finalized multi-sig (also async now)
-            let is_valid = verify_multi_signature(message, &multi_sig, threshold, delay_config).await;
-            assert!(is_valid);
-        });
+            // Ensure no more metrics are unexpectedly sent
+            assert!(metrics_rx.try_recv().is_err(), "Should be no more metrics");
+
+        // }); // End run_async if used
     }
 
-    #[test]
-    fn test_aggregator_add_duplicate_signer_async() {
-        run_async(async {
-            let (id1, kp1) = create_real_tee(1);
-            let message = b"duplicate test";
-            let delay_config = Arc::new(TeeDelayConfig::default());
-            let mut aggregator = ThresholdAggregator::new(2, Arc::clone(&delay_config));
+    // Test adding a signature from a node not in the committee
+    #[tokio::test]
+    async fn add_signature_from_non_committee_member() {
+        // run_async(async {
+             let (identities, committee, _) = setup_committee(3);
+            let message = b"Test message".to_vec();
+            let delay_config = TeeDelayConfig::default();
+            let (metrics_tx, _) = mpsc::channel(100);
+            let node_id = Some(identities[0].clone());
 
-            let partial_sig1 = create_valid_partial_sig(&id1, &kp1, message).await;
-            let partial_sig2 = create_valid_partial_sig(&id1, &kp1, message).await; // Same signer
+            let mut aggregator = ThresholdAggregator::new(
+                message.clone(),
+                2,
+                committee,
+                delay_config,
+                Some(metrics_tx),
+                node_id.clone(),
+            );
 
-            assert!(aggregator.add_partial_signature(message, partial_sig1).await.is_ok());
-            assert!(aggregator.add_partial_signature(message, partial_sig2).await.is_err()); // Should fail
-            assert_eq!(aggregator.signature_count(), 1);
-        });
+            // Create a non-committee identity and key
+            let non_committee_sk = crypto_sim::generate_keypair();
+            let non_committee_pk = non_committee_sk.verifying_key().clone();
+            let non_committee_id = TEEIdentity { id: 99, public_key: non_committee_pk }; // Add pk
+            // Pass aggregator metrics config to sign
+            let signature = crypto_sim::sign(&message, &non_committee_sk, 0, 0, &aggregator.metrics_tx, &aggregator.node_id).await;
+
+            let result = aggregator.add_partial_signature(non_committee_id.clone(), signature).await;
+            assert!(result.is_err(), "Adding signature from non-committee member should fail");
+            assert!(result.clone().unwrap_err().contains("not part of the committee"), "Error message mismatch: {}", result.unwrap_err());
+        // });
     }
 
-    #[test]
-    fn test_aggregator_add_invalid_signature_async() {
-        run_async(async {
-            let (id1, kp1) = create_real_tee(1);
-            let message = b"invalid sig test";
-            let wrong_message = b"wrong message";
-            let delay_config = Arc::new(TeeDelayConfig::default());
-            let mut aggregator = ThresholdAggregator::new(1, Arc::clone(&delay_config));
+    // Test adding an invalid signature (e.g., wrong message signed)
+    #[tokio::test]
+    async fn add_invalid_signature() {
+         // run_async(async {
+            let (identities, committee, secret_keys) = setup_committee(3);
+            let message = b"Correct message".to_vec();
+            let wrong_message = b"Wrong message".to_vec();
+            let delay_config = TeeDelayConfig::default();
+             let (metrics_tx, _) = mpsc::channel(100);
+             let node_id = Some(identities[0].clone());
 
-            // Create sig with wrong message
-            let invalid_partial_sig = create_valid_partial_sig(&id1, &kp1, wrong_message).await;
-            
-            // Try adding it with the correct message context
-            assert!(aggregator.add_partial_signature(message, invalid_partial_sig).await.is_err()); // Should fail verification
-            assert_eq!(aggregator.signature_count(), 0);
-        });
+            let mut aggregator = ThresholdAggregator::new(
+                message.clone(),
+                2,
+                committee,
+                delay_config,
+                Some(metrics_tx),
+                node_id.clone(),
+            );
+
+            // Sign the *wrong* message
+            // Pass aggregator metrics config to sign
+            let signature = crypto_sim::sign(&wrong_message, &secret_keys[0], 0, 0, &aggregator.metrics_tx, &aggregator.node_id).await;
+
+            let result = aggregator.add_partial_signature(identities[0].clone(), signature).await;
+            assert!(result.is_err(), "Adding invalid signature should fail");
+            assert!(result.clone().unwrap_err().contains("Invalid partial signature"), "Error message mismatch: {}", result.unwrap_err());
+         // });
     }
 
-    #[test]
-    fn test_aggregator_threshold_not_met_async() {
-         run_async(async {
-            let (id1, kp1) = create_real_tee(1);
-            let (id2, kp2) = create_real_tee(2);
-            let message = b"threshold not met";
-            let threshold = 3;
-            let delay_config = Arc::new(TeeDelayConfig::default());
-            let mut aggregator = ThresholdAggregator::new(threshold, Arc::clone(&delay_config));
+    // Test adding a duplicate signature from the same signer
+    #[tokio::test]
+    async fn duplicate_signature_ignored() {
+        // run_async(async {
+            let (identities, committee, secret_keys) = setup_committee(3);
+            let message = b"Test message".to_vec();
+            let delay_config = TeeDelayConfig::default();
+            let (metrics_tx, _) = mpsc::channel(100);
+            let node_id = Some(identities[0].clone());
 
-            let partial_sig1 = create_valid_partial_sig(&id1, &kp1, message).await;
-            let partial_sig2 = create_valid_partial_sig(&id2, &kp2, message).await;
+            let mut aggregator = ThresholdAggregator::new(
+                message.clone(),
+                2,
+                committee,
+                delay_config,
+                Some(metrics_tx),
+                node_id.clone(),
+            );
 
-            assert!(aggregator.add_partial_signature(message, partial_sig1).await.is_ok());
-            assert!(aggregator.add_partial_signature(message, partial_sig2).await.is_ok());
+            // Add the first signature
+            // Pass aggregator metrics config to sign
+            let signature1 = crypto_sim::sign(&message, &secret_keys[0], 0, 0, &aggregator.metrics_tx, &aggregator.node_id).await;
+            let result1 = aggregator.add_partial_signature(identities[0].clone(), signature1.clone()).await;
+            assert!(result1.is_ok() && !result1.unwrap(), "First signature add failed or met threshold unexpectedly");
+            assert_eq!(aggregator.partial_signatures.len(), 1);
 
-            assert_eq!(aggregator.signature_count(), 2);
-            assert!(!aggregator.has_reached_threshold());
-            assert!(aggregator.finalize_multi_signature().is_none());
-        });
+            // Add the same signature again
+            let result2 = aggregator.add_partial_signature(identities[0].clone(), signature1).await;
+            assert!(result2.is_ok() && !result2.unwrap(), "Duplicate signature add failed or met threshold unexpectedly");
+            assert_eq!(aggregator.partial_signatures.len(), 1, "Duplicate signature should not increase count");
+            assert!(aggregator.get_combined_signature().is_none());
+
+             // Add a different signature to meet threshold
+             // Pass aggregator metrics config to sign
+             let signature2 = crypto_sim::sign(&message, &secret_keys[1], 0, 0, &aggregator.metrics_tx, &aggregator.node_id).await;
+             let result3 = aggregator.add_partial_signature(identities[1].clone(), signature2).await;
+             assert!(result3.is_ok() && result3.unwrap(), "Second unique signature failed to meet threshold");
+             assert_eq!(aggregator.partial_signatures.len(), 2);
+             assert!(aggregator.get_combined_signature().is_some());
+        // });
+    }
+
+    // Test scenario where threshold is not met
+    #[tokio::test]
+    async fn threshold_not_met() {
+        // run_async(async {
+            let (identities, committee, secret_keys) = setup_committee(5);
+        let threshold = 3;
+            let message = b"Test message".to_vec();
+            let delay_config = TeeDelayConfig::default();
+            let (metrics_tx, _) = mpsc::channel(100);
+            let node_id = Some(identities[0].clone());
+
+            let mut aggregator = ThresholdAggregator::new(
+                message.clone(),
+                threshold,
+                committee,
+                delay_config,
+                Some(metrics_tx),
+                node_id.clone(),
+            );
+
+            // Add fewer signatures than the threshold
+            for i in 0..(threshold - 1) {
+                // Pass aggregator metrics config to sign
+                let signature = crypto_sim::sign(&message, &secret_keys[i], 0, 0, &aggregator.metrics_tx, &aggregator.node_id).await;
+                let result = aggregator.add_partial_signature(identities[i].clone(), signature).await;
+                assert!(result.is_ok() && !result.unwrap(), "Signature add failed or met threshold too early");
+            }
+
+            assert_eq!(aggregator.partial_signatures.len(), threshold - 1);
+            assert!(aggregator.get_combined_signature().is_none(), "Combined signature should be None when threshold is not met");
+
+            // Attempting aggregation directly (though internal) should fail
+            let aggregation_result = aggregator.aggregate_signatures().await;
+            assert!(aggregation_result.is_err(), "Direct aggregation should fail if threshold not met");
+            assert!(aggregation_result.unwrap_err().contains("Threshold not met"));
+        // });
     }
 } 

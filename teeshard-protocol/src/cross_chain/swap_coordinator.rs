@@ -1,27 +1,24 @@
 // Placeholder for Cross-Chain Swap Coordinator logic (Algorithm 2)
 
-use crate::data_structures::{TEEIdentity, Transaction, LockInfo}; // Added LockInfo etc. for test helpers
+use crate::data_structures::{TEEIdentity, Transaction, AccountId, AssetId};
 use crate::config::SystemConfig;
 use crate::network::{NetworkInterface, NetworkMessage, Message};
 use crate::onchain::interface::{BlockchainInterface, SignatureBytes, TransactionId, BlockchainError, SwapId};
 use crate::onchain::evm_relayer::EvmRelayerError;
-use crate::tee_logic::threshold_sig::{ThresholdAggregator, PartialSignature, verify_multi_signature};
+use crate::tee_logic::threshold_sig::{ThresholdAggregator, PartialSignature};
 use crate::cross_chain::types::{LockProof, AbortReason, SignedCoordinatorDecision, LockRequest}; // Keep other types
-use crate::tee_logic::types::Signature;
 use crate::tee_logic::crypto_sim::SecretKey;
-use crate::raft::{messages::RaftMessage, node::RaftNode};
 use ed25519_dalek::Signer;
 use ed25519_dalek::VerifyingKey as PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
 use ethers::types::U256;
 use hex;
-use log::{info, warn, error, debug};
-use thiserror::Error;
 use tokio;
-use std::error::Error as StdError;
 use crate::tee_logic::lock_proofs; // Import the module
+use crate::raft::state::{Command, RaftRole};
+use crate::tee_logic::types::Signature;
+use crate::data_structures::LockInfo;
 
 // Constants
 const DEFAULT_SWAP_TIMEOUT_SECS: u64 = 3600; // 1 hour
@@ -32,6 +29,7 @@ pub struct CrossChainCoordinator {
     pub identity: TEEIdentity,
     pub signing_key: SecretKey, // Coordinator needs its own key to sign placeholder decisions
     pub config: SystemConfig, // Access to system-wide parameters
+    pub committee: Vec<TEEIdentity>, // The set of coordinators
     // Track ongoing swaps and their state
     pub active_swaps: HashMap<String, SwapState>,
     // Network interface for sending messages
@@ -73,6 +71,7 @@ impl CrossChainCoordinator {
          identity: TEEIdentity,
          signing_key: SecretKey,
          config: SystemConfig,
+         committee: Vec<TEEIdentity>, // Add committee parameter
          network: Arc<dyn NetworkInterface + Send + Sync>,
          blockchain_interface: Arc<dyn BlockchainInterface + Send + Sync>,
          shard_tee_assignments: HashMap<usize, Vec<TEEIdentity>>, // Add assignments map
@@ -81,6 +80,7 @@ impl CrossChainCoordinator {
              identity,
              signing_key,
              config,
+             committee, // Store the committee
              active_swaps: HashMap::new(),
              network,
              blockchain_interface,
@@ -250,26 +250,41 @@ impl CrossChainCoordinator {
     async fn add_local_signature_share(&mut self, tx_id: &str, commit: bool) -> Result<(), String> {
         let message_bytes = Self::prepare_decision_message(tx_id, commit);
         let threshold = self.get_coordinator_threshold();
-        // Get the delay config from self.config
-        // Need Arc<TeeDelayConfig> for ThresholdAggregator::new
         // Clone the TeeDelayConfig from SystemConfig and wrap in Arc
-        let delay_config = Arc::new(self.config.tee_delays.clone());
+        let delay_config_arc = Arc::new(self.config.tee_delays.clone());
 
-        let swap = self.active_swaps.get_mut(tx_id)
-            .ok_or_else(|| format!("Swap {} not found for signing", tx_id))?;
-
+        // Get the correct aggregator (release or abort) based on the 'commit' flag
         let aggregator_option = if commit {
-            &mut swap.release_aggregator
+            self.active_swaps.get_mut(tx_id).map(|swap| &mut swap.release_aggregator)
         } else {
-            &mut swap.abort_aggregator
+            self.active_swaps.get_mut(tx_id).map(|swap| &mut swap.abort_aggregator)
         };
 
-        // Ensure aggregator exists
+        let aggregator_option = match aggregator_option {
+            Some(agg) => agg,
+            None => return Err(format!("Swap {} not found for adding signature.", tx_id)),
+        };
+
+        // If the aggregator hasn't been created yet for this decision, create it.
         if aggregator_option.is_none() {
             println!("Coordinator ({}): Creating {} aggregator for swap {}",
                      self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id);
-            // Pass the delay config Arc when creating
-            *aggregator_option = Some(ThresholdAggregator::new(threshold, Arc::clone(&delay_config)));
+            // Gather all necessary arguments for ThresholdAggregator::new
+            let committee_map: HashMap<TEEIdentity, PublicKey> = self.committee.iter()
+                .map(|id| (id.clone(), id.public_key.clone()))
+                .collect();
+            let delay_config = (*delay_config_arc).clone(); // Clone the inner config
+            let node_id = Some(self.identity.clone());
+
+            // Pass the cloned delay config Arc when creating
+            *aggregator_option = Some(ThresholdAggregator::new(
+                message_bytes.clone(), // Message needs to be passed
+                threshold,
+                committee_map, // Use the created HashMap
+                delay_config, // Pass the cloned config, not the Arc
+                None, // Pass None for metrics_tx for now
+                node_id,
+            ));
         }
 
         // Re-borrow mutably AFTER the potential assignment above.
@@ -284,7 +299,7 @@ impl CrossChainCoordinator {
         };
 
         // Add the verified share to the aggregator (now async)
-        match aggregator.add_partial_signature(&message_bytes, partial_sig.clone()).await { // Added .await
+        match aggregator.add_partial_signature(partial_sig.signer_id.clone(), partial_sig.signature_data.clone()).await {
             Ok(_) => {
                 println!("Coordinator ({}): Added local {} signature share for swap {}. Total shares: {}",
                          self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
@@ -334,7 +349,7 @@ impl CrossChainCoordinator {
             let message_bytes = Self::prepare_decision_message(tx_id, commit);
             
             // Call async version and await
-            match aggregator.add_partial_signature(&message_bytes, partial_sig).await { // Added .await
+            match aggregator.add_partial_signature(partial_sig.signer_id.clone(), partial_sig.signature_data.clone()).await {
                 Ok(_) => {
                      println!("Coordinator ({}): Added remote {} signature share for swap {}. Total shares: {}",
                               self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
@@ -367,16 +382,16 @@ impl CrossChainCoordinator {
          if let Some(aggregator) = aggregator_option {
               println!("Coordinator ({}): Attempting to finalize {} for swap {}. Threshold: {}, Have: {}",
                        self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id,
-                       aggregator.get_required_threshold(), aggregator.signature_count());
+                       aggregator.get_threshold(), aggregator.signature_count());
 
              // Try to finalize using the multi-sig logic
-             if let Some(multi_sig) = aggregator.finalize_multi_signature() {
+             if let Some(combined_sig) = aggregator.get_combined_signature() {
                  println!("Coordinator ({}): Finalized {} decision for swap {} with {} signatures.",
-                          self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, multi_sig.len());
+                          self.identity.id, if commit {"RELEASE"} else {"ABORT"}, tx_id, aggregator.signature_count());
                  Some(SignedCoordinatorDecision {
                      tx_id: tx_id.to_string(),
                      commit,
-                     signature: multi_sig,
+                     signature: combined_sig.clone(),
                  })
              } else {
                   println!("Coordinator ({}): Threshold not yet met for {} decision on swap {}.",
@@ -595,12 +610,11 @@ impl CrossChainCoordinator {
             let swap_id: SwapId = swap_id_bytes.try_into()
                 .map_err(|_| EvmRelayerError::ParseError("Failed to convert Vec<u8> to SwapId [u8; 32]".to_string()))?;
 
-            // Pack the collected threshold signatures from the SignedCoordinatorDecision
+            // Construct the signature bytes needed by the relayer
+            // Use decision.signature which is now a single Signature
             let final_signature_bytes: SignatureBytes = decision.signature
-                .iter()
-                // Signatures are already pre-sorted by public key within the aggregator
-                .flat_map(|(_pk, sig)| sig.to_bytes().to_vec()) 
-                .collect();
+                .to_bytes()
+                .to_vec();
 
             println!("[Coordinator {}] Submitting with packed threshold signatures ({} bytes) for swap {}", self.identity.id, final_signature_bytes.len(), tx_id_str);
 
@@ -739,7 +753,13 @@ mod tests {
         data_to_sign.extend_from_slice(&lock_info.asset.token_symbol.as_bytes());
         data_to_sign.extend_from_slice(&lock_info.amount.to_le_bytes());
         // Provide delay arguments (0, 0 for tests) and await the async sign function
-        let signature = sign(&data_to_sign, signing_key, 0, 0).await;
+        let signature = sign(
+            &data_to_sign, 
+            signing_key, 
+            0, 0, // No delays for this internal signing
+            &None, // No direct metrics context here
+            &None  // No direct node ID context here
+        ).await;
 
         LockProof {
             tx_id: tx_id.to_string(),
@@ -908,12 +928,14 @@ mod tests {
 
         // Instantiate coordinators
         // Add cast for mock_blockchain
-        coordinators.insert(coord100_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord100_id.clone(), coord100_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
-        coordinators.insert(coord101_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord101_id.clone(), coord101_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
-        coordinators.insert(coord102_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord102_id.clone(), coord102_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord100_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord100_id.clone(), coord100_key, config.clone(), vec![coord100_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord101_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord101_id.clone(), coord101_key, config.clone(), vec![coord101_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord102_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord102_id.clone(), coord102_key, config.clone(), vec![coord102_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
 
-        // Define a dummy transaction
-        let swap_tx = create_dummy_swap_tx("multi_sign_swap_1");
+        // For simplicity, create a dummy transaction. Replace with actual logic.
+        // Prefix unused swap_tx
+        let _swap_tx = create_dummy_swap_tx("swap_tx_payload"); 
+        // This might involve signing, nonce management, etc.
 
         // Simulate multiple rounds of dispatching until no more messages are flowing
         let max_rounds = num_coordinators * 2; // Heuristic limit
@@ -960,9 +982,9 @@ mod tests {
         shard_assignments.insert(1, vec![coord101_id.clone()]);
         shard_assignments.insert(2, vec![coord102_id.clone()]);
 
-        coordinators.insert(coord100_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord100_id.clone(), coord100_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
-        coordinators.insert(coord101_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord101_id.clone(), coord101_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
-        coordinators.insert(coord102_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord102_id.clone(), coord102_key, config.clone(), Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord100_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord100_id.clone(), coord100_key, config.clone(), vec![coord100_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord101_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord101_id.clone(), coord101_key, config.clone(), vec![coord101_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
+        coordinators.insert(coord102_id.clone(), Arc::new(Mutex::new(CrossChainCoordinator::new(coord102_id.clone(), coord102_key, config.clone(), vec![coord102_id.clone()], Arc::clone(&mock_network) as Arc<_>, Arc::clone(&mock_blockchain) as Arc<dyn BlockchainInterface + Send + Sync>, shard_assignments.clone()))));
 
         let tx_timeout = Transaction {
            tx_id: "swap_timeout".to_string(),

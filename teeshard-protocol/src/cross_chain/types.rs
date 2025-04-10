@@ -6,7 +6,6 @@ use crate::tee_logic::types::Signature;
 // Import TEEIdentity
 use crate::data_structures::TEEIdentity;
 // Import PublicKey for SignedCoordinatorDecision
-use crate::tee_logic::crypto_sim::PublicKey;
 use serde::{Serialize, Deserialize};
 
 // Represents a proof from a shard that a resource has been locked
@@ -62,7 +61,8 @@ pub struct SignedCoordinatorDecision {
     // public key. This might include the signature bytes and potentially metadata
     // like the threshold level (k) or the set of participating signers.
     // TODO: Implement a real threshold signature scheme and update this type.
-    pub signature: Vec<(PublicKey, Signature)>,
+    // pub signature: Vec<(PublicKey, Signature)>,
+    pub signature: Signature, // Changed to accept a single combined signature
 }
 
 #[cfg(test)]
