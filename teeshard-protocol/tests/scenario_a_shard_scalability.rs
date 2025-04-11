@@ -178,10 +178,9 @@ async fn run_scenario_a_trial(
     let mut sim_config = SimulationConfig::default();
     sim_config.system_config.num_shards = num_shards;
     sim_config.system_config.nodes_per_shard = nodes_per_shard;
-    sim_config.system_config.num_coordinators = num_coordinators;
     sim_config.system_config.coordinator_threshold = coordinator_threshold;
-    // TODO: Configure network delays if needed for specific trials
     sim_config.sync_system_config();
+    sim_config.system_config.num_coordinators = num_coordinators;
 
     let total_nodes = num_shards * nodes_per_shard;
     let coordinator_id_start = total_nodes;
@@ -190,14 +189,20 @@ async fn run_scenario_a_trial(
     println!("[Scenario A] Setting up simulation...");
     let mut identities = Vec::new();
     let mut signing_keys = HashMap::new();
+    // Print the value used in the loop range calculation
+    println!("[Debug] Value of sim_config.system_config.num_coordinators JUST BEFORE loop: {}", sim_config.system_config.num_coordinators);
     for i in 0..(total_nodes + sim_config.system_config.num_coordinators) {
         let (identity, signing_key) = create_test_tee_signing(i);
         identities.push(identity.clone());
         signing_keys.insert(identity.id, signing_key);
     }
+    println!("[Debug] Length of main identities vector before slicing: {}", identities.len()); // Print length BEFORE slice
+
+    // coordinator_id_start = total_nodes = 14
+    let coordinator_identities: Vec<TEEIdentity> = identities[coordinator_id_start..].to_vec();
+    println!("[Debug] Length of coordinator_identities vector AFTER slicing: {}", coordinator_identities.len()); // Print length AFTER slice
 
     // Assign coordinator identities to config
-    let coordinator_identities: Vec<TEEIdentity> = identities[coordinator_id_start..].to_vec();
     sim_config.system_config.coordinator_identities = coordinator_identities.clone();
 
     // Runtime setup
@@ -234,7 +239,7 @@ async fn run_scenario_a_trial(
             let node = SimulatedTeeNode::new(
                 identity.clone(), secret_key, peers, sim_config.system_config.clone(),
                 runtime.clone(), network_rx, proposal_tx, proposal_rx, query_tx, query_rx,
-                shard_id,
+                shard_id as usize,
             );
             nodes_to_spawn.push(node);
         }
@@ -250,6 +255,7 @@ async fn run_scenario_a_trial(
 
     for i in 0..num_coordinators {
         println!("[Debug] Loop iteration i = {}", i);
+        println!("[Debug][i={}] Length of coordinator_identities: {}", i, coordinator_identities.len()); // Print length
         println!("[Debug][i={}] Accessing coordinator_identities[{}] (BEFORE CLONE)", i, i);
         let identity_ref = &coordinator_identities[i]; // Get reference first
         println!("[Debug][i={}] Cloning identity ID {}", i, identity_ref.id);
@@ -312,7 +318,10 @@ async fn run_scenario_a_trial(
         let handle = tokio::spawn(node.run());
         node_handles.push(handle);
     }
-    println!("[Scenario A] Spawned {} shard nodes.", total_nodes);
+    println!("[Scenario A] Spawned {} shard nodes.", node_handles.len());
+
+    // ADDED: Debug print to confirm setup phase completion
+    println!("[Debug] >>> Setup Phase Completed. Entering Transaction Submission <<< ");
 
     // --- Transaction Generation/Submission ---
     println!("[Scenario A] Starting transaction submission ({} tx, target {} TPS)...", num_transactions, target_tps);
