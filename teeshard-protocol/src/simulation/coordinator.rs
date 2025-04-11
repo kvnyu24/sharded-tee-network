@@ -145,8 +145,17 @@ impl SimulatedCoordinator {
         );
 
         // --- Verify Signature ---
-        // The message signed by TEE nodes is the *serialized LockProofData*
-        let message_bytes = match bincode::encode_to_vec(&lock_data, standard()) {
+        // Create a tuple of the fields that were signed (excluding start_time)
+        let signable_data_tuple = (
+            &lock_data.tx_id,
+            lock_data.source_chain_id,
+            lock_data.target_chain_id,
+            &lock_data.token_address,
+            lock_data.amount,
+            &lock_data.recipient
+        );
+        // The message signed/verified is the *serialized tuple*
+        let message_bytes = match bincode::encode_to_vec(&signable_data_tuple, standard()) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
@@ -482,6 +491,7 @@ mod tests {
             recipient: mock_recipient_account.address.clone(), // Use recipient address from Transaction account
             token_address: mock_source_asset.token_address.clone(), // Use token address from source asset
             amount: 1000, // Use u64 amount (matches Transaction amount)
+            start_time: Instant::now(), // Initialize the new field
         };
 
         (mock_tx, mock_lock_data)
@@ -621,7 +631,16 @@ mod tests {
         let tx_id = lock_data.tx_id.clone();
         // let coordinator_metrics_tx = coordinator.metrics_tx.clone(); // Use clone from above
 
-        let serialized_lock_data = bincode::encode_to_vec(&lock_data, standard()).unwrap();
+        // Encode the signable tuple, not the whole struct
+        let signable_data_tuple = (
+            &lock_data.tx_id,
+            lock_data.source_chain_id,
+            lock_data.target_chain_id,
+            &lock_data.token_address,
+            lock_data.amount,
+            &lock_data.recipient
+        );
+        let serialized_data = bincode::encode_to_vec(&signable_data_tuple, standard()).unwrap();
 
         // Simulate nodes sending shares
         for i in 0..threshold {
@@ -630,7 +649,7 @@ mod tests {
             let min_delay = tee_delays_clone.sign_min_ms;
             let max_delay = tee_delays_clone.sign_max_ms;
             let signature = sign(
-                &serialized_lock_data, 
+                &serialized_data, // Sign the serialized tuple
                 node_secret, 
                 min_delay, 
                 max_delay, 
@@ -684,7 +703,16 @@ mod tests {
         let tx_id = lock_data.tx_id.clone();
         // let coordinator_metrics_tx = coordinator.metrics_tx.clone(); // Use clone from above
 
-        let serialized_lock_data = bincode::encode_to_vec(&lock_data, standard()).unwrap();
+        // Encode the signable tuple
+        let signable_data_tuple = (
+            &lock_data.tx_id,
+            lock_data.source_chain_id,
+            lock_data.target_chain_id,
+            &lock_data.token_address,
+            lock_data.amount,
+            &lock_data.recipient
+        );
+        let serialized_data = bincode::encode_to_vec(&signable_data_tuple, standard()).unwrap();
 
         // Simulate nodes sending *fewer* than threshold shares
         for i in 0..shares_to_send {
@@ -693,7 +721,7 @@ mod tests {
             let min_delay = tee_delays_clone.sign_min_ms;
             let max_delay = tee_delays_clone.sign_max_ms;
             let signature = sign(
-                &serialized_lock_data, 
+                &serialized_data, // Sign the serialized tuple
                 node_secret, 
                 min_delay, 
                 max_delay, 
@@ -745,10 +773,19 @@ mod tests {
         let tx_id = lock_data.tx_id.clone();
         // let coordinator_metrics_tx = coordinator.metrics_tx.clone(); // Use clone from above
 
-        let serialized_lock_data = bincode::encode_to_vec(&lock_data, standard()).unwrap();
+        // Encode the signable tuple
+        let signable_data_tuple = (
+            &lock_data.tx_id,
+            lock_data.source_chain_id,
+            lock_data.target_chain_id,
+            &lock_data.token_address,
+            lock_data.amount,
+            &lock_data.recipient
+        );
+        let message_bytes = bincode::encode_to_vec(&signable_data_tuple, standard()).unwrap();
 
         // Simulate one node sending an invalid share
-        let message_bytes = bincode::encode_to_vec(&lock_data, standard()).unwrap();
+        // let message_bytes = bincode::encode_to_vec(&lock_data, standard()).unwrap(); // Old incorrect line
         let (node_identity, _node_secret) = &nodes[0]; // Use node 0's identity
         // Use imported Signature type
         let invalid_signature_bytes = [0u8; 64];
@@ -775,7 +812,7 @@ mod tests {
             let min_delay = tee_delays_clone.sign_min_ms;
             let max_delay = tee_delays_clone.sign_max_ms;
             let valid_signature = sign(
-                &message_bytes, 
+                &message_bytes, // Sign/verify the encoded tuple
                 valid_node_secret, 
                 min_delay, 
                 max_delay, 

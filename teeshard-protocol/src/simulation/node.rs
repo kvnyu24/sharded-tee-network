@@ -282,7 +282,18 @@ impl SimulatedTeeNode {
                         continue; // Skip processing this command
                     }
 
-                    match bincode::encode_to_vec(&lock_data, standard()) {
+                    // Create a tuple of the fields to be signed (excluding start_time)
+                    let signable_data = (
+                        &lock_data.tx_id, 
+                        lock_data.source_chain_id, 
+                        lock_data.target_chain_id, 
+                        &lock_data.token_address, 
+                        lock_data.amount, 
+                        &lock_data.recipient
+                    );
+
+                    // Encode the tuple using bincode
+                    match bincode::encode_to_vec(&signable_data, standard()) {
                         Ok(data_to_sign) => {
                             // DEBUG: Print data and key before signing
                             println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));

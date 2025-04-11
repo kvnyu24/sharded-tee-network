@@ -13,10 +13,17 @@ pub struct AttestationReport {
     // Add other fields like TEE measurements, identity info, etc.
 }
 
+use std::time::Instant;
+
+// Function to provide a default Instant value for serde
+fn default_instant() -> Instant {
+    Instant::now()
+}
+
 // Represents data related to a specific lock event that needs
 // consensus and signing by TEEs.
-// Add bincode Encode/Decode traits
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+// Remove bincode derives as Instant cannot be encoded
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LockProofData {
     // Unique identifier for the overall transaction/swap
     pub tx_id: String,
@@ -33,6 +40,11 @@ pub struct LockProofData {
     // Potentially other relevant data like source sender, nonce, etc.
     // pub source_sender: String,
     // pub nonce: u64,
+
+    // Start time of the transaction, used for latency calculation.
+    // Skip serialization/deserialization for this field.
+    #[serde(skip, default = "default_instant")]
+    pub start_time: Instant, 
 }
 
 #[cfg(test)]

@@ -36,6 +36,7 @@ use teeshard_protocol::onchain::evm_relayer::{EvmRelayer, EvmRelayerConfig, Chai
 use tokio::process::Command as TokioCommand;
 use log::info;
 use teeshard_protocol::tee_logic::crypto_sim;
+use std::time::Instant;
 
 // Helper to create TEE Identity and SecretKey (can be shared with other tests)
 fn create_test_tee(id: usize) -> (TEEIdentity, SecretKey) {
@@ -482,6 +483,7 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
         token_address: transactions[0].required_locks[0].asset.token_address.clone(),
         amount: transactions[0].required_locks[0].amount,
         recipient: transactions[0].accounts[1].address.clone(),
+        start_time: Instant::now(), // Initialize the new field
     };
 
     // Send command to the coordinator task using the correct variant

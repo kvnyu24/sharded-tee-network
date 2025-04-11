@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::time::Instant; // Add Instant
 
 /// Commands that can be applied to the state machine via Raft consensus.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     // Example: Confirm a lock has been observed and generate signature share
     ConfirmLockAndSign(LockProofData),

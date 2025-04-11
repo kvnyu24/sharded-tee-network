@@ -235,6 +235,7 @@ async fn test_raft_state_machine_command_processing() {
         token_address: "0xtesttokenB".to_string(),
         amount: 2000,
         recipient: "0xrecipientaddrB".to_string(),
+        start_time: Instant::now(),
     };
     let command = Command::ConfirmLockAndSign(lock_proof_data.clone());
     
@@ -326,7 +327,16 @@ async fn test_raft_state_machine_command_processing() {
         assert_eq!(received_lock_data, &lock_proof_data, "Share contained incorrect lock data");
 
         // Verify signature
-        let data_to_verify = bincode::encode_to_vec(&lock_proof_data, standard()).unwrap();
+        // Encode the tuple of relevant fields, not the whole struct
+        let signable_data_tuple = (
+            &lock_proof_data.tx_id,
+            lock_proof_data.source_chain_id,
+            lock_proof_data.target_chain_id,
+            &lock_proof_data.token_address,
+            lock_proof_data.amount,
+            &lock_proof_data.recipient
+        );
+        let data_to_verify = bincode::encode_to_vec(&signable_data_tuple, standard()).unwrap();
 
         // DEBUG: Print data and key before verification
         println!("[Test][VerifyDebug] Verifying for Node {}", signer_identity.id);
@@ -593,6 +603,7 @@ async fn test_threshold_signature_simulation() {
         token_address: "0xtoken_test".to_string(),
         amount: 100,
         recipient: "0xrecipient_test".to_string(),
+        start_time: Instant::now(),
     };
 
     let command = Command::ConfirmLockAndSign(lock_data.clone());
