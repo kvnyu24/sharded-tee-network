@@ -24,6 +24,7 @@ serde_bytes = "0.11"
 log = "0.4"
 thiserror = "1.0"
 blake3 = "1.5.0"
+humantime-serde = "1.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -32,4 +33,5 @@ hex = "0.4"
 rand = "0.8"
 async-trait = "0.1"
 ethers = { version = "2.0", features = ["abigen", "rustls", "ws"] }
+tracing = "0.1"
 # ethers = { version = "2.0", features = ["abigen", "rustls", "ws"] } # Example features 

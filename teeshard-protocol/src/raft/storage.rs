@@ -10,6 +10,8 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 // Add missing import
 use std::time::Instant;
+// ADD SystemTime and Duration
+use std::time::{SystemTime, Duration};
 
 /// Trait for Raft persistent storage.
 /// Implementors must be Send + Sync to be used across threads.
@@ -158,6 +160,8 @@ mod tests {
     use super::*;
     use crate::raft::state::Command;
     use crate::tee_logic::crypto_sim::generate_keypair;
+    // ADD Duration import here too
+    use std::time::{Duration, Instant, SystemTime};
 
      fn create_test_tee(id: usize) -> TEEIdentity {
         // Create TEEIdentity with usize ID and a real public key
@@ -184,10 +188,15 @@ mod tests {
         storage.save_voted_for(None);
         assert!(storage.get_voted_for().is_none());
 
+        // Calculate a duration for the test entries
+        let duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::ZERO);
+
         let entries = vec![
-            LogEntry { term: 1, command: Command::Dummy, proposal_time: Instant::now() },
-            LogEntry { term: 2, command: Command::Dummy, proposal_time: Instant::now() },
-            LogEntry { term: 3, command: Command::Dummy, proposal_time: Instant::now() },
+            // Use the correct field name and provide the Duration
+            LogEntry { term: 1, command: Command::Dummy, proposal_time_since_epoch: duration_since_epoch },
+            LogEntry { term: 2, command: Command::Dummy, proposal_time_since_epoch: duration_since_epoch },
+            LogEntry { term: 3, command: Command::Dummy, proposal_time_since_epoch: duration_since_epoch },
         ];
         storage.append_log_entries(&entries);
         assert_eq!(storage.get_log_len(), 3);
@@ -212,7 +221,10 @@ mod tests {
          assert_eq!(storage.get_last_log_term(), 0);
 
          // Test appending again after truncation
-         let new_entries = vec![LogEntry { term: 4, command: Command::Dummy, proposal_time: Instant::now() }];
+         // Calculate a new duration for the new entry
+         let new_duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+             .unwrap_or_else(|_| Duration::ZERO);
+         let new_entries = vec![LogEntry { term: 4, command: Command::Dummy, proposal_time_since_epoch: new_duration_since_epoch }];
          storage.append_log_entries(&new_entries);
          assert_eq!(storage.get_log_len(), 1);
          assert_eq!(storage.get_last_log_index(), 1);

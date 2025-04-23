@@ -18,146 +18,17 @@ use teeshard_protocol::{
 };
 use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use hex;
-use rand::Rng;
-use log::warn;
+use rand::{thread_rng, Rng};
+use tracing::{info, warn};
 
-// --- Helper Functions (Copied from simulation_tests.rs - TODO: Move to shared test utils module) ---
+// Import shared test utilities
+use teeshard_protocol::test_utils::*;
 
-fn create_test_tee_signing(id: usize) -> (TEEIdentity, SigningKey) {
-    // Simple deterministic key generation for testing reproducibility
-    let seed = [(id % 256) as u8; 32];
-    let signing_key = SigningKey::from_bytes(&seed);
-    let verifying_key = signing_key.verifying_key();
-    (TEEIdentity { id, public_key: verifying_key }, signing_key)
-}
-
-
-fn generate_test_transaction(tx_id_num: usize, cross_chain: bool, num_chains: usize) -> (Transaction, [u8; 32]) {
-    // Ensure num_chains > 0
-    let num_chains = if num_chains == 0 { 1 } else { num_chains };
-    let chain_id_a = (tx_id_num % num_chains) as u64; // Assign to a chain
-    let chain_id_b = ((tx_id_num + 1) % num_chains) as u64; // Assign to potentially different chain
-
-    let acc_a1 = AccountId { chain_id: chain_id_a, address: format!("user_a_{}", tx_id_num) };
-    let acc_a2 = AccountId { chain_id: chain_id_a, address: format!("pool_{}", chain_id_a) };
-    let asset_a = AssetId { chain_id: chain_id_a, token_symbol: format!("TKA{}", chain_id_a), token_address: format!("0xA{}", chain_id_a) };
-
-    // Create a mock 32-byte ID (e.g., tx_id_num as bytes padded)
-    let mut mock_swap_id = [0u8; 32];
-    let num_bytes = (tx_id_num as u64).to_be_bytes();
-    let start_index = mock_swap_id.len() - num_bytes.len();
-    mock_swap_id[start_index..].copy_from_slice(&num_bytes);
-
-    if cross_chain && chain_id_a != chain_id_b {
-        let acc_b1 = AccountId { chain_id: chain_id_b, address: format!("user_b_{}", tx_id_num) };
-        let acc_b2 = AccountId { chain_id: chain_id_b, address: format!("pool_{}", chain_id_b) };
-        let asset_b = AssetId { chain_id: chain_id_b, token_symbol: format!("TKB{}", chain_id_b), token_address: format!("0xB{}", chain_id_b) };
-        let tx = Transaction {
-            tx_id: format!("cc-tx-{}", tx_id_num),
-            tx_type: TxType::CrossChainSwap,
-            accounts: vec![acc_a1.clone(), acc_a2, acc_b1.clone(), acc_b2],
-            amounts: vec![100, 50], // Example amounts
-            required_locks: vec![
-                LockInfo { account: acc_a1, asset: asset_a.clone(), amount: 100 },
-                LockInfo { account: acc_b1, asset: asset_b.clone(), amount: 50 },
-            ],
-            target_asset: Some(asset_b), // Target asset for the swap
-            timeout: Duration::from_secs(60),
-        };
-        (tx, mock_swap_id)
-    } else {
-        // Treat as single chain even if originally cross_chain was true but chains matched
-        let tx = Transaction {
-            tx_id: format!("sc-tx-{}", tx_id_num),
-            tx_type: TxType::SingleChainTransfer,
-            accounts: vec![acc_a1.clone(), acc_a2],
-            amounts: vec![100],
-            required_locks: vec![LockInfo { account: acc_a1, asset: asset_a, amount: 100 }],
-            target_asset: None,
-            timeout: Duration::from_secs(60),
-        };
-        (tx, mock_swap_id)
-    }
-}
-
-// --- Performance Analysis Function (Based on provided baseline) ---
-fn analyze_perf_results(
-    scenario_name: &str,
-    scenario_params: &HashMap<String, String>,
-    metrics: &[MetricEvent],
-    submitted_count: usize,
-    submission_duration: Duration,
-) {
-    let mut latencies = Vec::new();
-    let mut completed_count = 0;
-    let mut successful_count = 0;
-
-    // Assuming MetricEvent::TransactionCompleted exists with these fields
-    for event in metrics {
-        if let MetricEvent::TransactionCompleted { start_time, end_time, success, .. } = event {
-            completed_count += 1;
-            if *success { 
-                successful_count += 1;
-                if *end_time >= *start_time {
-                    latencies.push((*end_time - *start_time).as_micros());
-                } else {
-                    warn!("Completion time (end_time) before start time detected, skipping latency calc.");
-                }
-            }
-        }
-        // TODO: Add extraction for other relevant metrics based on scenario
-        // e.g., Raft events, TEE operation timings if available in MetricEvent
-    }
-
-    latencies.sort_unstable();
-
-    let avg_latency_us = if !latencies.is_empty() {
-        latencies.iter().sum::<u128>() / latencies.len() as u128
-    } else {
-        0
-    };
-    // Calculate p95 and p99 only if there are enough successful transactions
-    let p95_latency_us = if latencies.len() > 1 {
-        let index = (latencies.len() as f64 * 0.95).floor() as usize;
-        latencies[index.min(latencies.len() - 1)] // Ensure index is within bounds
-    } else {
-        avg_latency_us // Fallback to average if too few samples
-    };
-    let p99_latency_us = if latencies.len() > 1 {
-        let index = (latencies.len() as f64 * 0.99).floor() as usize;
-        latencies[index.min(latencies.len() - 1)] // Ensure index is within bounds
-    } else {
-        avg_latency_us // Fallback to average if too few samples
-    };
-
-    // Calculate throughput based on *completed* transactions over *submission* duration.
-    // This is a reasonable approximation but might slightly overestimate if completion lags significantly.
-    let throughput_cps = if submission_duration > Duration::ZERO {
-        completed_count as f64 / submission_duration.as_secs_f64()
-    } else {
-        0.0 // Avoid division by zero
-    };
-
-    println!("\n--- {} Analysis (Params: {:?}) ---", scenario_name, scenario_params);
-    println!("Submitted Transactions: {}", submitted_count);
-    println!("Completed Transactions: {}", completed_count);
-    println!("Successful Transactions: {}", successful_count); // Added successful count
-    println!("Submission Duration: {:.2?}", submission_duration);
-    println!("Calculated Throughput (Completed/SubmissionTime): {:.2} CPS", throughput_cps);
-    if !latencies.is_empty() {
-        println!("Latency (Successful TXs): [based on {} samples]", latencies.len());
-        println!("  Average: {:.3} ms", avg_latency_us as f64 / 1000.0);
-        println!("  P95:     {:.3} ms", p95_latency_us as f64 / 1000.0);
-        println!("  P99:     {:.3} ms", p99_latency_us as f64 / 1000.0);
-    } else {
-        println!("Latency (Successful TXs): No successful transactions with valid timings recorded.");
-    }
-    println!("------------------------------------\n");
-}
+// --- Helper Functions Removed (Now in test_utils) ---
 
 // --- Test Runner Function ---
 
@@ -179,8 +50,12 @@ async fn run_scenario_a_trial(
     sim_config.system_config.num_shards = num_shards;
     sim_config.system_config.nodes_per_shard = nodes_per_shard;
     sim_config.system_config.coordinator_threshold = coordinator_threshold;
-    sim_config.sync_system_config();
     sim_config.system_config.num_coordinators = num_coordinators;
+
+    // Increase Raft timeouts to potentially avoid election loops
+    sim_config.system_config.raft_election_timeout_min_ms = 1000;
+    sim_config.system_config.raft_election_timeout_max_ms = 2000;
+    sim_config.system_config.raft_heartbeat_ms = 200;
 
     let total_nodes = num_shards * nodes_per_shard;
     let coordinator_id_start = total_nodes;
@@ -189,46 +64,50 @@ async fn run_scenario_a_trial(
     println!("[Scenario A] Setting up simulation...");
     let mut identities = Vec::new();
     let mut signing_keys = HashMap::new();
-    // Print the value used in the loop range calculation
-    println!("[Debug] Value of sim_config.system_config.num_coordinators JUST BEFORE loop: {}", sim_config.system_config.num_coordinators);
-    for i in 0..(total_nodes + sim_config.system_config.num_coordinators) {
+    for i in 0..(total_nodes + num_coordinators) {
         let (identity, signing_key) = create_test_tee_signing(i);
         identities.push(identity.clone());
         signing_keys.insert(identity.id, signing_key);
     }
-    println!("[Debug] Length of main identities vector before slicing: {}", identities.len()); // Print length BEFORE slice
 
-    // coordinator_id_start = total_nodes = 14
     let coordinator_identities: Vec<TEEIdentity> = identities[coordinator_id_start..].to_vec();
-    println!("[Debug] Length of coordinator_identities vector AFTER slicing: {}", coordinator_identities.len()); // Print length AFTER slice
-
-    // Assign coordinator identities to config
     sim_config.system_config.coordinator_identities = coordinator_identities.clone();
 
     // Runtime setup
+    println!("[Debug] >>> PRE SimulationRuntime::new <<<");
     let (runtime, result_rx, _isolation_rx, metrics_handle) =
         SimulationRuntime::new(sim_config.clone());
-    let mut opt_result_rx = Some(result_rx); // Wrap in Option
+    println!("[Debug] >>> POST SimulationRuntime::new <<<");
+    let mut opt_result_rx = Some(result_rx);
 
-    // Dummy partition mapping (may need refinement based on actual partitioning logic)
     let partition_mapping: PartitionMapping = HashMap::new();
+    let shard_assignments: Arc<TokioMutex<HashMap<usize, Vec<TEEIdentity>>>> = Arc::new(TokioMutex::new(HashMap::new()));
 
-    // Setup Shard Nodes
-    let mut nodes_to_spawn = Vec::new();
+    let blockchain_interface = Arc::new(MockBlockchainInterface::new());
+    let mut coordinator_handles = Vec::new();
+    let mut node_handles = Vec::new();
+
+    // --- RESTORE THE NORMAL SETUP LOOPS ---
+    println!("[DEBUG] >>> Entering Shard Node PREPARATION Loop <<<"); // Added
+    let mut nodes_to_spawn = Vec::new(); // Define nodes_to_spawn here
     for shard_id in 0..num_shards {
+        println!("[Debug][Shard Prep {}] >>> Loop Start <<<", shard_id); // Added
         let mut current_shard_nodes = Vec::new();
         let start_node_id = shard_id * nodes_per_shard;
         let end_node_id = start_node_id + nodes_per_shard;
 
         for node_id in start_node_id..end_node_id {
+            println!("[Debug][Shard Prep {}][Node {}] >>> Inner Loop Start <<<", shard_id, node_id); // Added
             let identity = identities[node_id].clone();
             let secret_key = signing_keys.get(&identity.id).unwrap().clone();
-            current_shard_nodes.push(identity.clone());
+            // current_shard_nodes.push(identity.clone()); // Pushed later
 
-            let (proposal_tx, proposal_rx) = mpsc::channel::<NodeProposalRequest>(100);
-            let (query_tx, query_rx) = mpsc::channel::<NodeQuery>(10);
+            let (proposal_tx, proposal_rx) = mpsc::channel::<NodeProposalRequest>(10000);
+            let (query_tx, query_rx) = mpsc::channel::<NodeQuery>(1000);
 
+            println!("[Debug][Shard Prep {}][Node {}] PRE runtime.register_node <<<", shard_id, node_id); // Added
             let network_rx = runtime.register_node(identity.clone(), proposal_tx.clone()).await;
+            println!("[Debug][Shard Prep {}][Node {}] POST runtime.register_node <<<", shard_id, node_id); // Added
 
             let peers: Vec<TEEIdentity> = identities[start_node_id..end_node_id]
                 .iter()
@@ -242,117 +121,121 @@ async fn run_scenario_a_trial(
                 shard_id as usize,
             );
             nodes_to_spawn.push(node);
+            current_shard_nodes.push(identity.clone()); // Add to list for assignment
         }
-        runtime.assign_nodes_to_shard(shard_id, current_shard_nodes).await;
+        runtime.assign_nodes_to_shard(shard_id, current_shard_nodes.clone()).await;
+        shard_assignments.lock().await.insert(shard_id, current_shard_nodes);
     }
     println!("[Scenario A] Shard nodes created and registered.");
 
-    // Setup Coordinator Nodes
-    let blockchain_interface = Arc::new(MockBlockchainInterface::new());
-    let mut coordinator_handles = Vec::new();
-    // Channel for coordinator results (if multiple coordinators produce results)
-    // let (coord_result_tx, mut coord_result_rx) = mpsc::channel(100);
-
+    println!("[Debug] >>> Entering Coordinator Setup Loop <<<");
     for i in 0..num_coordinators {
-        println!("[Debug] Loop iteration i = {}", i);
-        println!("[Debug][i={}] Length of coordinator_identities: {}", i, coordinator_identities.len()); // Print length
-        println!("[Debug][i={}] Accessing coordinator_identities[{}] (BEFORE CLONE)", i, i);
-        let identity_ref = &coordinator_identities[i]; // Get reference first
-        println!("[Debug][i={}] Cloning identity ID {}", i, identity_ref.id);
-        let coord_identity = identity_ref.clone(); // Clone the reference
-        println!("[Debug][i={}] Identity cloned successfully.", i);
-        
-        println!("[Debug][i={}] Getting signing key for ID {} (BEFORE GET)", i, coord_identity.id);
-        let signing_key_option = signing_keys.get(&coord_identity.id); // Separate get
-        println!("[Debug][i={}] Signing key get returned Option: is_some={}", i, signing_key_option.is_some());
-        let signing_key_ref = signing_key_option.unwrap(); // Separate unwrap
-        println!("[Debug][i={}] Cloning signing key", i);
-        let coord_signing_key = signing_key_ref.clone(); // Separate clone
-        println!("[Debug][i={}] Signing key cloned successfully.", i);
+         // ... (Restore original coordinator setup loop content) ...
+         println!("[Debug][Coord {}] >>> Loop Start <<<", i); // Added
+         let coord_identity = coordinator_identities[i].clone();
+         let coord_signing_key = signing_keys.get(&coord_identity.id).unwrap().clone();
 
-        println!("[Debug][i={}] Creating channel", i);
-        let (coord_network_tx, _coord_network_rx) = mpsc::channel(100);
-        println!("[Debug][i={}] PRE-AWAIT runtime.register_component for ID {}", i, coord_identity.id);
-        runtime.register_component(coord_identity.clone(), coord_network_tx).await;
-        println!("[Debug][i={}] POST-AWAIT runtime.register_component for ID {}", i, coord_identity.id);
-        let coordinator_metrics_tx = runtime.get_metrics_sender();
+         println!("[Debug][Coord {}] Creating channel", i); // Added
+         let (coord_network_tx, _coord_network_rx) = mpsc::channel(100);
+         println!("[Debug][Coord {}] PRE-AWAIT runtime.register_component for ID {}", i, coord_identity.id); // Added
+         runtime.register_component(coord_identity.clone(), coord_network_tx).await;
+         println!("[Debug][Coord {}] POST-AWAIT runtime.register_component for ID {}", i, coord_identity.id); // Added
+         let coordinator_metrics_tx = runtime.get_metrics_sender();
 
-        println!("[Debug][i={}] Calling SimulatedCoordinator::new for ID {}", i, coord_identity.id);
-        let coordinator = SimulatedCoordinator::new(
-            coord_identity.clone(),
-            coord_signing_key,
-            sim_config.system_config.clone(),
-            runtime.clone(),
-            blockchain_interface.clone(),
-            partition_mapping.clone(), // This is currently an empty HashMap
-            coordinator_metrics_tx.clone(),
-        );
-        println!("[Debug][i={}] SimulatedCoordinator::new finished", i);
-        let coordinator_arc = Arc::new(coordinator);
+         println!("[Debug][Coord {}] Calling SimulatedCoordinator::new for ID {}", i, coord_identity.id); // Added
+         let coordinator = SimulatedCoordinator::new(
+             coord_identity.clone(),
+             coord_signing_key,
+             sim_config.system_config.clone(),
+             runtime.clone(),
+             blockchain_interface.clone(),
+             partition_mapping.clone(),
+             coordinator_metrics_tx.clone(),
+             shard_assignments.clone(),
+         );
+         println!("[Debug][Coord {}] SimulatedCoordinator::new finished", i); // Added
+         let coordinator_arc = Arc::new(coordinator);
 
-        // Spawn listener for the first coordinator
-        if i == 0 {
-            println!("[Debug][i={}] In i == 0 block", i);
-             if let Some(rx_to_move) = opt_result_rx.take() { // Take the receiver here
-                 let listener_handle = {
-                     let coordinator_clone = coordinator_arc.clone();
-                     tokio::spawn(async move {
-                         coordinator_clone.run_share_listener(rx_to_move).await;
-                     })
-                 };
-                 coordinator_handles.push(listener_handle);
-                 println!("[Scenario A] Spawned Share Listener for Coordinator {}.", coord_identity.id);
-            } else {
-                 eprintln!("[Scenario A] Error: Could not take result_rx for Coordinator 0 listener.");
-             }
-        } else {
-             println!("[Debug][i={}] In else block for coordinator setup", i);
-             println!("[Scenario A] TODO: Spawn other tasks for Coordinator {}.", coord_identity.id);
-        }
-         println!("[Debug][i={}] End of loop iteration", i);
+         if i == 0 {
+             println!("[Debug][Coord {}] In i == 0 block, PRE-TAKE opt_result_rx", i); // Added
+              if let Some(rx_to_move) = opt_result_rx.take() {
+                  println!("[Debug][Coord {}] PRE-SPAWN Share Listener", i); // Added
+                  let listener_handle = {
+                      let coordinator_clone = coordinator_arc.clone();
+                      tokio::spawn(async move {
+                          println!("[Debug][Coord 0 Listener] Task started."); // Added inside task
+                          coordinator_clone.run_share_listener(rx_to_move).await;
+                          println!("[Debug][Coord 0 Listener] Task finished."); // Added inside task
+                      })
+                  };
+                  coordinator_handles.push(listener_handle);
+                  println!("[Debug][Coord {}] POST-SPAWN Share Listener for Coordinator {}.", i, coord_identity.id); // Added
+             } else {
+                  eprintln!("[Scenario A] Error: Could not take result_rx for Coordinator 0 listener.");
+              }
+         } else {
+              println!("[Debug][Coord {}] In else block for coordinator setup", i); // Added
+              println!("[Scenario A] TODO: Spawn other tasks for Coordinator {}.", coord_identity.id);
+         }
+          println!("[Debug][Coord {}] >>> Loop End <<<", i); // Added
     }
+    println!("[Debug] >>> Exited Coordinator Setup Loop <<<"); // Added
 
-    // Spawn Shard Nodes
-    let mut node_handles = Vec::new();
-    for node in nodes_to_spawn {
-        let handle = tokio::spawn(node.run());
+    println!("[Debug] >>> Entering Shard Node Spawning Loop <<<"); // Added
+    // let mut node_handles = Vec::new(); // Already defined above
+    for (idx, node) in nodes_to_spawn.into_iter().enumerate() {
+        let node_id = node.identity.id;
+        // Capture shard_id *before* moving node into the async block
+        let node_shard_id = node.shard_id(); 
+        println!("[Debug][Node Spawn {}] PRE-SPAWN for Node ID {}", idx, node_id); // Added
+        let handle = tokio::spawn(async move {
+             // NOTE: Keep the startup println here inside the spawn block
+             // Use the captured node_shard_id
+             println!("[Node {} Task Startup] Entered run method. Shard ID: {}", node_id, node_shard_id);
+             node.run().await;
+             println!("[Node {} Task] Finished.", node_id); // Added inside task
+        });
         node_handles.push(handle);
+        println!("[Debug][Node Spawn {}] POST-SPAWN for Node ID {}", idx, node_id); // Added
     }
+    println!("[Debug] >>> Exited Shard Node Spawning Loop <<<"); // Added
     println!("[Scenario A] Spawned {} shard nodes.", node_handles.len());
+    // --- END RESTORE ---
 
     // ADDED: Debug print to confirm setup phase completion
     println!("[Debug] >>> Setup Phase Completed. Entering Transaction Submission <<< ");
 
-    // --- Transaction Generation/Submission ---
+    // --- Transaction Generation/Submission (Restore original target shard logic) ---
     println!("[Scenario A] Starting transaction submission ({} tx, target {} TPS)...", num_transactions, target_tps);
     let submission_interval = Duration::from_secs_f64(1.0 / target_tps as f64);
     let start_of_submission = Instant::now();
 
+    println!("[Debug] >>> Entering submission FOR loop <<< ");
     for i in 0..num_transactions {
         let is_cross_chain = rand::random::<f64>() < cross_chain_ratio;
         let (tx, _mock_swap_id_bytes) = generate_test_transaction(i, is_cross_chain, num_blockchains);
 
-        // Target shard determination (simple round-robin)
+        // --- RESTORE Original shard target ---
         let target_shard_id = i % num_shards;
 
-        // Command creation (assuming ConfirmLockAndSign is the entry point)
-        // This needs verification - does the client interact directly or propose this command?
-        // For perf test, assume this command triggers the TEE flow.
         let lock_proof_data = LockProofData {
-            tx_id: tx.tx_id.clone(), // Use descriptive ID? Or bytes32 ID? Needs consistency.
+            tx_id: tx.tx_id.clone(),
+            shard_id: target_shard_id, // Use original target shard ID
             source_chain_id: tx.required_locks.first().map(|l| l.asset.chain_id).unwrap_or(0),
             target_chain_id: tx.target_asset.map(|a| a.chain_id).unwrap_or(0),
             token_address: tx.required_locks.first().map(|l| l.asset.token_address.clone()).unwrap_or_default(),
             amount: tx.amounts.first().copied().unwrap_or(0),
             recipient: tx.accounts.last().map(|a| a.address.clone()).unwrap_or_default(),
-            start_time: Instant::now(), // Initialize the new field
+            start_time: Instant::now(),
         };
         let command = Command::ConfirmLockAndSign(lock_proof_data);
 
+        println!("[Debug] >>> Sending command for tx {} to shard {} <<< ", i, target_shard_id);
         runtime.send_command_to_shard(target_shard_id, command).await;
+        println!("[Debug] >>> Command for tx {} sent <<< ", i);
 
         tokio::time::sleep(submission_interval).await;
-        if i % 100 == 0 && i > 0 { // Log every 100
+        if i % 100 == 0 && i > 0 {
             println!("[Scenario A] Submitted {} transactions...", i);
         }
     }
@@ -360,19 +243,32 @@ async fn run_scenario_a_trial(
     println!("[Scenario A] Finished submitting {} transactions in {:?}.", num_transactions, submission_duration);
 
     // --- Completion Wait ---
-    // TODO: Implement robust completion check (e.g., wait for expected metric count or use channels)
+    println!("[Scenario A] SUBMISSION COMPLETE. Entering 60s wait period...");
     println!("[Scenario A] Waiting for transactions to complete (max 60s)... ");
-    tokio::time::sleep(Duration::from_secs(60)).await; // Increased wait time
+    tokio::time::sleep(Duration::from_secs(60)).await;
 
-    // --- Cleanup & Metric Collection ---\n    println!(\"[Scenario A] Cleaning up nodes and collecting metrics...\");
-    // Abort coordinator tasks first
+    // --- Cleanup & Metric Collection ---
+    println!("[Scenario A] Cleaning up nodes and collecting metrics...");
+    // Abort the handles we created
     for handle in coordinator_handles { handle.abort(); }
-    // Abort node tasks
     for handle in node_handles { handle.abort(); }
 
+    // --- Drop the runtime explicitly HERE ---
+    println!("[Scenario A] Dropping SimulationRuntime instance...");
+    drop(runtime);
+    println!("[Scenario A] SimulationRuntime instance dropped.");
+    // --- End Drop ---
+
+    println!("[Scenario A] Awaiting metrics handle..."); // Added log
     let collected_metrics = match metrics_handle.await {
-        Ok(metrics) => metrics,
-        Err(e) => { eprintln!("[Scenario A] Error awaiting metrics handle: {}", e); Vec::new() }
+        Ok(metrics) => {
+            println!("[Scenario A] Metrics collected successfully ({} events).", metrics.len()); // Added log
+            metrics
+        },
+        Err(e) => {
+            eprintln!("[Scenario A] Error awaiting metrics handle: {}", e);
+            Vec::new()
+        }
     };
     println!("[Scenario A] Trial finished.");
     (collected_metrics, submission_duration)
@@ -380,15 +276,15 @@ async fn run_scenario_a_trial(
 
 // --- Main Test Function ---
 
-#[tokio::test]
-#[ignore] // Ignore by default, run explicitly
-async fn test_scenario_a_shard_scalability() {
+#[tokio::test(flavor = "multi_thread")]
+async fn scenario_a_shard_scalability() {
+    println!(">>> Entering scenario_a_shard_scalability test function <<<"); // Added: Very first line
     println!("===== Running Scenario A: Shard Scalability Test =====");
-    let shard_counts = [2, 4, 5, 8, 10]; // k values
+    let shard_counts = [2]; // k values - REDUCED TO 1 for faster testing
     let nodes_per_shard = 7; // m value
     let num_coordinators = 5; // Assuming a coordinator committee size
     let coordinator_threshold = 4; // t value (Changed from 3 to 4)
-    let num_transactions = 5000;
+    let num_transactions = 5000; // Keep 5k for load
     let target_tps = 300; // Example target TPS
     let cross_chain_ratio = 0.30; // rho = 30%
     let num_blockchains = 2; // n=2

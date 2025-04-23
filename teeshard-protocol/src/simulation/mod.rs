@@ -166,6 +166,16 @@ impl Simulation {
                 let mock_relayer = Arc::new(MockBlockchainInterface::new()); // Replace with actual relayer later
                 let partition_mapping = PartitionMapping::new(); // Example, needs real mapping
 
+                // --- Get Shard Assignments Handle ---
+                // The coordinator needs access to the shard assignments map.
+                // We calculated `shard_assignments` earlier, wrap it in Arc<Mutex>.
+                // NOTE: This assumes the runtime holds the *authoritative* copy.
+                // A better approach might be for the runtime to provide a getter,
+                // but for now, we use the map built during simulation setup.
+                // Need tokio::sync::Mutex here
+                let shard_assignments_handle = Arc::new(tokio::sync::Mutex::new(shard_assignments.clone()));
+                // ---
+
                 let coordinator = SimulatedCoordinator::new(
                     identity.clone(),
                     secret_key,
@@ -174,6 +184,7 @@ impl Simulation {
                     mock_relayer, // Using mock relayer
                     partition_mapping,
                     metrics_tx_clone, // Pass the metrics sender
+                    shard_assignments_handle, // Pass the shard assignments handle
                 );
 
                 // Spawn coordinator task(s) - Placeholder, needs run methods

@@ -1,6 +1,10 @@
 use crate::config::SystemConfig; // Import SystemConfig
 // Import TeeDelayConfig
 use crate::tee_logic::enclave_sim::TeeDelayConfig;
+use crate::data_structures::TEEIdentity;
+use crate::liveness::types::LivenessConfig;
+use serde::{Serialize, Deserialize};
+use std::time::Duration;
 
 // Configuration specific to the simulation environment and experiments
 // Removed Serialize, Deserialize, PartialEq temporarily due to missing derives in members
@@ -50,6 +54,21 @@ pub struct SimulationConfig {
     // Add other simulation-specific parameters as needed
     // E.g., duration of the simulation run
     pub simulation_duration_secs: Option<u64>,
+
+    // Include Liveness Config
+    pub liveness_config: LivenessConfig,
+
+    // Simulation timing / parameters
+    pub num_transactions_to_simulate: usize,
+    pub target_tps: u64,
+    pub cross_chain_ratio: f64, // 0.0 to 1.0
+    pub num_blockchains: usize,
+
+    // Optional settings for specific scenarios
+    pub fault_injection_config: Option<FaultInjectionConfig>,
+
+    // Network emulation parameters
+    pub network_packet_loss_probability: f64, // Added packet loss probability (0.0 to 1.0)
 }
 
 impl Default for SimulationConfig {
@@ -85,6 +104,21 @@ impl Default for SimulationConfig {
             network_tick_interval_ms: Some(5), // Default queue check interval
             // Simulation Run Duration Default (None = run until total transactions)
             simulation_duration_secs: None,
+
+            // Include Liveness Config
+            liveness_config: LivenessConfig::default(),
+
+            // Simulation timing / parameters
+            num_transactions_to_simulate: 100,
+            target_tps: 50,
+            cross_chain_ratio: 0.3, // 30% cross-chain
+            num_blockchains: 2,
+
+            // Optional settings for specific scenarios
+            fault_injection_config: None,
+
+            // Network emulation parameters
+            network_packet_loss_probability: 0.0, // Default to 0% packet loss
         }
     }
 }
@@ -101,4 +135,11 @@ impl SimulationConfig {
         self.system_config.tee_delays = self.tee_delays.clone();
         // Sync other relevant fields as needed
     }
+}
+
+// Placeholder for fault injection configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FaultInjectionConfig {
+    pub crash_rate_per_minute: f64,
+    pub crash_duration_secs: u64,
 } 

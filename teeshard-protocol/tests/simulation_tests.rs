@@ -229,6 +229,7 @@ async fn test_raft_state_machine_command_processing() {
 
     // 4. Define Command Data
     let lock_proof_data = LockProofData {
+        shard_id: 0,
         tx_id: "test-tx-456".to_string(),
         source_chain_id: 1,
         target_chain_id: 2,
@@ -597,6 +598,7 @@ async fn test_threshold_signature_simulation() {
 
     // 4. Create and Propose Command to Leader
     let lock_data = LockProofData {
+        shard_id: 0,
         tx_id: "test_tx_123".to_string(),
         source_chain_id: 1,
         target_chain_id: 2,

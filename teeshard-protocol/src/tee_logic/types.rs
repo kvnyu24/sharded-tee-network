@@ -31,6 +31,8 @@ pub struct LockProofData {
     pub source_chain_id: u64,
     // Identifier for the target chain where release should happen
     pub target_chain_id: u64,
+    // Shard ID where the lock confirmation occurred
+    pub shard_id: usize,
     // Token being locked
     pub token_address: String, // Assuming address uniquely identifies token on source chain
     // Amount locked

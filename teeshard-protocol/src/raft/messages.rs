@@ -4,7 +4,7 @@ use crate::data_structures::TEEIdentity;
 use crate::raft::state::LogEntry;
 use serde::{Serialize, Deserialize};
 use crate::tee_logic::crypto_sim::generate_keypair;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 // Sent by candidates to gather votes
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,9 +108,20 @@ mod tests {
 
     #[test]
     fn append_entries_args_creation() {
+        // Calculate Duration since epoch for the test entries using SystemTime
+        let time_now_sys = SystemTime::now();
+        let epoch_start = SystemTime::UNIX_EPOCH;
+        // Calculate duration since epoch, handling potential error if time is before epoch
+        let duration_since_epoch = time_now_sys.duration_since(epoch_start)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: System time is before epoch? Error: {}", e);
+                Duration::ZERO // Default to zero duration if time is before epoch
+            });
+
         let entries = vec![
-            LogEntry { term: 1, command: Command::Dummy, proposal_time: Instant::now() }, 
-            LogEntry { term: 2, command: Command::Dummy, proposal_time: Instant::now() }
+            // Use the correct field name 'proposal_time_since_epoch' and provide a Duration
+            LogEntry { term: 1, command: Command::Dummy, proposal_time_since_epoch: duration_since_epoch },
+            LogEntry { term: 2, command: Command::Dummy, proposal_time_since_epoch: duration_since_epoch }
         ];
         let args = AppendEntriesArgs {
             term: 2,

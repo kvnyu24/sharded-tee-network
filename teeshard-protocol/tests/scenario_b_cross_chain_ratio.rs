@@ -25,139 +25,10 @@ use hex;
 use rand::Rng;
 use log::warn;
 
-// --- Helper Functions (Copied from scenario_a_shard_scalability.rs) ---
+// Import shared test utilities
+use teeshard_protocol::test_utils::*;
 
-fn create_test_tee_signing(id: usize) -> (TEEIdentity, SigningKey) {
-    // Simple deterministic key generation for testing reproducibility
-    let seed = [(id % 256) as u8; 32];
-    let signing_key = SigningKey::from_bytes(&seed); // Removed .expect()
-    let verifying_key = signing_key.verifying_key();
-    (TEEIdentity { id, public_key: verifying_key }, signing_key)
-}
-
-
-fn generate_test_transaction(tx_id_num: usize, cross_chain: bool, num_chains: usize) -> (Transaction, [u8; 32]) {
-    // Ensure num_chains > 0
-    let num_chains = if num_chains == 0 { 1 } else { num_chains };
-    let chain_id_a = (tx_id_num % num_chains) as u64; // Assign to a chain
-    let chain_id_b = ((tx_id_num + 1) % num_chains) as u64; // Assign to potentially different chain
-
-    let acc_a1 = AccountId { chain_id: chain_id_a, address: format!("user_a_{}", tx_id_num) };
-    let acc_a2 = AccountId { chain_id: chain_id_a, address: format!("pool_{}", chain_id_a) };
-    let asset_a = AssetId { chain_id: chain_id_a, token_symbol: format!("TKA{}", chain_id_a), token_address: format!("0xA{}", chain_id_a) };
-
-    // Create a mock 32-byte ID (e.g., tx_id_num as bytes padded)
-    let mut mock_swap_id = [0u8; 32];
-    let num_bytes = (tx_id_num as u64).to_be_bytes();
-    let start_index = mock_swap_id.len() - num_bytes.len();
-    mock_swap_id[start_index..].copy_from_slice(&num_bytes);
-
-    if cross_chain && chain_id_a != chain_id_b {
-        let acc_b1 = AccountId { chain_id: chain_id_b, address: format!("user_b_{}", tx_id_num) };
-        let acc_b2 = AccountId { chain_id: chain_id_b, address: format!("pool_{}", chain_id_b) };
-        let asset_b = AssetId { chain_id: chain_id_b, token_symbol: format!("TKB{}", chain_id_b), token_address: format!("0xB{}", chain_id_b) };
-        let tx = Transaction {
-            tx_id: format!("cc-tx-{}", tx_id_num),
-            tx_type: TxType::CrossChainSwap,
-            accounts: vec![acc_a1.clone(), acc_a2, acc_b1.clone(), acc_b2],
-            amounts: vec![100, 50], // Example amounts
-            required_locks: vec![
-                LockInfo { account: acc_a1, asset: asset_a.clone(), amount: 100 },
-                LockInfo { account: acc_b1, asset: asset_b.clone(), amount: 50 },
-            ],
-            target_asset: Some(asset_b), // Target asset for the swap
-            timeout: Duration::from_secs(60),
-        };
-        (tx, mock_swap_id)
-    } else {
-        // Treat as single chain even if originally cross_chain was true but chains matched
-        let tx = Transaction {
-            tx_id: format!("sc-tx-{}", tx_id_num),
-            tx_type: TxType::SingleChainTransfer,
-            accounts: vec![acc_a1.clone(), acc_a2],
-            amounts: vec![100],
-            required_locks: vec![LockInfo { account: acc_a1, asset: asset_a, amount: 100 }],
-            target_asset: None,
-            timeout: Duration::from_secs(60),
-        };
-        (tx, mock_swap_id)
-    }
-}
-
-// --- Performance Analysis Function (Based on provided baseline) ---
-fn analyze_perf_results(
-    scenario_name: &str,
-    scenario_params: &HashMap<String, String>,
-    metrics: &[MetricEvent],
-    submitted_count: usize,
-    submission_duration: Duration,
-) {
-    let mut latencies = Vec::new();
-    let mut completed_count = 0;
-    let mut successful_count = 0;
-
-    // Assuming MetricEvent::TransactionCompleted exists with these fields
-    for event in metrics {
-        if let MetricEvent::TransactionCompleted { start_time, end_time, success, .. } = event {
-            completed_count += 1;
-            if *success { 
-                successful_count += 1;
-                if *end_time >= *start_time {
-                    latencies.push((*end_time - *start_time).as_micros());
-                } else {
-                    warn!("Completion time (end_time) before start time detected, skipping latency calc.");
-                }
-            }
-        }
-        // TODO: Add extraction for other relevant metrics based on scenario
-        // e.g., Raft events, TEE operation timings if available in MetricEvent
-    }
-
-    latencies.sort_unstable();
-
-    let avg_latency_us = if !latencies.is_empty() {
-        latencies.iter().sum::<u128>() / latencies.len() as u128
-    } else {
-        0
-    };
-    // Calculate p95 and p99 only if there are enough successful transactions
-    let p95_latency_us = if latencies.len() > 1 {
-        let index = (latencies.len() as f64 * 0.95).floor() as usize;
-        latencies[index.min(latencies.len() - 1)] // Ensure index is within bounds
-    } else {
-        avg_latency_us // Fallback to average if too few samples
-    };
-    let p99_latency_us = if latencies.len() > 1 {
-        let index = (latencies.len() as f64 * 0.99).floor() as usize;
-        latencies[index.min(latencies.len() - 1)] // Ensure index is within bounds
-    } else {
-        avg_latency_us // Fallback to average if too few samples
-    };
-
-    // Calculate throughput based on *completed* transactions over *submission* duration.
-    // This is a reasonable approximation but might slightly overestimate if completion lags significantly.
-    let throughput_cps = if submission_duration > Duration::ZERO {
-        completed_count as f64 / submission_duration.as_secs_f64()
-    } else {
-        0.0 // Avoid division by zero
-    };
-
-    println!("\n--- {} Analysis (Params: {:?}) ---", scenario_name, scenario_params);
-    println!("Submitted Transactions: {}", submitted_count);
-    println!("Completed Transactions: {}", completed_count);
-    println!("Successful Transactions: {}", successful_count); // Added successful count
-    println!("Submission Duration: {:.2?}", submission_duration);
-    println!("Calculated Throughput (Completed/SubmissionTime): {:.2} CPS", throughput_cps);
-    if !latencies.is_empty() {
-        println!("Latency (Successful TXs): [based on {} samples]", latencies.len());
-        println!("  Average: {:.3} ms", avg_latency_us as f64 / 1000.0);
-        println!("  P95:     {:.3} ms", p95_latency_us as f64 / 1000.0);
-        println!("  P99:     {:.3} ms", p99_latency_us as f64 / 1000.0);
-    } else {
-        println!("Latency (Successful TXs): No successful transactions with valid timings recorded.");
-    }
-    println!("------------------------------------\n");
-}
+// --- Helper Functions Removed (Now in test_utils) ---
 
 // --- Test Runner Function (Adapted for Scenario B parameters) ---
 
@@ -202,6 +73,9 @@ async fn run_scenario_b_trial(
     let mut opt_result_rx = Some(result_rx); // Wrap in Option
 
     let partition_mapping: PartitionMapping = HashMap::new();
+    // Local map to track shard assignments for the coordinator
+    let shard_assignments: Arc<tokio::sync::Mutex<HashMap<usize, Vec<TEEIdentity>>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
     let mut nodes_to_spawn = Vec::new();
     // ... (Shard Node Setup loop - identical to Scenario A) ...
     for shard_id in 0..num_shards {
@@ -231,8 +105,12 @@ async fn run_scenario_b_trial(
                 shard_id,
             );
             nodes_to_spawn.push(node);
+            // Keep track of identities for local map
+            current_shard_nodes.push(identity.clone());
         }
-        runtime.assign_nodes_to_shard(shard_id, current_shard_nodes).await;
+        // Assign in runtime AND store locally
+        runtime.assign_nodes_to_shard(shard_id, current_shard_nodes.clone()).await;
+        shard_assignments.lock().await.insert(shard_id, current_shard_nodes);
     }
 
 
@@ -251,6 +129,7 @@ async fn run_scenario_b_trial(
             coord_identity.clone(), coord_signing_key, sim_config.system_config.clone(),
             runtime.clone(), blockchain_interface.clone(), partition_mapping.clone(),
             coordinator_metrics_tx.clone(),
+            shard_assignments.clone(), // Pass the local assignments map (Arg 8)
         );
         let coordinator_arc = Arc::new(coordinator);
         if i == 0 {
@@ -287,6 +166,7 @@ async fn run_scenario_b_trial(
         let target_shard_id = i % num_shards;
         let lock_proof_data = LockProofData {
             tx_id: tx.tx_id.clone(),
+            shard_id: target_shard_id, // ADDED: Use the calculated target shard ID
             source_chain_id: tx.required_locks.first().map(|l| l.asset.chain_id).unwrap_or(0),
             target_chain_id: tx.target_asset.map(|a| a.chain_id).unwrap_or(0),
             token_address: tx.required_locks.first().map(|l| l.asset.token_address.clone()).unwrap_or_default(),
@@ -321,8 +201,7 @@ async fn run_scenario_b_trial(
 // --- Main Test Function ---
 
 #[tokio::test]
-#[ignore] // Ignore by default
-async fn test_scenario_b_cross_chain_ratio_sensitivity() {
+async fn test_scenario_b_cross_chain_ratio() {
     println!("===== Running Scenario B: Cross-Chain Ratio Sensitivity Test =====");
     let num_shards = 5; // k value
     let nodes_per_shard = 7; // m value

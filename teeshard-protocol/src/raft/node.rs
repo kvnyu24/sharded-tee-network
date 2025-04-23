@@ -14,7 +14,7 @@ use rand::Rng;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
     fmt,
 };
 use tokio::sync::mpsc; // Import mpsc
@@ -252,7 +252,6 @@ impl RaftNode {
         self.last_heartbeat_sent = Instant::now(); // Send initial heartbeats immediately
 
         // --- Send Metric --- 
-        /* // Temporarily comment out metrics spawn to check for deadlocks
         if let Some(metrics_tx) = self.metrics_tx.clone() { // Clone sender if it exists
             let event = MetricEvent::RaftLeaderElected {
                 shard_id: self.shard_id,
@@ -268,7 +267,6 @@ impl RaftNode {
                 }
             });
         }
-        */
         // --- End Metric --- 
 
         // Send initial empty AppendEntries (heartbeats)
@@ -588,10 +586,19 @@ impl RaftNode {
         }
 
         println!("Node {}: Leader proposing command: {:?}", self.state.id.id, command);
+
+        // Calculate duration since epoch for the new entry
+        let duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: System time is before epoch? Error: {}", e);
+                Duration::ZERO // Default to zero duration if time is before epoch
+            });
+
         let new_entry = LogEntry {
             term: self.state.current_term,
             command,
-            proposal_time: Instant::now(), // Record proposal time
+            // Add the missing field with the calculated duration
+            proposal_time_since_epoch: duration_since_epoch,
         };
 
         // Append to leader's log
@@ -636,16 +643,16 @@ impl RaftNode {
                         self.state.commit_index = n;
 
                         // --- Send Metrics for newly committed entries --- 
-                        /* // Temporarily comment out metrics spawn
                         if let Some(metrics_tx) = self.metrics_tx.clone() {
                             // Iterate from the old commit index + 1 up to the new commit index
                             for i in (old_commit_index + 1)..=self.state.commit_index {
                                 if let Some(committed_entry) = self.state.log.get(i as usize - 1) {
-                                    let latency = committed_entry.proposal_time.elapsed();
+                                    // Assign the Duration directly, don't convert to millis
+                                    let latency = committed_entry.proposal_time_since_epoch; 
                                     let event = MetricEvent::RaftCommit {
                                         shard_id: self.shard_id,
                                         leader_id: self.state.id.clone(),
-                                        latency,
+                                        latency, // Pass the Duration directly
                                     };
                                     let metrics_tx_clone = metrics_tx.clone();
                                     let node_id_clone = self.state.id.clone(); // Clone for async block
@@ -663,7 +670,6 @@ impl RaftNode {
                                 }
                             }
                         }
-                        */
                         // --- End Metrics --- 
 
                     } else {

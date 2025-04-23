@@ -243,11 +243,13 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
          println!("  Shard {}: Nodes {:?}", partition.shard_id, node_ids);
     }
 
-    // 2d. TODO: Use Partitioning Results
-    // - The `final_partitions` (Vec<ShardPartition>) tells us which TEEIdentity belongs to which shard_id.
-    //   This will be used to configure the SimulationRuntime, assigning nodes to shards.
-    // - The `final_mapping` (PartitionMapping: HashMap<AccountId, usize>) tells us which shard_id is responsible for which account.
-    //   This needs to be given to the CrossChainCoordinator so it knows where to send commands.
+    // --- Create Shard Assignments Map for Coordinator ---
+    let mut assignments_map = HashMap::new();
+    for partition in &final_partitions {
+        assignments_map.insert(partition.shard_id, partition.tee_nodes.clone());
+    }
+    let shard_assignments_handle = Arc::new(tokio::sync::Mutex::new(assignments_map));
+    // ---
 
     // 3. Setup Simulation Runtime & Nodes based on Sharding
     println!("[Setup] Setting up Simulation Runtime and Nodes...");
@@ -416,8 +418,9 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
         config.clone(), // Use system config
         runtime.clone(),
         evm_relayer.clone(),
-        final_mapping,
+        final_mapping.clone(), // Pass a CLONE to the coordinator
         metrics_tx.clone(), // Add metrics_tx (arg 7)
+        shard_assignments_handle, // Pass the handle (arg 8)
     ));
     println!("[Setup] Coordinator instance created.");
 
@@ -476,8 +479,14 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     // B. Simulate observing the lock event and informing the coordinator
     println!("\n[Test] Simulating lock observation (from deploy script) and sending command to Coordinator...");
     // Construct LockProofData - IMPORTANT: Ensure tx_id here matches the hex of swap_id_bytes
+    // Determine the shard ID for the transaction using the ShardManager mapping
+    let lock_account = transactions[0].required_locks[0].account.clone();
+    let target_shard_id = *final_mapping.get(&lock_account)
+        .expect(&format!("Account {:?} not found in shard mapping!", lock_account));
+
     let lock_data_swap1 = LockProofData {
         tx_id: hex::encode(swap_id_bytes), // Use the hex-encoded swap_id_bytes
+        shard_id: target_shard_id, // ADDED: Use the determined shard ID
         source_chain_id: transactions[0].required_locks[0].asset.chain_id,
         target_chain_id: transactions[0].target_asset.as_ref().unwrap().chain_id,
         token_address: transactions[0].required_locks[0].asset.token_address.clone(),

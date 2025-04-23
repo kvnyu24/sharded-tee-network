@@ -30,6 +30,7 @@ use ethers::utils::keccak256; // Import keccak256
 use crate::simulation::metrics::MetricEvent;
 use hex; // Add hex import
 use crate::tee_logic::enclave_sim::EnclaveSim; // Corrected Import Path
+use log::{debug, error, info};
 
 // Type for proposal requests received by the node's run loop
 pub type NodeProposalRequest = (Command, oneshot::Sender<Result<Vec<RaftEvent>, String>>);
@@ -133,65 +134,105 @@ impl SimulatedTeeNode {
         self.query_tx.clone()
     }
 
+    /// Returns the shard ID this node belongs to.
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
     /// Starts the node's main event loop in a separate Tokio task.
     pub async fn run(mut self) {
-        println!("[Node {}] Starting run loop...", self.identity.id);
-        let tick_duration = Duration::from_millis(50);
-        let mut tick_timer = interval(tick_duration);
+        // ADD PRINTLN HERE
+        println!("[Node {} Task Startup] Entered run method. Shard ID: {}", self.identity.id, self.shard_id);
+        info!("[Node {} Task] Starting run loop. Shard ID: {}", self.identity.id, self.shard_id); // Use info! macro
+        let raft_tick_duration = Duration::from_millis(50); // TODO: Make configurable?
+        let mut raft_tick_timer = interval(raft_tick_duration);
 
         loop {
+            // ADDED: Log at the start of each loop iteration
+            debug!("[Node {} Task] Top of run loop iteration.", self.identity.id);
+
+            let mut all_events: Vec<RaftEvent> = Vec::new();
+
             tokio::select! {
-                _ = tick_timer.tick() => {
+                // ADDED: Log when timer tick occurs
+                _ = raft_tick_timer.tick() => {
+                    debug!("[Node {} Task] Raft timer ticked.", self.identity.id);
                     let events = self.raft_node.tick();
-                    self.handle_raft_events(events).await;
+                    all_events.extend(events);
                 }
+                // ADDED: Log when network message is received
                 Some(network_msg) = self.network_rx.recv() => {
-                    println!("[Node {}] Received network message from {}: {:?}", 
-                        self.identity.id, network_msg.sender.id, network_msg.message);
+                    debug!("[Node {} Task] Received network message from Node {}: {:?}", self.identity.id, network_msg.sender.id, network_msg.message);
                     match network_msg.message {
                         Message::RaftAppendEntries(args) => {
                             let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::AppendEntries(args));
-                            self.handle_raft_events(events).await;
+                            all_events.extend(events);
                         }
                         Message::RaftAppendEntriesReply(reply) => {
                             let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::AppendEntriesReply(reply));
-                            self.handle_raft_events(events).await;
+                            all_events.extend(events);
                         }
                         Message::RaftRequestVote(args) => {
                             let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::RequestVote(args));
-                            self.handle_raft_events(events).await;
+                            all_events.extend(events);
                         }
                         Message::RaftRequestVoteReply(reply) => {
                             let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::RequestVoteReply(reply));
-                            self.handle_raft_events(events).await;
+                            all_events.extend(events);
                         }
                         Message::LivenessChallenge(challenge_struct) => {
-                            println!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge_struct.nonce);
-                            // Pass the u64 nonce to the handler
-                            self.handle_liveness_challenge(challenge_struct.nonce).await; // Pass u64
+                            info!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge_struct.nonce);
+                            self.handle_liveness_challenge(challenge_struct.nonce).await; // Nonce is u64
                         }
-                        _ => {
-                            warn!("[Node {}] Received unhandled message type: {:?}", self.identity.id, network_msg.message);
+                        Message::LivenessResponse(_) => { // Added handling for LivenessResponse
+                            warn!("[Node {}] Received LivenessResponse, but nodes typically send, not receive these.", self.identity.id);
+                        }
+                        // Add arms for the missing variants
+                        Message::ShardLockRequest(req) => {
+                            warn!("[Node {}] Received unexpected ShardLockRequest: {:?}", self.identity.id, req);
+                        }
+                        Message::CoordPartialSig { .. } => { // Use wildcard pattern for struct fields
+                            warn!("[Node {}] Received unexpected CoordPartialSig.", self.identity.id);
+                        }
+                        Message::Placeholder(data) => {
+                            warn!("[Node {}] Received Placeholder message: {:?}", self.identity.id, data);
                         }
                     }
                 }
-                Some((command, result_sender)) = self.proposal_rx.recv() => {
-                    println!("[Node {}] Received external command proposal: {:?}", self.identity.id, command);
-                    let result = self.raft_node.propose_command(command);
-                    if result_sender.send(Ok(result.clone())).is_err() {
-                        eprintln!("[Node {}] Failed to send proposal result back.", self.identity.id);
+                // ADDED: Log when proposal message is received
+                Some(proposal_request) = self.proposal_rx.recv() => {
+                    debug!("[Node {} Task] Received proposal request.", self.identity.id);
+                    let (command, ack_tx) = proposal_request;
+
+                    info!("[Node {}] Received proposal request: {:?}", self.identity.id, command);
+                    debug!("[Node {}] PRE raft_node.propose_command()", self.identity.id);
+                    let raft_events = self.raft_node.propose_command(command);
+                    debug!("[Node {}] POST raft_node.propose_command(), generated {} events", self.identity.id, raft_events.len());
+
+                    all_events.extend(raft_events.clone()); // Clone events before sending
+
+                    if let Err(_) = ack_tx.send(Ok(raft_events)) { // Send the cloned events
+                        error!("[Node {}] Failed to send proposal ACK back to runtime.", self.identity.id);
                     }
-                    self.handle_raft_events(result).await;
                 }
+                // ADDED: Log when query message is received
                 Some((query, response_sender)) = self.query_rx.recv() => {
+                    debug!("[Node {} Task] Received query request: {:?}", self.identity.id, query);
                     self.handle_query(query, response_sender).await;
                 }
+                // Handles the case where a channel closes or the select! exits unexpectedly
                 else => {
-                    println!("[Node {}] Message/Query channel closed or select! completed. Stopping run loop.", self.identity.id);
-                    break;
+                    warn!("[Node {} Task] A channel closed or select! completed without matching. Breaking loop.", self.identity.id);
+                    break; // Exit the loop if any channel closes or if select! terminates for other reasons
                 }
             }
+
+            if !all_events.is_empty() {
+                 debug!("[Node {} Task] Handling {} Raft events.", self.identity.id, all_events.len());
+                 self.handle_raft_events(all_events).await;
+            }
         }
+        info!("[Node {} Task] Run loop finished.", self.identity.id); // Use info!
     }
 
     /// Handles received state queries
@@ -272,58 +313,73 @@ impl SimulatedTeeNode {
 
     /// Processes commands applied to the state machine via Raft consensus.
     async fn process_state_machine_commands(&mut self, commands: Vec<Command>) {
-        for command in commands {
-            println!("[Node {}][StateMachine] Processing command: {:?}", self.identity.id, command);
-            match command {
-                Command::ConfirmLockAndSign(lock_data) => {
-                    // Check if this lock proof has already been processed
-                    if self.processed_commands.contains(&lock_data.tx_id) {
-                        println!("[Node {}][StateMachine] Command for tx_id {} already processed. Skipping.", self.identity.id, lock_data.tx_id);
-                        continue; // Skip processing this command
-                    }
-
-                    // Create a tuple of the fields to be signed (excluding start_time)
-                    let signable_data = (
-                        &lock_data.tx_id, 
-                        lock_data.source_chain_id, 
-                        lock_data.target_chain_id, 
-                        &lock_data.token_address, 
-                        lock_data.amount, 
-                        &lock_data.recipient
-                    );
-
-                    // Encode the tuple using bincode
-                    match bincode::encode_to_vec(&signable_data, standard()) {
-                        Ok(data_to_sign) => {
-                            // DEBUG: Print data and key before signing
-                            println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
-                            println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
-                            
-                            println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
-                            let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
-                            let share = (self.identity.clone(), lock_data.clone(), signature);
-                            println!("[Node {}][StateMachine] Submitting signature share for tx_id: {}", self.identity.id, lock_data.tx_id);
-                            self.runtime.submit_result(share).await;
-
-                            // Mark this command (by tx_id) as processed
-                            self.processed_commands.insert(lock_data.tx_id.clone());
-                        }
-                        Err(e) => {
-                            eprintln!("[Node {}][StateMachine] Error serializing LockProofData for signing: {}", self.identity.id, e);
-                        }
-                    }
+         for command in commands {
+            debug!("[Node {}] PRE apply_state_machine_command({:?}).await", self.identity.id, command);
+            match self.apply_state_machine_command(command).await {
+                Ok(_) => {
+                     debug!("[Node {}] POST apply_state_machine_command().await - Success", self.identity.id);
                 }
-                Command::Noop => {
-                    println!("[Node {}][StateMachine] Processing Noop command.", self.identity.id);
+                Err(e) => {
+                     error!("[Node {}] POST apply_state_machine_command().await - Error: {}", self.identity.id, e);
                 }
-                // Add case for Dummy command (required because of cfg(test))
-                #[cfg(test)]
-                Command::Dummy => {
-                     println!("Node {}: Applying Dummy command (test)", self.identity.id);
-                     // No action needed for Dummy
-                 }
-                // Add other command handlers here if needed in the future
             }
+        }
+        debug!("[Node {}] Finished processing ApplyToStateMachine event", self.identity.id);
+    }
+    
+    async fn apply_state_machine_command(&mut self, command: Command) -> Result<(), String> {
+        println!("[Node {}][StateMachine] Processing command: {:?}", self.identity.id, command);
+        match command {
+            Command::ConfirmLockAndSign(lock_data) => {
+                if self.processed_commands.contains(&lock_data.tx_id) {
+                    println!("[Node {}][StateMachine] Command for tx_id {} already processed. Skipping.", self.identity.id, lock_data.tx_id);
+                    return Ok(());
+                }
+
+                let signable_data = (
+                    &lock_data.tx_id, 
+                    lock_data.source_chain_id, 
+                    lock_data.target_chain_id, 
+                    &lock_data.token_address, 
+                    lock_data.amount, 
+                    &lock_data.recipient
+                );
+
+                match bincode::encode_to_vec(&signable_data, standard()) {
+                    Ok(data_to_sign) => {
+                        println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
+                        println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
+                        
+                        println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
+                        let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
+                        let share = (self.identity.clone(), lock_data.clone(), signature);
+
+                        // --- Add PRE/POST logging for submit_result ---
+                        let tx_id_for_log = lock_data.tx_id.clone(); // Clone tx_id for logging
+                        println!("[Node {}][StateMachine] PRE runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
+                        self.runtime.submit_result(share).await;
+                        println!("[Node {}][StateMachine] POST runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
+                        // --- End Add ---
+
+                        self.processed_commands.insert(lock_data.tx_id.clone());
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let err_msg = format!("Error serializing LockProofData for signing: {}", e);
+                        eprintln!("[Node {}][StateMachine] {}", self.identity.id, err_msg);
+                        Err(err_msg)
+                    }
+                }
+            }
+            Command::Noop => {
+                println!("[Node {}][StateMachine] Processing Noop command.", self.identity.id);
+                Ok(())
+            }
+            #[cfg(test)]
+            Command::Dummy => {
+                 println!("Node {}: Applying Dummy command (test)", self.identity.id);
+                 Ok(())
+             }
         }
     }
 

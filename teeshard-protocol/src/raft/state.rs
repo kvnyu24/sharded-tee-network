@@ -6,10 +6,11 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::time::Instant; // Add Instant
+use std::time::{Duration, Instant}; // Add Duration
+use serde::{Serialize, Deserialize}; // Make sure serde is imported
 
 /// Commands that can be applied to the state machine via Raft consensus.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     // Example: Confirm a lock has been observed and generate signature share
     ConfirmLockAndSign(LockProofData),
@@ -19,12 +20,25 @@ pub enum Command {
     Dummy, // For testing purposes
 }
 
+// ADDED: Helper method to get a string representation of the transaction ID
+impl Command {
+    pub fn tx_id_str(&self) -> String {
+        match self {
+            Command::ConfirmLockAndSign(data) => data.tx_id.clone(),
+            Command::Noop => "Noop".to_string(),
+            #[cfg(test)]
+            Command::Dummy => "Dummy".to_string(),
+        }
+    }
+}
+
 /// Represents an entry in the Raft log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogEntry {
     pub term: u64,
     pub command: Command, // The command for the state machine
-    pub proposal_time: Instant, // Added proposal time
+    #[serde(with = "humantime_serde")] // Use humantime_serde for Duration
+    pub proposal_time_since_epoch: Duration,
 }
 
 /// Represents the role of a node in the Raft cluster

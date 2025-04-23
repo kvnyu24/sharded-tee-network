@@ -15,3 +15,5 @@ pub mod tee_logic;
 // Declare other core modules based on the design
 pub mod shard_manager;
 pub mod liveness;
+
+pub mod test_utils; // Added for shared test utilities
