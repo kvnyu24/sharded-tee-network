@@ -1,19 +1,30 @@
 use crate::data_structures::TEEIdentity;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use crate::raft::node::ShardId;
 use tokio::sync::mpsc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use crate::raft::state::RaftRole;
+use serde::{Serialize, Deserialize};
+
+// Helper function to get current epoch milliseconds
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Enum representing different types of metrics collected during the simulation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetricEvent {
     /// Records the completion details of a transaction (e.g., a swap).
     TransactionCompleted {
         id: String,
-        start_time: Instant,
-        end_time: Instant,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(with = "humantime_serde")]
         duration: Duration,
         is_cross_chain: bool,
         success: bool,
@@ -22,26 +33,73 @@ pub enum MetricEvent {
     TeeFunctionMeasured {
         node_id: TEEIdentity,
         function_name: String,
+        #[serde(with = "humantime_serde")]
         duration: Duration,
     },
     /// Records when a Raft leader is elected for a specific shard.
     RaftLeaderElected {
-        shard_id: ShardId,
-        node_id: TEEIdentity,
         term: u64,
+        leader_id: usize, // Node ID
+        timestamp_ms: u64,
     },
     /// Records the latency for committing a Raft log entry.
     RaftCommit {
         shard_id: ShardId,
         leader_id: TEEIdentity,
+        #[serde(with = "humantime_serde")]
         latency: Duration, // Time from proposal to commit
     },
-    NodeIsolated { node_id: usize },
-    NodeRejoined { node_id: usize },
+    NodeIsolated {
+        node_id: usize,
+        timestamp_ms: u64,
+    },
+    NodeRejoined {
+        node_id: usize,
+        timestamp_ms: u64,
+    },
     /// Records when a message is sent between nodes in different shards.
     CrossShardMessageSent {
         sender_shard: ShardId,
         receiver_shard: ShardId,
+    },
+    NodeCommandProposed {
+        node_id: usize,
+        command_type: String, // e.g., "ConfirmLockAndSign"
+        tx_id: String,
+        timestamp_ms: u64,
+    },
+    NodeCommandCommitted {
+        node_id: usize,
+        log_index: u64,
+        term: u64,
+        command_type: String,
+        tx_id: String,
+        timestamp_ms: u64,
+    },
+    NodeSignatureShareGenerated {
+        node_id: usize,
+        tx_id: String,
+        timestamp_ms: u64,
+    },
+    CoordinatorThresholdReached {
+        coordinator_id: usize,
+        tx_id: String,
+        shares_count: usize,
+        threshold: usize,
+        timestamp_ms: u64,
+    },
+    RelayerReleaseSubmitted {
+        tx_id: String, // Or swap_id if more appropriate
+        target_chain_id: u64,
+        onchain_tx_hash: String, // The hash returned by the relayer
+        timestamp_ms: u64,
+    },
+    /// ADDED: Variant for coordinator receiving a share
+    CoordinatorShareReceived {
+        coordinator_id: usize,
+        tee_node_id: usize,
+        tx_id: String,
+        timestamp_ms: u64,
     },
     // Add more metric types as needed
 }
@@ -79,12 +137,12 @@ impl MetricsCollector {
                     // Drop lock immediately after use
                     drop(transactions);
                 }
-                MetricEvent::NodeIsolated { node_id } => {
+                MetricEvent::NodeIsolated { node_id, timestamp_ms: _ } => {
                     let mut isolated = self.isolated_nodes.lock().await;
                     isolated.insert(node_id);
                     drop(isolated);
                 }
-                 MetricEvent::NodeRejoined { node_id } => {
+                 MetricEvent::NodeRejoined { node_id, timestamp_ms: _ } => {
                     let mut isolated = self.isolated_nodes.lock().await;
                     isolated.remove(&node_id);
                     drop(isolated);
@@ -107,6 +165,24 @@ impl MetricsCollector {
                     log::trace!("[MetricsCollector] Ignoring CrossShardMessageSent event for now.");
                 }
                 // Handle other event types if added later (no default needed if enum is exhaustive)
+                MetricEvent::NodeCommandProposed { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring NodeCommandProposed event for now.");
+                }
+                MetricEvent::NodeCommandCommitted { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring NodeCommandCommitted event for now.");
+                }
+                MetricEvent::NodeSignatureShareGenerated { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring NodeSignatureShareGenerated event for now.");
+                }
+                MetricEvent::CoordinatorThresholdReached { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring CoordinatorThresholdReached event for now.");
+                }
+                MetricEvent::RelayerReleaseSubmitted { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring RelayerReleaseSubmitted event for now.");
+                }
+                MetricEvent::CoordinatorShareReceived { .. } => {
+                    log::trace!("[MetricsCollector] Ignoring CoordinatorShareReceived event for now.");
+                }
             }
         }
         println!("[MetricsCollector] Run loop finished (channel closed).");
@@ -290,7 +366,7 @@ impl MetricsCollector {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     #[tokio::test]
     async fn test_metrics_collection_and_stats() {
@@ -306,23 +382,25 @@ mod tests {
         });
 
         // Send some events
-        let start1 = Instant::now();
+        let start1_ms = current_epoch_millis();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let end1 = Instant::now();
+        let end1_ms = current_epoch_millis();
+        let duration1 = Duration::from_millis(end1_ms - start1_ms);
         tx.send(MetricEvent::TransactionCompleted {
-            id: "tx1".to_string(), start_time: start1, end_time: end1, duration: end1 - start1, is_cross_chain: true, success: true
+            id: "tx1".to_string(), start_time_ms: start1_ms, end_time_ms: end1_ms, duration: duration1, is_cross_chain: true, success: true
         }).await.unwrap();
 
-        let start2 = Instant::now();
+        let start2_ms = current_epoch_millis();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let end2 = Instant::now();
+        let end2_ms = current_epoch_millis();
+        let duration2 = Duration::from_millis(end2_ms - start2_ms);
          tx.send(MetricEvent::TransactionCompleted {
-            id: "tx2".to_string(), start_time: start2, end_time: end2, duration: end2 - start2, is_cross_chain: true, success: false
+            id: "tx2".to_string(), start_time_ms: start2_ms, end_time_ms: end2_ms, duration: duration2, is_cross_chain: true, success: false
         }).await.unwrap();
 
-        tx.send(MetricEvent::NodeIsolated { node_id: 5 }).await.unwrap();
-        tx.send(MetricEvent::NodeIsolated { node_id: 10 }).await.unwrap();
-        tx.send(MetricEvent::NodeRejoined { node_id: 5 }).await.unwrap(); // Node 5 rejoins
+        tx.send(MetricEvent::NodeIsolated { node_id: 5, timestamp_ms: current_epoch_millis() }).await.unwrap();
+        tx.send(MetricEvent::NodeIsolated { node_id: 10, timestamp_ms: current_epoch_millis() }).await.unwrap();
+        tx.send(MetricEvent::NodeRejoined { node_id: 5, timestamp_ms: current_epoch_millis() }).await.unwrap(); // Node 5 rejoins
 
         // Drop the sender to signal the end of events
         drop(tx);

@@ -18,7 +18,7 @@ use teeshard_protocol::{
 };
 use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, watch};
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use hex;
@@ -75,6 +75,10 @@ async fn run_scenario_d_trial(
     let coordinator_identities: Vec<TEEIdentity> = identities[coordinator_id_start..].to_vec();
     sim_config.system_config.coordinator_identities = coordinator_identities.clone();
 
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
+
     let (runtime, result_rx, _isolation_rx, metrics_handle) =
         SimulationRuntime::new(sim_config.clone());
     let mut opt_result_rx = Some(result_rx);
@@ -123,8 +127,10 @@ async fn run_scenario_d_trial(
              if let Some(rx_to_move) = opt_result_rx.take() {
                  let listener_handle = {
                      let coordinator_clone = coordinator_arc.clone();
+                     let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
                      tokio::spawn(async move {
-                         coordinator_clone.run_share_listener(rx_to_move).await;
+                         // Pass shutdown receiver
+                         coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await;
                      })
                  };
                  coordinator_handles.push(listener_handle);
@@ -136,7 +142,13 @@ async fn run_scenario_d_trial(
 
     // ... (Spawn Node Tasks - identical to Scenario A) ...
      let mut node_handles = Vec::new();
-    for node in nodes_to_spawn { let handle = tokio::spawn(node.run()); node_handles.push(handle); }
+    for node in nodes_to_spawn {
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
+        node_handles.push(handle);
+    }
 
     // --- Transaction Generation/Submission (Identical to Scenario B) ---
     println!("[Scenario D] Starting transaction submission...");
@@ -170,10 +182,37 @@ async fn run_scenario_d_trial(
     println!("[Scenario D] Waiting for transactions to complete (max {}s)... ", wait_secs);
     tokio::time::sleep(Duration::from_secs(wait_secs)).await;
 
-    // --- Cleanup & Metric Collection ---
+    // --- Cleanup & Metric Collection (Add graceful shutdown) ---
      println!("[Scenario D] Cleaning up nodes and collecting metrics...");
-    for handle in coordinator_handles { handle.abort(); }
-    for handle in node_handles { handle.abort(); }
+     // --- Send Shutdown Signal ---
+     println!("[Scenario D] Sending shutdown signal...");
+     if shutdown_tx.send(()).is_err() {
+         eprintln!("[Scenario D] Warning: Shutdown channel already closed?");
+     }
+     println!("[Scenario D] Shutdown signal sent.");
+     // --- End Send ---
+
+     // --- Await Handles Gracefully ---
+     println!("[Scenario D] Awaiting coordinator tasks...");
+     for handle in coordinator_handles {
+         if let Err(e) = handle.await {
+             eprintln!("[Scenario D] Error awaiting coordinator handle: {}", e);
+         }
+     }
+     println!("[Scenario D] Coordinator tasks finished.");
+
+     println!("[Scenario D] Awaiting node tasks...");
+     for handle in node_handles {
+          if let Err(e) = handle.await {
+              eprintln!("[Scenario D] Error awaiting node handle: {}", e);
+          }
+     }
+      println!("[Scenario D] Node tasks finished.");
+     // --- End Await ---
+
+     // Drop runtime AFTER awaiting tasks
+     drop(runtime);
+
     let collected_metrics = match metrics_handle.await {
         Ok(metrics) => metrics,
         Err(e) => { eprintln!("[Scenario D] Error awaiting metrics handle: {}", e); Vec::new() }

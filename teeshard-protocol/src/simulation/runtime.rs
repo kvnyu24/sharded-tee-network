@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex}; // Add TokioMutex
 use log::{debug, warn, error, info}; // Import log macros and info
 use crate::liveness::types::NonceChallenge; // Import specifically
  // Need this for Message::LivenessResponse
-use std::time::Duration; // Add Duration import
+use std::time::{Duration, Instant, SystemTime}; // Add Duration, Instant, and SystemTime imports
 use rand::Rng; // Import Rng for packet loss
  // Import std::sync::Mutex
 
@@ -188,8 +188,16 @@ impl SimulationRuntime {
         info!("[Runtime] Crashing Node {}", node_id);
         let mut crashed = self.crashed_nodes.lock().await;
         if crashed.insert(node_id) {
-            // Send metric only if node wasn't already marked as crashed
-             let _ = self.metrics_tx.send(MetricEvent::NodeIsolated { node_id }).await;
+            // --- FIX: Add timestamp_ms ---
+            let current_time_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let _ = self.metrics_tx.send(MetricEvent::NodeIsolated {
+                node_id,
+                timestamp_ms: current_time_ms, // Add the timestamp field
+            }).await;
+            // --- END FIX ---
         }
     }
 
@@ -198,8 +206,16 @@ impl SimulationRuntime {
         info!("[Runtime] Restarting Node {}", node_id);
         let mut crashed = self.crashed_nodes.lock().await;
         if crashed.remove(&node_id) {
-             // Send metric only if node was actually crashed
-             let _ = self.metrics_tx.send(MetricEvent::NodeRejoined { node_id }).await;
+             // --- FIX: Add timestamp_ms ---
+             let current_time_ms = SystemTime::now()
+                 .duration_since(SystemTime::UNIX_EPOCH)
+                 .unwrap_or_default()
+                 .as_millis() as u64;
+             let _ = self.metrics_tx.send(MetricEvent::NodeRejoined {
+                 node_id,
+                 timestamp_ms: current_time_ms, // Add the timestamp field
+             }).await;
+             // --- END FIX ---
         }
     }
 

@@ -32,7 +32,7 @@ use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Represents the overall simulation setup and execution environment.
@@ -42,12 +42,18 @@ pub struct Simulation {
     pub node_handles: Vec<JoinHandle<()>>,
     pub coordinator_handles: Vec<JoinHandle<()>>,
     pub liveness_handles: Vec<JoinHandle<()>>,
+    // Add shutdown sender
+    shutdown_tx: Option<watch::Sender<()>>,
     // Add other simulation state if necessary
 }
 
 impl Simulation {
     /// Builds the simulation environment based on the provided configuration.
     pub async fn build(config: SimulationConfig) -> Self {
+        // --- Create Shutdown Channel ---
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        // --- End Create ---
+
         // Create runtime first
         let (runtime, _result_rx, _isolation_rx_agg_to_runtime, _metrics_handle) = 
             SimulationRuntime::new(config.clone());
@@ -146,8 +152,9 @@ impl Simulation {
             );
 
             // Spawn the node's main loop
+            let node_shutdown_rx = shutdown_rx.clone(); // Clone receiver for this task
             let handle = tokio::spawn(async move {
-                node.run().await;
+                node.run(node_shutdown_rx).await; // Pass shutdown receiver
             });
             node_handles.push(handle);
         }
@@ -188,10 +195,13 @@ impl Simulation {
                 );
 
                 // Spawn coordinator task(s) - Placeholder, needs run methods
+                // Pass shutdown receiver if coordinator tasks need graceful shutdown
+                let coord_shutdown_rx = shutdown_rx.clone();
                 let coord_handle = tokio::spawn(async move {
-                    log::warn!("SimulatedCoordinator run loop not implemented!");
+                    // TODO: Modify coordinator run methods to accept shutdown_rx
+                    log::warn!("SimulatedCoordinator run loop not implemented or needs shutdown handling!");
                     // coordinator.run_command_listener(...).await;
-                    // coordinator.run_share_listener(...).await;
+                    // coordinator.run_share_listener(..., coord_shutdown_rx).await;
                 });
                 coordinator_handles.push(coord_handle);
             } else {
@@ -239,12 +249,14 @@ impl Simulation {
             // TODO: Refactor Aggregator to receive attestations via EmulatedNetwork
             // Commenting out listener spawn for now as it uses the wrong channel type
             // let agg_attestation_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_attestation_listener(???)); 
+            let agg_shutdown_rx_listener = shutdown_rx.clone();
+            let agg_challenge_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_challenge_listener(_challenge_rx_returned)); 
+            let agg_shutdown_rx_timeout = shutdown_rx.clone();
             let agg_timeout_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_timeout_checker());
             // Spawn challenge listener with the original receiver channel
-            let agg_challenge_listener_handle = tokio::spawn(Arc::clone(&aggregator_arc).run_challenge_listener(_challenge_rx_returned)); // Use the returned rx here
             // liveness_handles.push(agg_attestation_listener_handle);
-            liveness_handles.push(agg_timeout_handle);
             liveness_handles.push(agg_challenge_listener_handle);
+            liveness_handles.push(agg_timeout_handle);
 
             // --- Challenger --- 
             // Challenger::new takes 4 arguments
@@ -254,7 +266,8 @@ impl Simulation {
                 runtime.clone(), // Pass runtime for routing challenges TO nodes
                 challenge_tx_for_agg, // Pass the sender for Aggregator's challenge info channel
             );
-            let chal_handle = tokio::spawn(async move { challenger.run().await; });
+            let chal_shutdown_rx = shutdown_rx.clone();
+            let chal_handle = tokio::spawn(async move { challenger.run().await; }); // TODO: Modify run() to accept shutdown_rx
             liveness_handles.push(chal_handle);
             log::info!("Spawned Liveness tasks.");
 
@@ -267,6 +280,7 @@ impl Simulation {
             node_handles,
             coordinator_handles,
             liveness_handles,
+            shutdown_tx: Some(shutdown_tx), // Store sender
         }
     }
 
@@ -282,5 +296,17 @@ impl Simulation {
         //     let _ = handle.await;
         // }
          log::warn!("Simulation run logic is placeholder.");
+    }
+
+     // Add method to trigger shutdown
+     pub fn shutdown(&mut self) {
+        log::info!("Triggering simulation shutdown...");
+        if let Some(tx) = self.shutdown_tx.take() {
+            if tx.send(()).is_err() {
+                log::warn!("Shutdown signal receiver already dropped.");
+            }
+        } else {
+            log::warn!("Shutdown already triggered or sender not available.");
+        }
     }
 } 

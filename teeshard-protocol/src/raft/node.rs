@@ -251,23 +251,22 @@ impl RaftNode {
         }
         self.last_heartbeat_sent = Instant::now(); // Send initial heartbeats immediately
 
-        // --- Send Metric --- 
-        if let Some(metrics_tx) = self.metrics_tx.clone() { // Clone sender if it exists
+        // Send metrics event for leader election
+        if let Some(metrics_tx) = self.metrics_tx.clone() {
+            // --- FIX: Use correct fields for RaftLeaderElected ---
+            let current_time_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             let event = MetricEvent::RaftLeaderElected {
-                shard_id: self.shard_id,
-                node_id: self.state.id.clone(),
-                term: self.state.current_term,
+                term: self.state.current_term, // Add term
+                leader_id: self.state.id.id, // Use node_id for leader_id
+                timestamp_ms: current_time_ms, // Add timestamp_ms
             };
-            // Send asynchronously, log error if channel closed
-            let node_id_clone = self.state.id.clone(); // Clone for async block
-            tokio::spawn(async move {
-                if let Err(e) = metrics_tx.send(event).await {
-                    // Use cloned node_id for logging
-                    eprintln!("[RaftNode {}] Failed to send RaftLeaderElected metric: {}", node_id_clone.id, e);
-                }
-            });
+            // --- END FIX ---
+            // Send metrics in a non-blocking way or spawn a task
+            let _ = metrics_tx.try_send(event); // Use try_send for non-blocking
         }
-        // --- End Metric --- 
 
         // Send initial empty AppendEntries (heartbeats)
         self.send_append_entries() 

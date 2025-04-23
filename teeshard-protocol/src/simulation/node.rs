@@ -31,6 +31,7 @@ use crate::simulation::metrics::MetricEvent;
 use hex; // Add hex import
 use crate::tee_logic::enclave_sim::EnclaveSim; // Corrected Import Path
 use log::{debug, error, info};
+use tokio::sync::watch; // Add watch
 
 // Type for proposal requests received by the node's run loop
 pub type NodeProposalRequest = (Command, oneshot::Sender<Result<Vec<RaftEvent>, String>>);
@@ -140,29 +141,29 @@ impl SimulatedTeeNode {
     }
 
     /// Starts the node's main event loop in a separate Tokio task.
-    pub async fn run(mut self) {
-        // ADD PRINTLN HERE
+    pub async fn run(mut self, mut shutdown_rx: watch::Receiver<()>) {
         println!("[Node {} Task Startup] Entered run method. Shard ID: {}", self.identity.id, self.shard_id);
-        info!("[Node {} Task] Starting run loop. Shard ID: {}", self.identity.id, self.shard_id); // Use info! macro
-        let raft_tick_duration = Duration::from_millis(50); // TODO: Make configurable?
+        info!("[Node {} Task] Starting run loop. Shard ID: {}", self.identity.id, self.shard_id);
+        let raft_tick_duration = Duration::from_millis(50);
         let mut raft_tick_timer = interval(raft_tick_duration);
 
         loop {
-            // ADDED: Log at the start of each loop iteration
             debug!("[Node {} Task] Top of run loop iteration.", self.identity.id);
-
             let mut all_events: Vec<RaftEvent> = Vec::new();
 
             tokio::select! {
-                // ADDED: Log when timer tick occurs
+                // Prioritize shutdown check
+                _ = shutdown_rx.changed() => {
+                    info!("[Node {} Task] Shutdown signal received. Breaking loop.", self.identity.id);
+                    break;
+                }
                 _ = raft_tick_timer.tick() => {
                     debug!("[Node {} Task] Raft timer ticked.", self.identity.id);
                     let events = self.raft_node.tick();
                     all_events.extend(events);
                 }
-                // ADDED: Log when network message is received
                 Some(network_msg) = self.network_rx.recv() => {
-                    debug!("[Node {} Task] Received network message from Node {}: {:?}", self.identity.id, network_msg.sender.id, network_msg.message);
+                   debug!("[Node {} Task] Received network message from Node {}: {:?}", self.identity.id, network_msg.sender.id, network_msg.message);
                     match network_msg.message {
                         Message::RaftAppendEntries(args) => {
                             let events = self.raft_node.handle_message(network_msg.sender, RaftMessage::AppendEntries(args));
@@ -184,14 +185,13 @@ impl SimulatedTeeNode {
                             info!("[Node {}] Received liveness challenge: Nonce={:?}", self.identity.id, challenge_struct.nonce);
                             self.handle_liveness_challenge(challenge_struct.nonce).await; // Nonce is u64
                         }
-                        Message::LivenessResponse(_) => { // Added handling for LivenessResponse
+                        Message::LivenessResponse(_) => { 
                             warn!("[Node {}] Received LivenessResponse, but nodes typically send, not receive these.", self.identity.id);
                         }
-                        // Add arms for the missing variants
                         Message::ShardLockRequest(req) => {
                             warn!("[Node {}] Received unexpected ShardLockRequest: {:?}", self.identity.id, req);
                         }
-                        Message::CoordPartialSig { .. } => { // Use wildcard pattern for struct fields
+                        Message::CoordPartialSig { .. } => { 
                             warn!("[Node {}] Received unexpected CoordPartialSig.", self.identity.id);
                         }
                         Message::Placeholder(data) => {
@@ -199,31 +199,23 @@ impl SimulatedTeeNode {
                         }
                     }
                 }
-                // ADDED: Log when proposal message is received
                 Some(proposal_request) = self.proposal_rx.recv() => {
                     debug!("[Node {} Task] Received proposal request.", self.identity.id);
                     let (command, ack_tx) = proposal_request;
-
                     info!("[Node {}] Received proposal request: {:?}", self.identity.id, command);
-                    debug!("[Node {}] PRE raft_node.propose_command()", self.identity.id);
                     let raft_events = self.raft_node.propose_command(command);
-                    debug!("[Node {}] POST raft_node.propose_command(), generated {} events", self.identity.id, raft_events.len());
-
-                    all_events.extend(raft_events.clone()); // Clone events before sending
-
-                    if let Err(_) = ack_tx.send(Ok(raft_events)) { // Send the cloned events
+                    all_events.extend(raft_events.clone());
+                    if let Err(_) = ack_tx.send(Ok(raft_events)) {
                         error!("[Node {}] Failed to send proposal ACK back to runtime.", self.identity.id);
                     }
                 }
-                // ADDED: Log when query message is received
                 Some((query, response_sender)) = self.query_rx.recv() => {
-                    debug!("[Node {} Task] Received query request: {:?}", self.identity.id, query);
+                   debug!("[Node {} Task] Received query request: {:?}", self.identity.id, query);
                     self.handle_query(query, response_sender).await;
                 }
-                // Handles the case where a channel closes or the select! exits unexpectedly
                 else => {
                     warn!("[Node {} Task] A channel closed or select! completed without matching. Breaking loop.", self.identity.id);
-                    break; // Exit the loop if any channel closes or if select! terminates for other reasons
+                    break;
                 }
             }
 
@@ -232,7 +224,7 @@ impl SimulatedTeeNode {
                  self.handle_raft_events(all_events).await;
             }
         }
-        info!("[Node {} Task] Run loop finished.", self.identity.id); // Use info!
+        info!("[Node {} Task] Run loop finished.", self.identity.id);
     }
 
     /// Handles received state queries

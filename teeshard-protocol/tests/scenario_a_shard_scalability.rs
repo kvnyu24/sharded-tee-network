@@ -18,7 +18,7 @@ use teeshard_protocol::{
 };
 use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, watch};
 use std::sync::Arc;
 use ed25519_dalek::SigningKey;
 use hex;
@@ -86,6 +86,10 @@ async fn run_scenario_a_trial(
     let blockchain_interface = Arc::new(MockBlockchainInterface::new());
     let mut coordinator_handles = Vec::new();
     let mut node_handles = Vec::new();
+
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
 
     // --- RESTORE THE NORMAL SETUP LOOPS ---
     println!("[DEBUG] >>> Entering Shard Node PREPARATION Loop <<<"); // Added
@@ -159,14 +163,17 @@ async fn run_scenario_a_trial(
          if i == 0 {
              println!("[Debug][Coord {}] In i == 0 block, PRE-TAKE opt_result_rx", i); // Added
               if let Some(rx_to_move) = opt_result_rx.take() {
-                  println!("[Debug][Coord {}] PRE-SPAWN Share Listener", i); // Added
+                  println!("[Debug][Coord 0 Listener] Task started."); // Added inside task
                   let listener_handle = {
                       let coordinator_clone = coordinator_arc.clone();
+                      // --- Pass Shutdown Receiver ---
+                      let shutdown_rx_clone = shutdown_rx.clone();
                       tokio::spawn(async move {
                           println!("[Debug][Coord 0 Listener] Task started."); // Added inside task
-                          coordinator_clone.run_share_listener(rx_to_move).await;
+                          coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await;
                           println!("[Debug][Coord 0 Listener] Task finished."); // Added inside task
                       })
+                      // --- End Pass ---
                   };
                   coordinator_handles.push(listener_handle);
                   println!("[Debug][Coord {}] POST-SPAWN Share Listener for Coordinator {}.", i, coord_identity.id); // Added
@@ -188,13 +195,16 @@ async fn run_scenario_a_trial(
         // Capture shard_id *before* moving node into the async block
         let node_shard_id = node.shard_id(); 
         println!("[Debug][Node Spawn {}] PRE-SPAWN for Node ID {}", idx, node_id); // Added
-        let handle = tokio::spawn(async move {
-             // NOTE: Keep the startup println here inside the spawn block
-             // Use the captured node_shard_id
-             println!("[Node {} Task Startup] Entered run method. Shard ID: {}", node_id, node_shard_id);
-             node.run().await;
-             println!("[Node {} Task] Finished.", node_id); // Added inside task
-        });
+        let handle = {
+            // --- Pass Shutdown Receiver ---
+            let shutdown_rx_clone = shutdown_rx.clone();
+            tokio::spawn(async move {
+                println!("[Node {} Task Startup] Entered run method. Shard ID: {}", node_id, node_shard_id);
+                node.run(shutdown_rx_clone).await;
+                println!("[Node {} Task] Finished.", node_id); // Added inside task
+            })
+            // --- End Pass ---
+        };
         node_handles.push(handle);
         println!("[Debug][Node Spawn {}] POST-SPAWN for Node ID {}", idx, node_id); // Added
     }
@@ -249,11 +259,39 @@ async fn run_scenario_a_trial(
 
     // --- Cleanup & Metric Collection ---
     println!("[Scenario A] Cleaning up nodes and collecting metrics...");
-    // Abort the handles we created
-    for handle in coordinator_handles { handle.abort(); }
-    for handle in node_handles { handle.abort(); }
+    // REMOVED: Abort loops are replaced by graceful shutdown below
+    // for handle in coordinator_handles { handle.abort(); }
+    // for handle in node_handles { handle.abort(); }
 
-    // --- Drop the runtime explicitly HERE ---
+    // --- Send Shutdown Signal ---
+    println!("[Scenario A] Sending shutdown signal...");
+    if shutdown_tx.send(()).is_err() {
+        eprintln!("[Scenario A] Warning: Shutdown channel already closed?");
+    }
+    println!("[Scenario A] Shutdown signal sent.");
+    // --- End Send ---
+
+    // --- Await Handles Gracefully ---
+    println!("[Scenario A] Awaiting coordinator tasks...");
+    for handle in coordinator_handles {
+        if let Err(e) = handle.await {
+            // Use Display formatting for JoinError
+            eprintln!("[Scenario A] Error awaiting coordinator handle: {}", e);
+        }
+    }
+    println!("[Scenario A] Coordinator tasks finished.");
+
+    println!("[Scenario A] Awaiting node tasks...");
+    for handle in node_handles {
+         if let Err(e) = handle.await {
+             // Use Display formatting for JoinError
+             eprintln!("[Scenario A] Error awaiting node handle: {}", e); 
+         }
+    }
+     println!("[Scenario A] Node tasks finished.");
+    // --- End Await ---
+
+    // --- Drop the runtime explicitly AFTER tasks complete ---
     println!("[Scenario A] Dropping SimulationRuntime instance...");
     drop(runtime);
     println!("[Scenario A] SimulationRuntime instance dropped.");

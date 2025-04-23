@@ -98,7 +98,7 @@ pub fn analyze_perf_results(
 
     // Separate latencies based on is_cross_chain flag
     for event in metrics {
-        if let MetricEvent::TransactionCompleted { start_time: _ , end_time: _, success, is_cross_chain, duration, .. } = event {
+        if let MetricEvent::TransactionCompleted { start_time_ms: _, end_time_ms: _, success, is_cross_chain, duration, .. } = event {
             completed_count += 1;
             if *success {
                 let latency_micros = duration.as_micros(); // Use pre-calculated duration

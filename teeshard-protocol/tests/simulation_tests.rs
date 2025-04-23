@@ -22,7 +22,7 @@ use teeshard_protocol::raft::node::ShardId;
 use teeshard_protocol::tee_logic::crypto_sim;
 use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{mpsc, oneshot}; // Import mpsc
+use tokio::sync::{mpsc, oneshot, watch}; // Import mpsc and watch
 use bincode::config::standard; // For verification serialization
 use hex; // Need hex for share verification output
 // Add correct ShardId import
@@ -41,6 +41,10 @@ fn create_test_tee_signing(id: usize) -> (TEEIdentity, SigningKey) {
 #[tokio::test]
 async fn test_simulation_runtime_and_node_startup() {
     println!("--- Starting Simulation Runtime Test ---");
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
+
     let (node_identity, _node_secret_key) = create_test_tee_signing(0);
     let (runtime, _result_rx, _isolation_rx, _metrics_handle) = SimulationRuntime::new(SimulationConfig::default());
     let config = SystemConfig::default();
@@ -92,8 +96,10 @@ async fn test_simulation_runtime_and_node_startup() {
     // 3. Spawn node tasks by consuming the vector
     for node in nodes_to_spawn { 
         let id = node.identity.id;
-        // Spawn the task, moving the node into it, and store the handle
-        let handle = tokio::spawn(node.run());
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
         node_handles.push((id, handle));
         println!("[Test] Spawned node {} task.", id);
     }
@@ -104,18 +110,24 @@ async fn test_simulation_runtime_and_node_startup() {
     println!("[Test] Simulation run time finished.");
     println!("[Test] Test finished. Nodes should have run and potentially elected a leader.");
 
-    // 5. Cleanup using the stored handles
+    // 5. Cleanup using shutdown signal
+    println!("[Test] Sending shutdown signal...");
+    let _ = shutdown_tx.send(());
+    println!("[Test] Awaiting node tasks...");
     for (id, handle) in node_handles {
-        println!("[Test] Aborting node {} task.", id);
-        handle.abort(); // Abort tasks to ensure cleanup
-        // Optionally, await the handle if graceful shutdown is needed/possible
-        // let _ = handle.await; 
+        if let Err(e) = handle.await {
+            eprintln!("[Test] Error awaiting node {} handle: {}", id, e);
+        }
     }
+    println!("[Test] All node tasks finished.");
 }
 
 #[tokio::test]
 async fn test_raft_state_machine_command_processing() {
     println!("--- Starting State Machine Command Processing Test ---");
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
 
     // 1. Setup Simulation Environment
     let (node_identity, _node_secret_key) = create_test_tee_signing(0);
@@ -177,8 +189,10 @@ async fn test_raft_state_machine_command_processing() {
     // Spawn tasks by consuming the vector
     for node in nodes_to_spawn { 
         let id = node.identity.id;
-        // Spawn the task, moving the node into it, and store the handle
-        let handle = tokio::spawn(node.run());
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
         node_handles.push((id, handle));
         println!("[Test] Spawned node {} task.", id);
     }
@@ -361,15 +375,24 @@ async fn test_raft_state_machine_command_processing() {
 
     println!("[Test] State Machine test finished SUCCESSFULLY.");
 
-    // Cleanup node tasks
-    for (_id, handle) in node_handles {
-        handle.abort();
+    // Cleanup node tasks using shutdown signal
+    println!("[Test] Sending shutdown signal...");
+    let _ = shutdown_tx.send(());
+    println!("[Test] Awaiting node tasks...");
+    for (id, handle) in node_handles {
+        if let Err(e) = handle.await {
+             eprintln!("[Test] Error awaiting node {} handle: {}", id, e);
+        }
     }
+    println!("[Test] All node tasks finished.");
     println!("--- Finished State Machine Command Processing Test ---");
 }
 
 #[tokio::test]
 async fn test_simulation_runtime_and_node_communication() {
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
     let (runtime, _result_rx, _isolation_rx, _metrics_handle) = SimulationRuntime::new(SimulationConfig::default());
     let config = SystemConfig::default();
     let num_nodes = 3;
@@ -409,8 +432,10 @@ async fn test_simulation_runtime_and_node_communication() {
     // 3. Spawn node tasks by CONSUMING nodes_to_spawn
     for node in nodes_to_spawn { 
         let id = node.identity.id;
-        // Spawn the task, MOVING the node into it
-        let handle = tokio::spawn(node.run()); 
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
         node_handles.push((id, handle)); // Store handle
         println!("[Test] Spawned node {} task.", id);
     }
@@ -421,15 +446,23 @@ async fn test_simulation_runtime_and_node_communication() {
     println!("[Test] Simulation run time finished.");
     println!("[Test] Test finished. Nodes should have run and potentially elected a leader.");
 
-    // 5. Cleanup using handles
+    // 5. Cleanup using shutdown signal
+    println!("[Test] Sending shutdown signal...");
+    let _ = shutdown_tx.send(());
+    println!("[Test] Awaiting node tasks...");
     for (id, handle) in node_handles {
-         println!("[Test] Aborting node {} task.", id);
-        handle.abort(); 
+         if let Err(e) = handle.await {
+             eprintln!("[Test] Error awaiting node {} handle: {}", id, e);
+         }
     }
+    println!("[Test] All node tasks finished.");
 }
 
 #[tokio::test]
 async fn test_cross_chain_swap_simulation_e2e() {
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
     let (runtime, _result_rx, _isolation_rx, _metrics_handle) = SimulationRuntime::new(SimulationConfig::default());
     let config = SystemConfig::default();
     let num_nodes = 3;
@@ -469,7 +502,10 @@ async fn test_cross_chain_swap_simulation_e2e() {
     // 3. Spawn node tasks by CONSUMING nodes_to_spawn
     for node in nodes_to_spawn {
         let id = node.identity.id;
-        let handle = tokio::spawn(node.run());
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
         node_handles.push((id, handle));
         println!("[Test] Spawned node {} task.", id);
     }
@@ -480,16 +516,25 @@ async fn test_cross_chain_swap_simulation_e2e() {
     println!("[Test] Simulation run time finished.");
     println!("[Test] Test finished. Nodes should have run and potentially elected a leader.");
 
-    // 5. Cleanup using handles
+    // 5. Cleanup using shutdown signal
+    println!("[Test] Sending shutdown signal...");
+    let _ = shutdown_tx.send(());
+    println!("[Test] Awaiting node tasks...");
     for (id, handle) in node_handles {
-         println!("[Test] Aborting node {} task.", id);
-        handle.abort(); 
+         if let Err(e) = handle.await {
+             eprintln!("[Test] Error awaiting node {} handle: {}", id, e);
+         }
     }
+    println!("[Test] All node tasks finished.");
 }
 
 #[tokio::test]
 async fn test_threshold_signature_simulation() {
     println!("--- Running Threshold Signature Simulation Test ---");
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
+
     let num_nodes = 3;
     let threshold = 2;
     let mut config = SimulationConfig::default(); // Start with default
@@ -552,7 +597,10 @@ async fn test_threshold_signature_simulation() {
             i, // Use node index as shard_id for this simple test
         );
 
-        let handle = tokio::spawn(node.run());
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass receiver
+        });
         node_handles.push(handle);
         println!("[Test] Spawned Node {} with TEE ID {}.", i, tee_identity.id);
     }
@@ -692,11 +740,16 @@ async fn test_threshold_signature_simulation() {
         threshold
     );
 
-    // Optional: Shutdown nodes gracefully if needed (might require adding shutdown channels)
-    // for handle in node_handles {
-    //     handle.abort(); // Or use a graceful shutdown mechanism
-    // }
-
+    // Shutdown nodes gracefully
+    println!("[Test] Sending shutdown signal...");
+    let _ = shutdown_tx.send(());
+    println!("[Test] Awaiting node tasks...");
+    for handle in node_handles {
+        if let Err(e) = handle.await {
+             eprintln!("[Test] Error awaiting node handle: {}", e);
+         }
+    }
+    println!("[Test] All node tasks finished.");
     println!("--- Threshold Signature Simulation Test PASSED ---");
 }
 

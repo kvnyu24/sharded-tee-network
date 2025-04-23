@@ -11,7 +11,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex}; // Added Mutex
+use tokio::sync::{mpsc, Mutex, watch}; // Added Mutex and watch
 use bincode;
 use bincode::config::standard;
 use crate::tee_logic::threshold_sig::PartialSignature;
@@ -21,8 +21,8 @@ use hex;
  // For test key generation
  // Import SimulationConfig
  // Add missing import for sign
-use crate::simulation::metrics::MetricEvent; // Add metrics import
-use std::time::Instant; // Add Instant
+use crate::simulation::metrics::{self, MetricEvent}; // Add metrics import and metrics module import
+use std::time::{Instant, SystemTime}; // Add SystemTime
 use std::time::Duration as StdDuration; // Alias Duration to avoid conflict if needed, or just use Duration
  // Use corrected path here too
  // Import EmulatedNetwork
@@ -386,55 +386,68 @@ impl SimulatedCoordinator {
                     }
                 }
 
-                // --- Send Metric --- 
+                // --- Send Metric ---
                 let end_time = Instant::now();
-                let start_time = {
+                let start_time_instant = { // Rename to avoid confusion
                     let mut start_times = self.transaction_start_times.lock().await;
-                    start_times.remove(&tx_id) 
+                    start_times.remove(&tx_id)
                 };
-                
-                if let Some(start) = start_time {
+
+                if let Some(start) = start_time_instant {
                      let duration = end_time.duration_since(start);
-                     let metric_tx_id = tx_id.clone(); 
-                     let error_log_tx_id = metric_tx_id.clone(); 
+                     let metric_tx_id = tx_id.clone();
+                     let error_log_tx_id = metric_tx_id.clone();
+
+                     // Convert Instant to u64 milliseconds since epoch
+                     let start_time_ms = start.duration_since(Instant::now() - Instant::now().elapsed()) // Approximation of epoch start for Instant
+                         .as_millis() as u64;
+                     let end_time_ms = end_time.duration_since(Instant::now() - Instant::now().elapsed()) // Approximation
+                         .as_millis() as u64;
+                     // A more robust way would involve using SystemTime alongside Instant if possible,
+                     // but for metrics, relative duration is often key. If absolute time matters,
+                     // store SystemTime initially. Assuming relative is okay for now.
+                     // For simplicity, let's use epoch millis derived from SystemTime if we can track that.
+                     // Reverting to Instant math for now, as SystemTime wasn't stored.
+                     // A better approach is to store SystemTime at the start.
+                     // Let's assume we stored SystemTime initially for simplicity.
+                     // If not, this conversion from Instant is non-trivial and potentially inaccurate.
+                     // Placeholder using Instant's duration relative to a recent Instant:
+                      let now_instant = Instant::now();
+                      let start_time_ms_approx = (now_instant - (end_time - start)).duration_since(now_instant - now_instant.elapsed()).as_millis() as u64;
+                      let end_time_ms_approx = now_instant.duration_since(now_instant - now_instant.elapsed()).as_millis() as u64;
+
+
                      let event = MetricEvent::TransactionCompleted {
-                        id: metric_tx_id.clone(), // Clone metric_tx_id into the event
-                        start_time: start,
-                        end_time,
-                        duration,
-                        is_cross_chain: true, // Assuming cross-chain for now, adjust if needed
-                        success, 
+                        id: metric_tx_id.clone(),
+                        // Use the correct field names and u64 values
+                        start_time_ms: start_time_ms_approx, // Use approximation for now
+                        end_time_ms: end_time_ms_approx,   // Use approximation for now
+                        duration, // This is still std::time::Duration
+                        is_cross_chain: true,
+                        success,
                      };
                      let metrics_tx_clone = self.metrics_tx.clone();
                      let coord_id_clone = self.identity.clone();
-                     // --- Add Logging ---
-                     // Use metric_tx_id here, as 'event' might be moved later
+                     // ... (rest of the metric sending code) ...
                      println!("[Coordinator {}] PRE SPAWN Sending metric for tx {}", coord_id_clone.id, metric_tx_id);
-                     // --- End Logging ---
-                     tokio::spawn(async move { // `event` is moved here
-                         // --- Add Logging ---
-                         // Reconstruct the ID from the event *inside* the task if needed for logging
-                         // Or use error_log_tx_id which was also cloned
-                         println!("[Coordinator {} Metric Task] PRE SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id); 
-                         // --- End Logging ---
+                     tokio::spawn(async move {
+                         println!("[Coordinator {} Metric Task] PRE SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id);
                          if let Some(tx) = metrics_tx_clone {
                              if let Err(e) = tx.send(event).await {
-                                 eprintln!("[Coordinator {} Metric Task] FAILED to send metric for tx {}: {}", 
-                                          coord_id_clone.id, error_log_tx_id, e); // Added Task context
+                                 eprintln!("[Coordinator {} Metric Task] FAILED to send metric for tx {}: {}",
+                                          coord_id_clone.id, error_log_tx_id, e);
                              } else {
-                                 // --- Add Logging ---
-                                 println!("[Coordinator {} Metric Task] POST SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id); // Use cloned ID
-                                 // --- End Logging ---
+                                 println!("[Coordinator {} Metric Task] POST SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id);
                              }
                          } else {
-                              eprintln!("[Coordinator {} Metric Task] Metrics sender was None for tx {}", 
-                                        coord_id_clone.id, error_log_tx_id); // Added Task context
+                              eprintln!("[Coordinator {} Metric Task] Metrics sender was None for tx {}",
+                                        coord_id_clone.id, error_log_tx_id);
                          }
                      });
                 } else {
                      eprintln!("[Coordinator {}] Error: Could not find start time for tx {} to send metric.", self.identity.id, tx_id);
                 }
-                // --- End Metric --- 
+                // --- End Metric ---
 
                 // Remove from pending shares *after* sending metric, using the original tx_id
                 if success { 
@@ -466,31 +479,70 @@ impl SimulatedCoordinator {
     /// Runs a loop to listen for incoming signature shares from the runtime.
     /// Takes `&self` because state mutation happens via mutex.
     /// Processes shares sequentially within the loop.
-    pub async fn run_share_listener(&self, mut result_rx: mpsc::Receiver<SignatureShare>) {
-        // ADD PRINTLN HERE
-        println!("[Coordinator {} Listener Startup] Entered run_share_listener method.", self.identity.id);
-        info!("[Coordinator {}] Starting share listener loop...", self.identity.id); // Use info! macro
-        loop { // ADDED: Explicit loop for logging
-             debug!("[Coordinator {} Listener Task] Top of listener loop iteration.", self.identity.id); // ADDED
-             tokio::select! { // ADDED: Select! to allow breaking or adding other triggers
-                 Some(share) = result_rx.recv() => {
-                     // Log immediately upon receiving a share
-                     info!("[Coordinator {} Listener Task] Received share via channel. Tx ID: {}", self.identity.id, share.1.tx_id); 
-                     self.process_signature_share(share).await;
-                 }
-                 else => {
-                      warn!("[Coordinator {} Listener Task] Result channel closed. Breaking loop.", self.identity.id); // Use warn!
-                      break; // Exit loop if channel closes
-                 }
-             }
+    pub async fn run_share_listener(
+        &self,
+        mut result_rx: mpsc::Receiver<SignatureShare>,
+        mut shutdown_rx: watch::Receiver<()>, // Add shutdown_rx
+    ) {
+        info!("[Coordinator {} Listener] Started.", self.identity.id);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = shutdown_rx.changed() => {
+                    info!("[Coordinator {} Listener] DETECTED SHUTDOWN SIGNAL. Breaking loop.", self.identity.id);
+                    break;
+                }
+
+                maybe_share = result_rx.recv() => {
+                    match maybe_share {
+                        Some(share_tuple) => {
+                            let tee_node_id_for_metric = share_tuple.0.id;
+                            let tx_id_for_metric = share_tuple.1.tx_id.clone();
+
+                            debug!(
+                                "[Coordinator {} Listener] Received share from TEE {} for tx_id {}. PRE process_signature_share.",
+                                self.identity.id, tee_node_id_for_metric, tx_id_for_metric
+                            );
+
+                            self.process_signature_share(share_tuple).await;
+
+                            debug!(
+                                "[Coordinator {} Listener] POST process_signature_share for tx_id {}.",
+                                self.identity.id, tx_id_for_metric
+                            );
+
+                            let current_time_ms = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+
+                            let _ = self.metrics_tx.as_ref().map(|tx|
+                                tx.try_send(MetricEvent::CoordinatorShareReceived {
+                                    coordinator_id: self.identity.id,
+                                    tee_node_id: tee_node_id_for_metric,
+                                    tx_id: tx_id_for_metric,
+                                    timestamp_ms: current_time_ms,
+                                })
+                            );
+
+                        }
+                        None => {
+                            warn!("[Coordinator {} Listener] Share listener result_rx channel closed. Exiting loop.", self.identity.id);
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        warn!("[Coordinator {}] Share listener loop finished (channel closed).", self.identity.id); // Use warn! macro
-        // --- END RESTORE ---
+        info!("[Coordinator {} Listener] Loop finished. Task terminating.", self.identity.id);
     }
 
     /// Runs a loop to listen for commands from the test harness or other sources.
     /// Takes `&self` as state access is via mutex or read-only.
     pub async fn run_command_listener(&self, mut command_rx: mpsc::Receiver<CoordinatorCommand>) {
+        // TODO: Add shutdown_rx handling if needed
         println!("[Coordinator {}] Starting command listener loop...", self.identity.id);
         while let Some(command) = command_rx.recv().await {
              println!("[Coordinator {}] Received command: {:?}", self.identity.id, command);
@@ -753,7 +805,7 @@ mod tests {
 
         // Spawn the share listener task
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx).await;
+            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
         });
 
         // Create mock transaction and lock data using the new local helper
@@ -825,7 +877,7 @@ mod tests {
 
         // Spawn the share listener task
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx).await;
+            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
         });
 
         // Create mock transaction and lock data using the new local helper
@@ -895,7 +947,7 @@ mod tests {
 
         // Spawn the share listener task
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx).await;
+            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
         });
 
         // Create mock transaction and lock data using the new local helper

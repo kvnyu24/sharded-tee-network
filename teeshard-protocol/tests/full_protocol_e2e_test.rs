@@ -26,7 +26,7 @@ use teeshard_protocol::{
     onchain::interface::{BlockchainInterface, BlockchainError, SwapId, TransactionId},
 };
 use ethers::{types::{Address, U256}, prelude::*};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, watch};
 use std::path::PathBuf;
 use std::time::Duration;
 use std::sync::Arc;
@@ -253,14 +253,16 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
 
     // 3. Setup Simulation Runtime & Nodes based on Sharding
     println!("[Setup] Setting up Simulation Runtime and Nodes...");
-    // Initialize SimulationRuntime and channels
-    // Update destructuring to expect 3 return values
     let (runtime, mut result_rx, mut isolation_rx, metrics_handle) = SimulationRuntime::new(SimulationConfig::default());
 
     let mut node_query_senders: HashMap<usize, tokio::sync::mpsc::Sender<NodeQuery>> = HashMap::new();
     let mut nodes_to_spawn: Vec<SimulatedTeeNode> = Vec::new(); // Store just the node
     // Store Node ID along with handle
-    let mut node_handles: Vec<(usize, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut node_handles: Vec<(usize, tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<()>, tokio::sync::watch::Receiver<()>)> = Vec::new();
+
+    // --- Create Shutdown Signal ---
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    // --- End Create ---
 
     // --- Create Nodes and Register BEFORE Spawning --- 
     for partition in &final_partitions {
@@ -302,8 +304,11 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     // --- Spawn Node Tasks --- 
     for node in nodes_to_spawn {
         let node_id = node.identity.id; // Capture ID before moving
-        let handle = tokio::spawn(node.run());
-        node_handles.push((node_id, handle)); // Store ID with handle
+        let shutdown_rx_clone = shutdown_rx.clone(); // Clone the receiver
+        let handle = tokio::spawn(async move {
+            node.run(shutdown_rx_clone).await; // Pass it
+        });
+        node_handles.push((node_id, handle, shutdown_tx.clone(), shutdown_rx.clone())); // Store ID with handle
     }
     println!("[Setup] Spawned {} node tasks.", node_handles.len());
     // --- End Node Spawning --- 
@@ -425,13 +430,14 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     println!("[Setup] Coordinator instance created.");
 
     // Spawn the coordinator tasks
-    let coordinator_share_listener = coordinator.clone(); // Clone Arc for the task
+    let coordinator_share_listener = coordinator.clone();
+    let shutdown_rx_coord_share = shutdown_rx.clone(); // Clone the receiver again
     let share_listener_handle = tokio::spawn(async move {
-        coordinator_share_listener.run_share_listener(result_rx).await;
+        coordinator_share_listener.run_share_listener(result_rx, shutdown_rx_coord_share).await;
     });
     println!("[Setup] Coordinator share listener task spawned.");
 
-    let coordinator_command_listener = coordinator.clone(); // Clone Arc for the task
+    let coordinator_command_listener = coordinator.clone();
     let command_listener_handle = tokio::spawn(async move {
         coordinator_command_listener.run_command_listener(coord_cmd_rx).await;
     });
@@ -550,7 +556,7 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     // Isolate one node (Node 0)
     info!("[Test] Aborting Node 0 to trigger isolation...");
     // Find the handle associated with first_node_id
-    if let Some((_id, handle)) = node_handles.iter().find(|(id, _h)| *id == first_node_id) {
+    if let Some((_id, handle, _, _)) = node_handles.iter().find(|(id, _h, _, _)| *id == first_node_id) {
         println!("[Test] Aborting task for Node {} to simulate failure...", first_node_id);
         handle.abort();
     } else {
@@ -625,7 +631,7 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
     share_listener_handle.abort();
     command_listener_handle.abort();
     // Abort the handles stored in node_handles
-    for (id, handle) in &node_handles { // Iterate over tuples
+    for (id, handle, _, _) in &node_handles { // Iterate over tuples
         if *id == first_node_id { // Don't abort the one we already aborted
             continue;
         }
