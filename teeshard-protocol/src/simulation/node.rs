@@ -351,11 +351,11 @@ impl SimulatedTeeNode {
                     let start_time = lock_data.start_time; // Capture start time
 
                     let signable_data = (
-                        &lock_data.tx_id,
-                        lock_data.source_chain_id,
-                        lock_data.target_chain_id,
-                        &lock_data.token_address,
-                        lock_data.amount,
+                        &lock_data.tx_id, 
+                        lock_data.source_chain_id, 
+                        lock_data.target_chain_id, 
+                        &lock_data.token_address, 
+                        lock_data.amount, 
                         &lock_data.recipient
                     );
 
@@ -363,7 +363,7 @@ impl SimulatedTeeNode {
                         Ok(data_to_sign) => {
                             println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
                             println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
-
+                            
                             println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
                             let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
                             let share = (self.identity.clone(), lock_data.clone(), signature.clone()); // Clone signature for potential share sending
@@ -394,7 +394,7 @@ impl SimulatedTeeNode {
 
                             // --- Send share to Coordinator ONLY if cross-chain ---
                             if is_cross_chain {
-                                let tx_id_for_log = lock_data.tx_id.clone(); // Clone tx_id for logging
+                        let tx_id_for_log = lock_data.tx_id.clone(); // Clone tx_id for logging
                                 info!("[Node {}][StateMachine] Cross-chain tx {}. PRE runtime.submit_result", self.identity.id, tx_id_for_log);
                                 self.runtime.submit_result(share).await; // share was created earlier
                                 info!("[Node {}][StateMachine] POST runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
@@ -404,7 +404,7 @@ impl SimulatedTeeNode {
                             // --- End Conditional Share Sending ---
 
                             self.processed_commands.insert(lock_data.tx_id.clone());
-                            Ok(())
+                        Ok(())
                         }
                         Err(e) => {
                             // --- Send Failure Metric ---
@@ -431,9 +431,9 @@ impl SimulatedTeeNode {
                              }
                             // --- End Failure Metric ---
 
-                            let err_msg = format!("Error serializing LockProofData for signing: {}", e);
-                            eprintln!("[Node {}][StateMachine] {}", self.identity.id, err_msg);
-                            Err(err_msg)
+                        let err_msg = format!("Error serializing LockProofData for signing: {}", e);
+                        eprintln!("[Node {}][StateMachine] {}", self.identity.id, err_msg);
+                        Err(err_msg)
                         }
                     }
                 }
