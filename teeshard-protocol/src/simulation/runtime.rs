@@ -13,12 +13,13 @@ use crate::{
 use std::collections::{HashMap, HashSet}; // Added HashSet
 use std::sync::{Arc}; // Remove std Mutex import
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex}; // Add TokioMutex
-use log::{debug, warn, error, info}; // Import log macros and info
+use log::{debug, warn, error, info, trace}; // Import log macros and info
 use crate::liveness::types::NonceChallenge; // Import specifically
  // Need this for Message::LivenessResponse
 use std::time::{Duration, Instant, SystemTime}; // Add Duration, Instant, and SystemTime imports
 use rand::Rng; // Import Rng for packet loss
  // Import std::sync::Mutex
+use std::fmt; // Import fmt
 
 // Type for results sent back from nodes (e.g., signature shares)
 // Tuple: (Signer Identity, Data Signed (e.g., LockProofData), Signature)
@@ -403,26 +404,35 @@ impl SimulationRuntime {
 
     /// Submits a result (SignatureShare) from a node.
     pub async fn submit_result(&self, result: SignatureShare) {
-        let sender_node_id = result.0.id; // Get ID from TEEIdentity in tuple
-        // --- Crash Check ---
-        if self.is_node_crashed(sender_node_id).await {
-             debug!("[Runtime] Dropping result from crashed Node {}", sender_node_id);
+        // Lock state AFTER extracting info needed for logging if lock isn't strictly needed for that info
+        let node_id = result.0.id; // Extract node_id for logging
+        let tx_id = result.1.tx_id.clone(); // Extract tx_id for logging
+
+        // --- ADDED Logging ---
+        info!("[Runtime] Node {} preparing to submit result for tx {}", node_id, tx_id);
+        // --- END Logging ---
+
+        let state = self.crashed_nodes.lock().await; // Lock crash set
+        if state.contains(&node_id) {
+             debug!("[Runtime] Dropping result submission from crashed Node {}", node_id);
+             return; // Drop lock on crashed_nodes here implicitly
+        }
+        let loss_prob = self.config.network_packet_loss_probability;
+        // Drop crash lock before potential random number generation and send
+        drop(state);
+
+        if loss_prob > 0.0 && rand::thread_rng().gen::<f64>() < loss_prob {
+             debug!("[Runtime] PACKET LOSS: Dropping result submission from Node {} for tx {} (Loss Rate: {})",
+                    node_id, tx_id, loss_prob);
              return;
         }
-        // --- End Crash Check ---
 
-         // --- Packet Loss Check ---
-         // Applying loss here assumes results channel simulates network loss.
-         let loss_prob = self.config.network_packet_loss_probability;
-         if loss_prob > 0.0 && rand::thread_rng().gen::<f64>() < loss_prob {
-             debug!("[Runtime] PACKET LOSS: Dropping result submission from Node {} (Loss Rate: {})",
-                    sender_node_id, loss_prob);
-             return; // Simulate packet loss
-         }
-        // --- End Packet Loss Check ---
-
+        // Send the result
         if let Err(e) = self.result_tx.send(result).await {
-            error!("[Runtime] Failed to submit result: {}", e);
+             error!("[Runtime] Failed to submit result from node {} for tx {}: {}", node_id, tx_id, e);
+             // This indicates the coordinator's listener might have terminated or the channel is broken.
+        } else {
+            debug!("[Runtime] Successfully submitted result from node {} for tx {}", node_id, tx_id);
         }
     }
 

@@ -134,7 +134,6 @@ async fn run_scenario_a_trial(
 
     println!("[Debug] >>> Entering Coordinator Setup Loop <<<");
     for i in 0..num_coordinators {
-         // ... (Restore original coordinator setup loop content) ...
          println!("[Debug][Coord {}] >>> Loop Start <<<", i); // Added
          let coord_identity = coordinator_identities[i].clone();
          let coord_signing_key = signing_keys.get(&coord_identity.id).unwrap().clone();
@@ -159,19 +158,25 @@ async fn run_scenario_a_trial(
          );
          println!("[Debug][Coord {}] SimulatedCoordinator::new finished", i); // Added
          let coordinator_arc = Arc::new(coordinator);
+         let coordinator_id_for_task = coord_identity.id; // Capture ID before move
 
          if i == 0 {
              println!("[Debug][Coord {}] In i == 0 block, PRE-TAKE opt_result_rx", i); // Added
               if let Some(rx_to_move) = opt_result_rx.take() {
-                  println!("[Debug][Coord 0 Listener] Task started."); // Added inside task
+                  println!("[Debug][Coord 0 Listener] Spawning Task."); // Updated log
                   let listener_handle = {
-                      let coordinator_clone = coordinator_arc.clone();
                       // --- Pass Shutdown Receiver ---
                       let shutdown_rx_clone = shutdown_rx.clone();
-                      tokio::spawn(async move {
-                          println!("[Debug][Coord 0 Listener] Task started."); // Added inside task
-                          coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await;
-                          println!("[Debug][Coord 0 Listener] Task finished."); // Added inside task
+                      // DO NOT CAPTURE coordinator_arc here
+                      tokio::spawn(async move { // Only move necessary items
+                          println!("[Debug][Coord {} Listener] Task started.", coordinator_id_for_task);
+                          // Call the static-like function from the SimulatedCoordinator struct
+                          SimulatedCoordinator::run_share_listener(
+                              coordinator_id_for_task, // Pass the ID
+                              rx_to_move,
+                              shutdown_rx_clone
+                          ).await;
+                          println!("[Debug][Coord {} Listener] Task finished.", coordinator_id_for_task);
                       })
                       // --- End Pass ---
                   };
@@ -182,6 +187,18 @@ async fn run_scenario_a_trial(
               }
          } else {
               println!("[Debug][Coord {}] In else block for coordinator setup", i); // Added
+              // TODO: If spawning other coordinator tasks (like command listener) that NEED self,
+              // you would capture coordinator_arc for those tasks.
+              // Example:
+              // let cmd_listener_handle = {
+              //     let coord_clone = coordinator_arc.clone();
+              //     let (cmd_tx, cmd_rx) = mpsc::channel(10); // Need command channel setup
+              //     // Store cmd_tx somewhere accessible
+              //     tokio::spawn(async move {
+              //         coord_clone.run_command_listener(cmd_rx).await;
+              //     })
+              // };
+              // coordinator_handles.push(cmd_listener_handle);
               println!("[Scenario A] TODO: Spawn other tasks for Coordinator {}.", coord_identity.id);
          }
           println!("[Debug][Coord {}] >>> Loop End <<<", i); // Added
@@ -271,6 +288,12 @@ async fn run_scenario_a_trial(
     println!("[Scenario A] Shutdown signal sent.");
     // --- End Send ---
 
+    // --- FIX: Drop the runtime BEFORE awaiting tasks ---
+    println!("[Scenario A] Dropping SimulationRuntime instance...");
+    drop(runtime);
+    println!("[Scenario A] SimulationRuntime instance dropped.");
+    // --- END FIX ---
+
     // --- Await Handles Gracefully ---
     println!("[Scenario A] Awaiting coordinator tasks...");
     for handle in coordinator_handles {
@@ -290,12 +313,6 @@ async fn run_scenario_a_trial(
     }
      println!("[Scenario A] Node tasks finished.");
     // --- End Await ---
-
-    // --- Drop the runtime explicitly AFTER tasks complete ---
-    println!("[Scenario A] Dropping SimulationRuntime instance...");
-    drop(runtime);
-    println!("[Scenario A] SimulationRuntime instance dropped.");
-    // --- End Drop ---
 
     println!("[Scenario A] Awaiting metrics handle..."); // Added log
     let collected_metrics = match metrics_handle.await {

@@ -41,7 +41,7 @@ async fn run_scenario_d_trial(
     num_blockchains: usize,
     network_min_delay_ms: u64, // Key variable
     network_max_delay_ms: u64, // Key variable
-    // packet_drop_rate: f64, // TODO: Add in Phase 3
+    packet_loss_probability: f64, // Use the correct field name
 ) -> (Vec<MetricEvent>, Duration) {
     println!("--- Starting Scenario D Trial (k={}, m={}, delay=[{},{}], tps={}, rho={}) ---",
              num_shards, nodes_per_shard, network_min_delay_ms, network_max_delay_ms, target_tps, cross_chain_ratio);
@@ -54,7 +54,7 @@ async fn run_scenario_d_trial(
     sim_config.system_config.coordinator_threshold = coordinator_threshold;
     sim_config.network_min_delay_ms = network_min_delay_ms; // Set delay
     sim_config.network_max_delay_ms = network_max_delay_ms; // Set delay
-    // sim_config.packet_drop_rate = packet_drop_rate; // Set drop rate later
+    sim_config.network_packet_loss_probability = packet_loss_probability; // Use the correct field name
     // **Important**: Raft timeouts might need adjusting based on network delay
     sim_config.system_config.raft_election_timeout_min_ms = network_max_delay_ms * 5; // Example heuristic
     sim_config.system_config.raft_election_timeout_max_ms = network_max_delay_ms * 10;
@@ -117,20 +117,35 @@ async fn run_scenario_d_trial(
     for i in 0..num_coordinators {
         let coord_identity = coordinator_identities[i].clone();
         let coord_signing_key = signing_keys.get(&coord_identity.id).unwrap().clone();
+        let coordinator_id_for_task = coord_identity.id; // Capture ID before move
+
         let (coord_network_tx, _coord_network_rx) = mpsc::channel(100);
         runtime.register_component(coord_identity.clone(), coord_network_tx).await;
         let coordinator_metrics_tx = runtime.get_metrics_sender();
-        let coordinator = SimulatedCoordinator::new(coord_identity.clone(), coord_signing_key, sim_config.system_config.clone(), runtime.clone(), blockchain_interface.clone(), partition_mapping.clone(), coordinator_metrics_tx.clone(), shard_assignments.clone(), // Pass the local assignments map (Arg 8)
+        let coordinator = SimulatedCoordinator::new(
+            coord_identity.clone(),
+            coord_signing_key,
+            sim_config.system_config.clone(),
+            runtime.clone(),
+            blockchain_interface.clone(),
+            partition_mapping.clone(),
+            coordinator_metrics_tx.clone(),
+            shard_assignments.clone(), // Pass the local assignments map (Arg 8)
         );
+        // Keep Arc if other tasks need it
         let coordinator_arc = Arc::new(coordinator);
         if i == 0 {
              if let Some(rx_to_move) = opt_result_rx.take() {
                  let listener_handle = {
-                     let coordinator_clone = coordinator_arc.clone();
+                     // REMOVE: let coordinator_clone = coordinator_arc.clone();
                      let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
-                     tokio::spawn(async move {
-                         // Pass shutdown receiver
-                         coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await;
+                     tokio::spawn(async move { // Only move required items
+                         // Call the associated function directly using :: syntax
+                         SimulatedCoordinator::run_share_listener(
+                            coordinator_id_for_task, // Pass captured ID
+                            rx_to_move,
+                            shutdown_rx_clone
+                         ).await;
                      })
                  };
                  coordinator_handles.push(listener_handle);
@@ -192,26 +207,37 @@ async fn run_scenario_d_trial(
      println!("[Scenario D] Shutdown signal sent.");
      // --- End Send ---
 
-     // --- Await Handles Gracefully ---
+     // --- Drop runtime BEFORE awaiting tasks (Consistent with A/C) ---
+     println!("[Scenario D] Dropping SimulationRuntime instance...");
+     drop(runtime);
+     println!("[Scenario D] SimulationRuntime instance dropped.");
+     // --- End Drop ---
+
+     // --- Await Handles Gracefully (with Timeouts) ---
      println!("[Scenario D] Awaiting coordinator tasks...");
      for handle in coordinator_handles {
-         if let Err(e) = handle.await {
-             eprintln!("[Scenario D] Error awaiting coordinator handle: {}", e);
+         // Add timeout like in Scenario C
+         if let Err(_) = tokio::time::timeout(Duration::from_secs(10), handle).await {
+             eprintln!("[Scenario D] WARN: Coordinator task timed out during shutdown await.");
+             // Optionally abort: handle.abort();
+         } else {
+            // println!("[Scenario D] Coordinator task finished gracefully."); // Optional success log
          }
      }
-     println!("[Scenario D] Coordinator tasks finished.");
+     println!("[Scenario D] Coordinator tasks finished (or timed out).");
 
      println!("[Scenario D] Awaiting node tasks...");
      for handle in node_handles {
-          if let Err(e) = handle.await {
-              eprintln!("[Scenario D] Error awaiting node handle: {}", e);
+          // Add timeout like in Scenario C
+          if let Err(_) = tokio::time::timeout(Duration::from_secs(10), handle).await {
+              eprintln!("[Scenario D] WARN: Node task timed out during shutdown await.");
+              // Optionally abort: handle.abort();
+          } else {
+            // println!("[Scenario D] Node task finished gracefully."); // Optional success log
           }
      }
-      println!("[Scenario D] Node tasks finished.");
+      println!("[Scenario D] Node tasks finished (or timed out).");
      // --- End Await ---
-
-     // Drop runtime AFTER awaiting tasks
-     drop(runtime);
 
     let collected_metrics = match metrics_handle.await {
         Ok(metrics) => metrics,
@@ -224,7 +250,7 @@ async fn run_scenario_d_trial(
 // --- Main Test Function ---
 
 #[tokio::test]
-#[ignore] // Ignore by default
+// #[ignore] // Ignore by default - REMOVED
 async fn test_scenario_d_network_delay_variations() {
     println!("===== Running Scenario D: Network Delay Variations Test =====");
     let num_shards = 5; // k value
@@ -235,11 +261,11 @@ async fn test_scenario_d_network_delay_variations() {
     let target_tps = 200; // Fixed TPS
     let cross_chain_ratio = 0.30; // rho = 30%
     let num_blockchains = 2;
-    let num_trials = 1; // TODO: Increase
+    let num_trials = 3; // Increased from 1
 
-    // Network Profiles (min_ms, max_ms, drop_rate - drop rate added later)
+    // Network Profiles (min_ms, max_ms, loss_prob - loss probability added later)
     let network_profiles = [
-        ("Low", 10, 20, 0.01),
+        ("Low", 10, 20, 0.01),      // (name, min_delay, max_delay, loss_prob)
         ("Moderate", 30, 50, 0.01),
         ("High", 80, 120, 0.02),
     ];
@@ -247,8 +273,9 @@ async fn test_scenario_d_network_delay_variations() {
     let mut all_results: HashMap<String, Vec<MetricEvent>> = HashMap::new();
     let mut all_durations: HashMap<String, Vec<Duration>> = HashMap::new();
 
-    for (profile_name, min_delay, max_delay, _drop_rate) in network_profiles {
-        println!("\n>>> Testing with Network Profile: {} (Delay: {}-{}ms) <<<", profile_name, min_delay, max_delay);
+    for (profile_name, min_delay, max_delay, loss_prob) in network_profiles { // Use correct variable name
+        println!("\n>>> Testing with Network Profile: {} (Delay: {}-{}ms, Loss: {}%) <<<",
+                 profile_name, min_delay, max_delay, loss_prob * 100.0);
         let mut trial_metrics = Vec::new();
         let mut trial_durations = Vec::new();
         for trial in 0..num_trials {
@@ -264,7 +291,7 @@ async fn test_scenario_d_network_delay_variations() {
                 num_blockchains,
                 min_delay, // Pass delay param
                 max_delay, // Pass delay param
-                // drop_rate, // Pass drop rate later
+                loss_prob, // Pass packet loss probability
             ).await;
             trial_metrics.extend(metrics);
             trial_durations.push(duration);
@@ -274,14 +301,14 @@ async fn test_scenario_d_network_delay_variations() {
     }
 
     println!("\n===== Scenario D Analysis =====");
-    for (profile_name, min_delay, max_delay, _drop_rate) in network_profiles {
+    for (profile_name, min_delay, max_delay, loss_prob) in network_profiles { // Use correct variable name
          if let (Some(metrics), Some(durations)) = (all_results.get(profile_name), all_durations.get(profile_name)) {
             let avg_duration = durations.iter().sum::<Duration>() / num_trials as u32;
             let mut params = HashMap::new();
             params.insert("profile".to_string(), profile_name.to_string());
             params.insert("min_delay".to_string(), min_delay.to_string());
             params.insert("max_delay".to_string(), max_delay.to_string());
-            // params.insert("drop_rate".to_string(), drop_rate.to_string());
+            params.insert("loss_prob".to_string(), loss_prob.to_string()); // Use correct key
             analyze_perf_results("Scenario D", &params, metrics, num_transactions * num_trials, avg_duration);
             // TODO: Extract and analyze specific metrics: finality latency, Raft elections
         }

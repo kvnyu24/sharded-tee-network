@@ -131,9 +131,21 @@ fn generate_scenario_e_transactions(
     transactions
 }
 
+// --- Helper function for percentile calculation (copied from test_utils.rs) ---
+fn calculate_stats_micros(latencies: &[u128]) -> (f64, u128, u128) {
+    if latencies.is_empty() { return (0.0, 0, 0); }
+    let count = latencies.len();
+    let avg = latencies.iter().sum::<u128>() as f64 / count as f64;
+    // Ensure index calculation doesn't panic on empty or single-element slices
+    let p95_idx = ((count as f64 * 0.95).floor() as usize).min(count.saturating_sub(1));
+    let p99_idx = ((count as f64 * 0.99).floor() as usize).min(count.saturating_sub(1));
+    // Use the last element as fallback if index calculation somehow fails (e.g., len=0 was missed)
+    let p95 = *latencies.get(p95_idx).unwrap_or(latencies.last().unwrap_or(&0));
+    let p99 = *latencies.get(p99_idx).unwrap_or(latencies.last().unwrap_or(&0));
+    (avg, p95, p99)
+}
 
 #[tokio::test]
-#[ignore] // Ignore by default as it requires fault injection mechanism and specific analysis
 async fn test_scenario_e_crash_faults() -> Result<(), String> {
     println!("--- Starting Scenario E: Crash Fault Tolerance ---");
     let start_scenario = Instant::now();
@@ -165,6 +177,9 @@ async fn test_scenario_e_crash_faults() -> Result<(), String> {
     // Use default sim config, assuming fault injection is handled separately via runtime calls
     let sim_config = SimulationConfig::default();
 
+    // --- ADD shared state for crash intervals ---
+    let crash_intervals = Arc::new(Mutex::new(Vec::<(usize, u64, u64)>::new()));
+
     // --- Identities ---
     let identities: Vec<(TEEIdentity, SecretKey)> = (0..num_nodes).map(create_test_tee).collect();
     let node_identities: Vec<TEEIdentity> = identities.iter().map(|(id, _)| id.clone()).collect();
@@ -186,6 +201,8 @@ async fn test_scenario_e_crash_faults() -> Result<(), String> {
     // or provides a way to signal crashes (e.g., via isolation_tx)
     let (runtime, mut result_rx, mut isolation_rx, metrics_handle) = SimulationRuntime::new(sim_config);
     let runtime_handle = Arc::new(runtime); // Use Arc for sharing runtime handle with fault injector
+    // --- Get Metrics Sender --- 
+    let metrics_tx = runtime_handle.get_metrics_sender();
 
     let mut node_query_senders = HashMap::new();
     let mut proposal_txs = HashMap::new();
@@ -349,20 +366,74 @@ async fn test_scenario_e_crash_faults() -> Result<(), String> {
     let fault_shutdown_rx = shutdown_rx.clone();
     let mut rng = rand::rngs::SmallRng::from_rng(thread_rng()).map_err(|e| e.to_string())?;
     let fault_injection_task = tokio::spawn({
-        let runtime = runtime_handle.clone(); // Use runtime Arc
+        // Clone handles needed for the task
+        let metrics_tx = metrics_tx.clone(); // Clone sender
         let node_ids = all_node_ids.clone();
+        let crash_intervals_clone = crash_intervals.clone(); // Clone Arc for task
         // Move the created RNG into the async block
         let mut rng = rng;
         async move {
             let mut interval = tokio::time::interval(crash_interval);
             let mut shutdown_signal = fault_shutdown_rx;
+            // Track currently crashed nodes to avoid crashing them again immediately
+            let crashed_nodes = Arc::new(Mutex::new(HashSet::<usize>::new()));
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        if let Some(node_to_crash) = node_ids.choose(&mut rng) {
-                            println!("[FaultInjector] Placeholder: Would crash Node {} for {:?}", node_to_crash, crash_duration);
-                            // --- TODO: Implement actual crash injection call using SimulationRuntime API ---
+                        let mut available_nodes = node_ids.clone();
+                        {
+                            // Filter out nodes that are already crashed
+                            let currently_crashed = crashed_nodes.lock().await;
+                            available_nodes.retain(|id| !currently_crashed.contains(id));
+                        }
+
+                        if available_nodes.is_empty() {
+                            println!("[FaultInjector] No available nodes to crash currently.");
+                            continue;
+                        }
+
+                        if let Some(&node_to_crash) = available_nodes.choose(&mut rng) { // Dereference the chosen node ID
+                            println!("[FaultInjector] Injecting crash for Node {} for {:?}...", node_to_crash, crash_duration);
+                            // Mark as crashed immediately
+                            crashed_nodes.lock().await.insert(node_to_crash);
+                            let crash_start_time_ms = teeshard_protocol::simulation::metrics::current_epoch_millis(); // Get current time
+
+                            // --- Send NodeIsolated Metric Event --- 
+                            let isolated_event = MetricEvent::NodeIsolated {
+                                node_id: node_to_crash,
+                                timestamp_ms: crash_start_time_ms,
+                            };
+                            if let Err(e) = metrics_tx.send(isolated_event).await {
+                                eprintln!("[FaultInjector] Error sending NodeIsolated event: {}", e);
+                            }
+
+                            // Spawn rejoin task
+                            let rejoin_metrics_tx = metrics_tx.clone();
+                            let rejoin_crashed_nodes = crashed_nodes.clone();
+                            let rejoin_crash_intervals = crash_intervals_clone.clone(); // Clone Arc for rejoin task
+                            tokio::spawn(async move {
+                                tokio::time::sleep(crash_duration).await;
+                                let rejoin_time_ms = teeshard_protocol::simulation::metrics::current_epoch_millis();
+                                println!("[FaultInjector] Injecting rejoin for Node {}...", node_to_crash);
+
+                                // --- Record crash interval BEFORE sending rejoin event ---
+                                {
+                                    let mut intervals = rejoin_crash_intervals.lock().await;
+                                    intervals.push((node_to_crash, crash_start_time_ms, rejoin_time_ms));
+                                }
+                                
+                                // --- Send NodeRejoined Metric Event --- 
+                                let rejoined_event = MetricEvent::NodeRejoined {
+                                    node_id: node_to_crash,
+                                    timestamp_ms: rejoin_time_ms,
+                                };
+                                if let Err(e) = rejoin_metrics_tx.send(rejoined_event).await {
+                                     eprintln!("[FaultInjector] Error sending NodeRejoined event: {}", e);
+                                }
+                                // Unmark as crashed after sending rejoin event
+                                rejoin_crashed_nodes.lock().await.remove(&node_to_crash);
+                            });
                         }
                     },
                      _ = shutdown_signal.changed() => {
@@ -386,65 +457,124 @@ async fn test_scenario_e_crash_faults() -> Result<(), String> {
     println!("[Cleanup] Sending shutdown signal...");
     let _ = shutdown_tx.send(()); // Signal all tasks
 
+    // --- Drop runtime BEFORE awaiting tasks ---
+    println!("[Cleanup] Dropping SimulationRuntime instance...");
+    drop(runtime_handle); // Drop the Arc<SimulationRuntime>
+    println!("[Cleanup] SimulationRuntime instance dropped.");
+    // --- End Drop ---
+
     // Wait for tasks (with timeouts)
     println!("[Cleanup] Waiting for submission task...");
-    let _ = tokio::time::timeout(Duration::from_secs(5), submission_task).await;
+    if let Err(_) = tokio::time::timeout(Duration::from_secs(5), submission_task).await {
+        eprintln!("[Cleanup] WARN: Submission task timed out during shutdown await.");
+    }
     println!("[Cleanup] Waiting for fault injection task...");
-     let _ = tokio::time::timeout(Duration::from_secs(5), fault_injection_task).await;
+     if let Err(_) = tokio::time::timeout(Duration::from_secs(5), fault_injection_task).await {
+        eprintln!("[Cleanup] WARN: Fault injection task timed out during shutdown await.");
+     }
      println!("[Cleanup] Waiting for node tasks...");
     for (id, handle) in node_handles {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        println!("[Cleanup] Node {} finished.", id);
+        if let Err(_) = tokio::time::timeout(Duration::from_secs(5), handle).await {
+             eprintln!("[Cleanup] WARN: Node {} task timed out during shutdown await.", id);
+        }
+        // No need for else print, keep output clean
     }
+    println!("[Cleanup] All node tasks finished or timed out."); // Consolidated log
 
     // Collect metrics using the correct handle
+    println!("[Cleanup] Awaiting metrics handle..."); // Added log
     let collected_metrics = metrics_handle.await.unwrap_or_default(); // Await the handle
     println!("[Metrics] Collected {} metric events.", collected_metrics.len());
 
-    // --- Analyze Metrics (Placeholder) ---
+    // --- Analyze Metrics ---
     let mut leader_elections_per_shard: HashMap<usize, usize> = HashMap::new();
-    let mut commit_latencies: Vec<Duration> = Vec::new();
-    let mut transaction_outcomes: HashMap<TransactionId, bool> = HashMap::new(); // true=committed, false=aborted (needs tracking)
+    let mut commit_latencies: Vec<Duration> = Vec::new(); // Raw commit latencies
+    let mut transaction_outcomes: HashMap<String, bool> = HashMap::new(); // String = TxId, bool = success
+    let mut latencies_during_crash: Vec<u128> = Vec::new(); // Tx completion latencies (micros)
+    let mut latencies_normal: Vec<u128> = Vec::new(); // Tx completion latencies (micros)
 
-    for event in collected_metrics {
-        match event {
-            // --- TODO: Find the correct MetricEvent variant for leader elections ---
-            // MetricEvent::RaftLeaderElection { shard_id, .. } => {
-            //     *leader_elections_per_shard.entry(shard_id).or_insert(0) += 1;
-            // }
-            MetricEvent::RaftCommit { latency, .. } => {
-                commit_latencies.push(latency);
-            }
-            // --- CHALLENGE: Abort Tracking ---
-            // Need a way to track aborted transactions, e.g., a new MetricEvent::TransactionAborted
-            // Adjust matching based on actual MetricEvent::TransactionCompleted structure
-            // --- TODO: Re-enable and adjust matching based on actual MetricEvent::TransactionCompleted fields ---
-            // MetricEvent::TransactionCompleted { tx_id, success, .. } => {
-            //      // Assuming 'success: bool' field exists
-            //      transaction_outcomes.insert(tx_id, success);
-            // }
-            _ => {}
+    // Create node_id -> shard_id lookup map
+    let mut node_id_to_shard_id: HashMap<usize, usize> = HashMap::new();
+    for (shard_id, nodes_in_shard) in &shard_assignments {
+        for node_identity in nodes_in_shard {
+            node_id_to_shard_id.insert(node_identity.id, *shard_id);
         }
     }
 
-    println!("[Results] Leader Elections per Shard:");
+    // --- Get the recorded crash intervals ---
+    let final_crash_intervals = crash_intervals.lock().await.clone(); // Clone the data
+
+    println!("[Analysis] Analyzing {} metric events...", collected_metrics.len());
+    for event in collected_metrics {
+        match event {
+            MetricEvent::RaftLeaderElected { leader_id, .. } => {
+                if let Some(shard_id) = node_id_to_shard_id.get(&leader_id) {
+                    *leader_elections_per_shard.entry(*shard_id).or_insert(0) += 1;
+                } else {
+                    println!("[Analysis] Warning: Could not find shard for leader election event (leader_id: {}).", leader_id);
+                }
+            }
+            MetricEvent::RaftCommit { latency, .. } => {
+                commit_latencies.push(latency);
+            }
+            MetricEvent::TransactionCompleted { id, success, duration, end_time_ms, .. } => {
+                 transaction_outcomes.insert(id, success);
+                 if success {
+                    let latency_micros = duration.as_micros();
+                    let mut is_during_crash = false;
+                    // Check if tx completed during ANY crash interval
+                    for (_node_id, start_ms, finish_ms) in &final_crash_intervals {
+                        if end_time_ms >= *start_ms && end_time_ms <= *finish_ms {
+                            is_during_crash = true;
+                            break;
+                        }
+                    }
+                    if is_during_crash {
+                        latencies_during_crash.push(latency_micros);
+                    } else {
+                        latencies_normal.push(latency_micros);
+                    }
+                 }
+            }
+            // Added cases to prevent warnings, ignore others for now
+            MetricEvent::NodeIsolated { .. } | MetricEvent::NodeRejoined { .. } | MetricEvent::TeeFunctionMeasured {..} | _ => {}
+        }
+    }
+
+    println!("\n[Results] Leader Elections per Shard:");
     for shard_id in 0..num_shards {
         println!("  - Shard {}: {}", shard_id, leader_elections_per_shard.get(&shard_id).unwrap_or(&0));
     }
 
-    // --- CHALLENGE: Latency Spike Analysis ---
-    println!("[Results] Commit Latency ({} samples):", commit_latencies.len());
-    // TODO: Analyze commit_latencies for spikes or changes during crash periods. Requires correlating timestamps.
+    // --- Latency Spike Analysis ---
+    println!("\n[Results] Transaction Completion Latency Comparison:");
+    if !latencies_normal.is_empty() {
+        latencies_normal.sort_unstable();
+        let (avg, p95, p99) = calculate_stats_micros(&latencies_normal);
+        println!("  Normal Period ({} samples): Avg={:.3} ms, P95={:.3} ms, P99={:.3} ms",
+                 latencies_normal.len(), avg / 1000.0, p95 as f64 / 1000.0, p99 as f64 / 1000.0);
+    } else {
+        println!("  Normal Period: No successful transactions recorded.");
+    }
+    if !latencies_during_crash.is_empty() {
+        latencies_during_crash.sort_unstable();
+        let (avg, p95, p99) = calculate_stats_micros(&latencies_during_crash);
+        println!("  During Crash ({} samples): Avg={:.3} ms, P95={:.3} ms, P99={:.3} ms",
+                 latencies_during_crash.len(), avg / 1000.0, p95 as f64 / 1000.0, p99 as f64 / 1000.0);
+    } else {
+        println!("  During Crash: No successful transactions completed during recorded crash intervals.");
+    }
 
-    // --- CHALLENGE: Abort Rate Analysis ---
+    // --- Abort Rate Analysis ---
     let total_tracked_tx = transaction_outcomes.len();
     let committed_tx = transaction_outcomes.values().filter(|&&committed| committed).count();
     let aborted_tx = total_tracked_tx - committed_tx;
-    println!("[Results] Transaction Outcomes ({} tracked): Committed: {}, Aborted: {}",
+    println!("\n[Results] Transaction Outcomes ({} tracked): Committed: {}, Aborted: {}",
              total_tracked_tx, committed_tx, aborted_tx);
     // Assert abort rate should be very low if Raft handles failures correctly.
-    // assert!(aborted_tx <= (total_tracked_tx as f64 * 0.01) as usize, "Abort rate too high!");
-
+    // Allow a small tolerance, e.g., 1% failure rate just in case
+    assert!(aborted_tx <= (total_tracked_tx as f64 * 0.01).ceil() as usize, 
+            "Abort rate too high! Aborted: {}, Total: {}", aborted_tx, total_tracked_tx);
 
     let scenario_duration = start_scenario.elapsed();
     println!("--- Scenario E Finished in {:?} ---", scenario_duration);

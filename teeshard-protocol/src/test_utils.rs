@@ -82,6 +82,18 @@ pub fn generate_test_transaction(
     }
 }
 
+// --- Helper for stats calculation (moved from scenario_e) ---
+fn calculate_stats_micros(latencies: &[u128]) -> (f64, u128, u128) {
+    if latencies.is_empty() { return (0.0, 0, 0); }
+    let count = latencies.len();
+    let avg = latencies.iter().sum::<u128>() as f64 / count as f64;
+    let p95_idx = ((count as f64 * 0.95).floor() as usize).min(count.saturating_sub(1));
+    let p99_idx = ((count as f64 * 0.99).floor() as usize).min(count.saturating_sub(1));
+    let p95 = *latencies.get(p95_idx).unwrap_or(latencies.last().unwrap_or(&0));
+    let p99 = *latencies.get(p99_idx).unwrap_or(latencies.last().unwrap_or(&0));
+    (avg, p95, p99)
+}
+
 // --- Enhanced Performance Analysis Function ---
 pub fn analyze_perf_results(
     scenario_name: &str,
@@ -90,69 +102,133 @@ pub fn analyze_perf_results(
     submitted_count: usize,
     submission_duration: Duration,
 ) {
-    let mut latencies_cc = Vec::new();
-    let mut latencies_sc = Vec::new();
+    let mut latencies_completion_cc = Vec::new();
+    let mut latencies_completion_sc = Vec::new();
+    let mut latencies_tee_finality = Vec::new();
+    let mut latencies_onchain_finality = Vec::new();
+    let mut tee_function_times: HashMap<String, Vec<u128>> = HashMap::new(); // Store durations as micros
+
     let mut completed_count = 0;
     let mut successful_count_cc = 0;
     let mut successful_count_sc = 0;
+    let mut raft_election_count = 0;
 
-    // Separate latencies based on is_cross_chain flag
+    let mut tx_start_times_ms: HashMap<String, u64> = HashMap::new();
+
+    // First pass: Find the earliest proposal time for each transaction
     for event in metrics {
-        if let MetricEvent::TransactionCompleted { start_time_ms: _, end_time_ms: _, success, is_cross_chain, duration, .. } = event {
-            completed_count += 1;
-            if *success {
-                let latency_micros = duration.as_micros(); // Use pre-calculated duration
-                if *is_cross_chain {
-                    successful_count_cc += 1;
-                    latencies_cc.push(latency_micros);
-                } else {
-                    successful_count_sc += 1;
-                    latencies_sc.push(latency_micros);
-                }
-            }
+        if let MetricEvent::NodeCommandProposed { tx_id, timestamp_ms, .. } = event {
+            tx_start_times_ms.entry(tx_id.clone()).or_insert(*timestamp_ms);
         }
-        // Extract other relevant metrics based on scenario (e.g., Raft, TEE) if needed later
     }
 
-    latencies_cc.sort_unstable();
-    latencies_sc.sort_unstable();
+    // Second pass: Calculate latencies and count events
+    for event in metrics {
+        match event {
+            MetricEvent::TransactionCompleted { duration, success, is_cross_chain, .. } => {
+                completed_count += 1;
+                if *success {
+                    let latency_micros = duration.as_micros();
+                    if *is_cross_chain {
+                        successful_count_cc += 1;
+                        latencies_completion_cc.push(latency_micros);
+                    } else {
+                        successful_count_sc += 1;
+                        latencies_completion_sc.push(latency_micros);
+                    }
+                }
+            }
+            MetricEvent::RaftLeaderElected { .. } => {
+                raft_election_count += 1;
+            }
+            MetricEvent::CoordinatorThresholdReached { tx_id, timestamp_ms, .. } => {
+                if let Some(start_ms) = tx_start_times_ms.get(tx_id) {
+                    if *timestamp_ms >= *start_ms {
+                        let latency_ms = timestamp_ms - start_ms;
+                        latencies_tee_finality.push(latency_ms as u128 * 1000);
+                    }
+                }
+            }
+            MetricEvent::RelayerReleaseSubmitted { tx_id, timestamp_ms, .. } => {
+                if let Some(start_ms) = tx_start_times_ms.get(tx_id) {
+                    if *timestamp_ms >= *start_ms {
+                        let latency_ms = timestamp_ms - start_ms;
+                        latencies_onchain_finality.push(latency_ms as u128 * 1000);
+                    }
+                }
+            }
+            MetricEvent::TeeFunctionMeasured { function_name, duration, .. } => {
+                tee_function_times.entry(function_name.clone()).or_default().push(duration.as_micros());
+            }
+            _ => {} // Ignore other events like RaftCommit, NodeIsolated etc. for this summary
+        }
+    }
 
-    let calculate_stats = |latencies: &[u128]| -> (f64, u128, u128) {
-        if latencies.is_empty() { return (0.0, 0, 0); }
-        let avg = latencies.iter().sum::<u128>() as f64 / latencies.len() as f64;
-        // Ensure index calculation doesn't panic on empty or single-element slices
-        let p95_idx = ((latencies.len() as f64 * 0.95).floor() as usize).min(latencies.len().saturating_sub(1));
-        let p99_idx = ((latencies.len() as f64 * 0.99).floor() as usize).min(latencies.len().saturating_sub(1));
-        let p95 = latencies.get(p95_idx).copied().unwrap_or(avg as u128);
-        let p99 = latencies.get(p99_idx).copied().unwrap_or(avg as u128);
-        (avg, p95, p99)
-    };
+    latencies_completion_cc.sort_unstable();
+    latencies_completion_sc.sort_unstable();
+    latencies_tee_finality.sort_unstable();
+    latencies_onchain_finality.sort_unstable();
+    // Sort TEE function times
+    for times in tee_function_times.values_mut() {
+        times.sort_unstable();
+    }
 
+    // Use the calculate_stats_micros helper now
+    let (avg_comp_cc, p95_comp_cc, p99_comp_cc) = calculate_stats_micros(&latencies_completion_cc);
+    let (avg_comp_sc, p95_comp_sc, p99_comp_sc) = calculate_stats_micros(&latencies_completion_sc);
+    let (avg_tee_fin, p95_tee_fin, p99_tee_fin) = calculate_stats_micros(&latencies_tee_finality);
+    let (avg_onchain_fin, p95_onchain_fin, p99_onchain_fin) = calculate_stats_micros(&latencies_onchain_finality);
 
-    let (avg_lat_cc, p95_lat_cc, p99_lat_cc) = calculate_stats(&latencies_cc);
-    let (avg_lat_sc, p95_lat_sc, p99_lat_sc) = calculate_stats(&latencies_sc);
-
-    let throughput_tps = if submission_duration > Duration::ZERO { // Use tps acronym
+    let throughput_tps = if submission_duration > Duration::ZERO {
         completed_count as f64 / submission_duration.as_secs_f64()
     } else { 0.0 };
 
-    println!("
---- {} Analysis (Params: {:?}) ---", scenario_name, scenario_params);
-    println!("Submitted Transactions: {}", submitted_count);
-    println!("Completed Transactions: {}", completed_count);
-    println!("  Successful Cross-Chain: {} ({} samples)", successful_count_cc, latencies_cc.len());
-    println!("  Successful Single-Chain: {} ({} samples)", successful_count_sc, latencies_sc.len());
+    println!("\n--- {} Analysis (Params: {:?}) ---", scenario_name, scenario_params);
+    println!("Target Submitted Transactions: {}", submitted_count);
+    println!("Completed Transactions (end-to-end): {}", completed_count);
+    println!("  Successful Cross-Chain: {} ({} samples)", successful_count_cc, latencies_completion_cc.len());
+    println!("  Successful Single-Chain: {} ({} samples)", successful_count_sc, latencies_completion_sc.len());
     println!("Submission Duration: {:.2?}", submission_duration);
-    println!("Calculated Throughput (Completed/SubmissionTime): {:.2} [TPS]", throughput_tps); // Changed format slightly
+    println!("Calculated Throughput (Completed/SubmissionTime): {:.2} [TPS]", throughput_tps);
+    println!("Raft Elections Triggered: {}", raft_election_count);
 
-    if !latencies_cc.is_empty() {
-        println!("Latency CC (ms): Avg={:.3}, P95={:.3}, P99={:.3}", avg_lat_cc / 1000.0, p95_lat_cc as f64 / 1000.0, p99_lat_cc as f64 / 1000.0);
-    } else { println!("Latency CC (ms): No successful cross-chain transactions."); }
-    if !latencies_sc.is_empty() {
-        println!("Latency SC (ms): Avg={:.3}, P95={:.3}, P99={:.3}", avg_lat_sc / 1000.0, p95_lat_sc as f64 / 1000.0, p99_lat_sc as f64 / 1000.0);
-    } else { println!("Latency SC (ms): No successful single-chain transactions."); }
-    println!("-------------------------------------
-");
+    if !latencies_completion_cc.is_empty() {
+        println!("E2E Completion Latency CC (ms): Avg={:.3}, P95={:.3}, P99={:.3}", avg_comp_cc / 1000.0, p95_comp_cc as f64 / 1000.0, p99_comp_cc as f64 / 1000.0);
+    } else { println!("E2E Completion Latency CC (ms): No successful cross-chain transactions."); }
+    if !latencies_completion_sc.is_empty() {
+        println!("E2E Completion Latency SC (ms): Avg={:.3}, P95={:.3}, P99={:.3}", avg_comp_sc / 1000.0, p95_comp_sc as f64 / 1000.0, p99_comp_sc as f64 / 1000.0);
+    } else { println!("E2E Completion Latency SC (ms): No successful single-chain transactions."); }
+
+    if !latencies_tee_finality.is_empty() {
+        println!("TEE Finality Latency (ms, Proposal->Threshold): Avg={:.3}, P95={:.3}, P99={:.3} ({} samples)", avg_tee_fin / 1000.0, p95_tee_fin as f64 / 1000.0, p99_tee_fin as f64 / 1000.0, latencies_tee_finality.len());
+    } else { println!("TEE Finality Latency (ms): No TEE finality events recorded or matched."); }
+    if !latencies_onchain_finality.is_empty() {
+        println!("On-Chain Finality Latency (ms, Proposal->Release): Avg={:.3}, P95={:.3}, P99={:.3} ({} samples)", avg_onchain_fin / 1000.0, p95_onchain_fin as f64 / 1000.0, p99_onchain_fin as f64 / 1000.0, latencies_onchain_finality.len());
+    } else { println!("On-Chain Finality Latency (ms): No on-chain finality events recorded or matched."); }
+
+    // --- Print TEE Overhead Stats --- 
+    println!("\nTEE Function Overheads (ms):");
+    let mut sorted_tee_func_names: Vec<_> = tee_function_times.keys().cloned().collect();
+    sorted_tee_func_names.sort();
+    if sorted_tee_func_names.is_empty() {
+        println!("  No TEE function measurements recorded.");
+    } else {
+        for func_name in sorted_tee_func_names {
+            if let Some(times) = tee_function_times.get(&func_name) {
+                 if !times.is_empty() {
+                    let (avg, p95, p99) = calculate_stats_micros(times);
+                    println!("  - {}: Avg={:.3}, P95={:.3}, P99={:.3} ({} samples)",
+                             func_name, avg / 1000.0, p95 as f64 / 1000.0, p99 as f64 / 1000.0, times.len());
+                 } else {
+                     println!("  - {}: No samples recorded.", func_name);
+                 }
+            }
+        }
+    }
+    // --- End TEE Overhead --- 
+
+    println!("-------------------------------------\n");
 }
 
+// Add more shared test utilities here if needed... 
 // Add more shared test utilities here if needed... 

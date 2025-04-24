@@ -9,7 +9,7 @@ use crate::raft::state::RaftRole;
 use serde::{Serialize, Deserialize};
 
 // Helper function to get current epoch milliseconds
-fn current_epoch_millis() -> u64 {
+pub fn current_epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

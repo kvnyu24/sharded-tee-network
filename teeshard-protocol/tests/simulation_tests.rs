@@ -382,7 +382,7 @@ async fn test_raft_state_machine_command_processing() {
     for (id, handle) in node_handles {
         if let Err(e) = handle.await {
              eprintln!("[Test] Error awaiting node {} handle: {}", id, e);
-        }
+    }
     }
     println!("[Test] All node tasks finished.");
     println!("--- Finished State Machine Command Processing Test ---");

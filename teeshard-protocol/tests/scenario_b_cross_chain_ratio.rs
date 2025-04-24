@@ -123,6 +123,7 @@ async fn run_scenario_b_trial(
     for i in 0..num_coordinators {
         let coord_identity = coordinator_identities[i].clone();
         let coord_signing_key = signing_keys.get(&coord_identity.id).unwrap().clone();
+        let coordinator_id_for_task = coord_identity.id; // Capture ID before move
 
         let (coord_network_tx, _coord_network_rx) = mpsc::channel(100);
         runtime.register_component(coord_identity.clone(), coord_network_tx).await;
@@ -134,14 +135,19 @@ async fn run_scenario_b_trial(
             coordinator_metrics_tx.clone(),
             shard_assignments.clone(), // Pass the local assignments map (Arg 8)
         );
+        // Keep Arc if other tasks need it, but don't use it for listener call
         let coordinator_arc = Arc::new(coordinator);
         if i == 0 {
              if let Some(rx_to_move) = opt_result_rx.take() {
                  let listener_handle = {
-                     let coordinator_clone = coordinator_arc.clone();
                      let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver here
-                     tokio::spawn(async move {
-                         coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await; // Pass it
+                     tokio::spawn(async move { // Only move required items
+                         // Call the associated function directly using :: syntax
+                         SimulatedCoordinator::run_share_listener(
+                            coordinator_id_for_task, // Pass captured ID
+                            rx_to_move,
+                            shutdown_rx_clone
+                         ).await;
                      })
                  };
                  coordinator_handles.push(listener_handle);
@@ -205,18 +211,22 @@ async fn run_scenario_b_trial(
 
      // --- Await Handles Gracefully ---
      println!("[Scenario B] Awaiting coordinator tasks...");
-     for handle in coordinator_handles {
+     for (i, handle) in coordinator_handles.into_iter().enumerate() {
+         println!("[Scenario B] Awaiting coordinator handle {}...", i);
          if let Err(e) = handle.await {
              eprintln!("[Scenario B] Error awaiting coordinator handle: {}", e);
          }
+         println!("[Scenario B] Coordinator handle {} finished.", i);
      }
      println!("[Scenario B] Coordinator tasks finished.");
 
      println!("[Scenario B] Awaiting node tasks...");
-     for handle in node_handles {
+     for (i, handle) in node_handles.into_iter().enumerate() {
+         println!("[Scenario B] Awaiting node handle {}...", i);
           if let Err(e) = handle.await {
               eprintln!("[Scenario B] Error awaiting node handle: {}", e);
           }
+          println!("[Scenario B] Node handle {} finished.", i);
      }
       println!("[Scenario B] Node tasks finished.");
      // --- End Await ---
@@ -238,6 +248,7 @@ async fn run_scenario_b_trial(
             Vec::new() 
         }
     };
+    println!("[Scenario B] Metrics handle finished.");
     println!("[Scenario B] Trial finished.");
     (collected_metrics, submission_duration)
 }

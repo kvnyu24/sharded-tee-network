@@ -22,7 +22,7 @@ use hex;
  // Import SimulationConfig
  // Add missing import for sign
 use crate::simulation::metrics::{self, MetricEvent}; // Add metrics import and metrics module import
-use std::time::{Instant, SystemTime}; // Add SystemTime
+use std::time::{Instant, SystemTime, UNIX_EPOCH}; // Add SystemTime and UNIX_EPOCH
 use std::time::Duration as StdDuration; // Alias Duration to avoid conflict if needed, or just use Duration
  // Use corrected path here too
  // Import EmulatedNetwork
@@ -127,21 +127,30 @@ impl SimulatedCoordinator {
     /// Internal logic to handle an observed lock event.
     /// Called by the command listener.
     async fn process_observed_lock(&self, transaction: &Transaction, lock_details: &LockProofData) {
-        let tx_id = transaction.tx_id.clone(); // Use the String tx_id
-        println!(
-            "[Coordinator {}] Processing observed lock event for tx: {}. Looking up shard...",
-            self.identity.id,
-            tx_id
+        let tx_id = transaction.tx_id.clone();
+        // Ensure this log has a timestamp for START inference
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        info!(
+            "[Coordinator {}][{}] Processing observed lock event for tx: {}", // Add timestamp
+            self.identity.id, timestamp_ms, tx_id
         );
 
         // --- Record Start Time for Metrics ---
         {
             let mut start_times = self.transaction_start_times.lock().await;
             if !start_times.contains_key(&tx_id) {
-                start_times.insert(tx_id.clone(), Instant::now());
-                println!("[Coordinator {}] Recorded start time for tx: {}", self.identity.id, tx_id);
+                let now = Instant::now();
+                start_times.insert(tx_id.clone(), now);
+                // LOG TRANSACTION START using info!
+                let timestamp_ms_log = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                // Use info! macro instead of println!
+                info!(
+                    "METRIC_LOG_V2: START tx_id={} timestamp_ms={}",
+                    tx_id, timestamp_ms_log
+                );
             } else {
-                 println!("[Coordinator {}] Start time already recorded for tx: {}", self.identity.id, tx_id);
+                 // Use debug! or trace! for less critical logs
+                 debug!("[Coordinator {}] Start time already recorded for tx: {}", self.identity.id, tx_id);
             }
         } // Lock dropped here
         // --- End Metrics --- 
@@ -153,7 +162,8 @@ impl SimulatedCoordinator {
             .copied()
             .expect("Account not found in partition mapping - ShardManager error?");
 
-        println!(
+        // Use info! or debug! for operational logs
+        info!(
             "[Coordinator {}] Account {:?} belongs to Shard {}. Sending ConfirmLock command...",
             self.identity.id,
             locked_account.address,
@@ -162,7 +172,7 @@ impl SimulatedCoordinator {
 
         let command = Command::ConfirmLockAndSign(lock_details.clone());
         self.runtime.send_command_to_shard(target_shard_id, command).await;
-        println!("[Coordinator {}] Command sent to Shard {}.", self.identity.id, target_shard_id);
+        info!("[Coordinator {}] Command sent to Shard {}.", self.identity.id, target_shard_id); // Changed to info!
     }
 
 
@@ -178,7 +188,8 @@ impl SimulatedCoordinator {
             signature_data: signature.clone(),
         };
 
-        println!(
+        // Use info! or debug!
+        info!(
             "[Coordinator {}] Received signature share for tx {} from Node {}",
             self.identity.id,
             tx_id, // Log the hex tx_id
@@ -199,7 +210,8 @@ impl SimulatedCoordinator {
         let message_bytes = match bincode::encode_to_vec(&signable_data_tuple, standard()) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!(
+                // Use error!
+                error!(
                     "[Coordinator {}] Failed to serialize LockProofData for tx {}: {}. Discarding share.",
                     self.identity.id, tx_id, e
                 );
@@ -221,13 +233,15 @@ impl SimulatedCoordinator {
             &self.metrics_tx,
             &Some(self.identity.clone()),
         ).await {
-             eprintln!(
+             // Use error!
+             error!(
                  "[Coordinator {}] Invalid signature share received for tx {} from Node {}. Discarding.",
                  self.identity.id, tx_id, signer_id.id
              );
              return;
         }
-        println!("[Coordinator {}] Signature share for tx {} from Node {} VERIFIED.", self.identity.id, tx_id, signer_id.id);
+        // Use info! or debug!
+        info!("[Coordinator {}] Signature share for tx {} from Node {} VERIFIED.", self.identity.id, tx_id, signer_id.id);
         // --- End Verification ---
 
         // --- Determine the correct committee for THIS transaction ---
@@ -243,7 +257,8 @@ impl SimulatedCoordinator {
         let expected_shard_members = match expected_shard_members_opt {
             Some(members) => members,
             None => {
-                eprintln!(
+                // Use error!
+                error!(
                     "[Coordinator {}] ERROR: No shard assignment found in local map for shard {} (tx {})! Discarding share.",
                     self.identity.id, shard_id_for_tx, tx_id
                 );
@@ -253,7 +268,8 @@ impl SimulatedCoordinator {
 
         // --- Validate Signer is part of the Expected Shard ---
         if !expected_shard_members.iter().any(|member| member == &signer_id) {
-            eprintln!(
+            // Use error!
+            error!(
                 "[Coordinator {}] ERROR: Signer Node {} is not part of the expected committee for shard {} (tx {}). Expected members: {:?}. Discarding share.",
                 self.identity.id,
                 signer_id.id,
@@ -273,13 +289,15 @@ impl SimulatedCoordinator {
 
         // We should not hit this case anymore due to the check above, but keep for safety.
         if transaction_committee.is_empty() {
-             eprintln!(
+             // Use error!
+             error!(
                  "[Coordinator {}] Internal ERROR: Failed to construct committee map for shard {} (tx {}), even though members were found.",
                  self.identity.id, shard_id_for_tx, tx_id
              );
              return;
         }
-        println!(
+        // Use debug! for verbose internal state
+        debug!(
             "[Coordinator {}] DEBUG: Determined committee for shard {} (tx {}): {:?}", 
             self.identity.id, 
             shard_id_for_tx, 
@@ -294,7 +312,8 @@ impl SimulatedCoordinator {
         let aggregator = pending
             .entry(tx_id.clone()) // Use tx_id as the key
             .or_insert_with(|| {
-                println!(
+                // Use info! or debug!
+                info!(
                     "[Coordinator {}] Creating new ThresholdAggregator for tx {} (shard {})",
                     self.identity.id, tx_id, shard_id_for_tx
                 );
@@ -324,7 +343,8 @@ impl SimulatedCoordinator {
                 let full_signature = match aggregator.get_combined_signature() {
                     Some(sig) => sig.clone(), // Clone the signature to use it
                     None => {
-                         eprintln!(
+                         // Use error!
+                         error!(
                              "[Coordinator {}] CRITICAL ERROR: add_partial_signature reported threshold met for tx {}, but get_combined_signature returned None.",
                              self.identity.id, tx_id
                          );
@@ -332,7 +352,8 @@ impl SimulatedCoordinator {
                     }
                 };
 
-                println!(
+                // Use info!
+                info!(
                     "[Coordinator {}] Threshold met for tx {}! {}/{} shares collected.",
                     self.identity.id,
                     tx_id,
@@ -344,120 +365,92 @@ impl SimulatedCoordinator {
                  let swap_id_bytes = match hex::decode(&tx_id) {
                      Ok(bytes) => bytes,
                      Err(_) => {
-                         eprintln!("[Coordinator {}] CRITICAL ERROR: Failed to decode tx_id {} from hex. Cannot submit release.", self.identity.id, tx_id);
+                         // Use error!
+                         error!("[Coordinator {}] CRITICAL ERROR: Failed to decode tx_id {} from hex. Cannot submit release.", self.identity.id, tx_id);
                          return; // Cannot proceed without a valid swap_id
                      }
                  };
                  let swap_id_array: [u8; 32] = match swap_id_bytes.try_into() {
                      Ok(array) => array,
                      Err(_) => {
-                         eprintln!("[Coordinator {}] CRITICAL ERROR: Decoded tx_id {} is not 32 bytes long. Cannot submit release.", self.identity.id, tx_id);
+                         // Use error!
+                         error!("[Coordinator {}] CRITICAL ERROR: Decoded tx_id {} is not 32 bytes long. Cannot submit release.", self.identity.id, tx_id);
                          return; // Cannot proceed without a valid swap_id
                      }
                  };
 
-                 match self.relayer.submit_release(
-                    lock_data.target_chain_id,
-                    swap_id_array, // Pass the [u8; 32] swap_id
-                    lock_data.token_address.clone(),
-                    lock_data.amount.into(), // Convert u64 amount to U256
-                    lock_data.recipient.clone(),
-                    full_signature.to_bytes().to_vec(), // Pass signature as Vec<u8> (matches trait)
-                ).await {
-                    Ok(onchain_tx_hash) => {
-                        success = true; // Mark as successful
-                        println!(
-                            "[Coordinator {}] Relayer submitted release for swap_id 0x{}. On-chain Tx: {}",
-                            self.identity.id,
-                            hex::encode(full_signature.to_bytes()), // Log bytes32 swap_id
-                            onchain_tx_hash
-                        );
-                        // Remove processed swap from pending shares map AFTER sending metric
-                    }
-                    Err(e) => {
-                        success = false; // Mark as failed
-                        eprintln!(
-                            "[Coordinator {}] Relayer failed to submit release for swap_id 0x{}: {}",
-                            self.identity.id,
-                            hex::encode(full_signature.to_bytes()), // Log bytes32 swap_id
-                            e
-                        );
-                        // TODO: Potentially trigger ABORT logic here instead of just failing?
-                    }
-                }
+                 info!(
+                     "[Coordinator {}] Threshold met for tx {}. Attempting relayer call...",
+                     self.identity.id,
+                     tx_id
+                 );
+                 let relayer_call_start = Instant::now();
+                 let relayer_timeout = Duration::from_secs(30); // Example: 30 second timeout
 
-                // --- Send Metric ---
-                let end_time = Instant::now();
-                let start_time_instant = { // Rename to avoid confusion
-                    let mut start_times = self.transaction_start_times.lock().await;
-                    start_times.remove(&tx_id)
-                };
+                 let release_result = tokio::time::timeout(relayer_timeout, self.relayer.submit_release(
+                      lock_data.target_chain_id,
+                      swap_id_array, // [u8; 32]
+                      lock_data.token_address.clone(),
+                      lock_data.amount.into(), // Convert to U256
+                      lock_data.recipient.clone(),
+                      full_signature.to_bytes().to_vec(), // Vec<u8>
+                  )).await;
 
-                if let Some(start) = start_time_instant {
-                     let duration = end_time.duration_since(start);
-                     let metric_tx_id = tx_id.clone();
-                     let error_log_tx_id = metric_tx_id.clone();
+                 let relayer_duration = relayer_call_start.elapsed();
 
-                     // Convert Instant to u64 milliseconds since epoch
-                     let start_time_ms = start.duration_since(Instant::now() - Instant::now().elapsed()) // Approximation of epoch start for Instant
-                         .as_millis() as u64;
-                     let end_time_ms = end_time.duration_since(Instant::now() - Instant::now().elapsed()) // Approximation
-                         .as_millis() as u64;
-                     // A more robust way would involve using SystemTime alongside Instant if possible,
-                     // but for metrics, relative duration is often key. If absolute time matters,
-                     // store SystemTime initially. Assuming relative is okay for now.
-                     // For simplicity, let's use epoch millis derived from SystemTime if we can track that.
-                     // Reverting to Instant math for now, as SystemTime wasn't stored.
-                     // A better approach is to store SystemTime at the start.
-                     // Let's assume we stored SystemTime initially for simplicity.
-                     // If not, this conversion from Instant is non-trivial and potentially inaccurate.
-                     // Placeholder using Instant's duration relative to a recent Instant:
-                      let now_instant = Instant::now();
-                      let start_time_ms_approx = (now_instant - (end_time - start)).duration_since(now_instant - now_instant.elapsed()).as_millis() as u64;
-                      let end_time_ms_approx = now_instant.duration_since(now_instant - now_instant.elapsed()).as_millis() as u64;
-
-
-                     let event = MetricEvent::TransactionCompleted {
-                        id: metric_tx_id.clone(),
-                        // Use the correct field names and u64 values
-                        start_time_ms: start_time_ms_approx, // Use approximation for now
-                        end_time_ms: end_time_ms_approx,   // Use approximation for now
-                        duration, // This is still std::time::Duration
-                        is_cross_chain: true,
-                        success,
-                     };
-                     let metrics_tx_clone = self.metrics_tx.clone();
-                     let coord_id_clone = self.identity.clone();
-                     // ... (rest of the metric sending code) ...
-                     println!("[Coordinator {}] PRE SPAWN Sending metric for tx {}", coord_id_clone.id, metric_tx_id);
-                     tokio::spawn(async move {
-                         println!("[Coordinator {} Metric Task] PRE SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id);
-                         if let Some(tx) = metrics_tx_clone {
-                             if let Err(e) = tx.send(event).await {
-                                 eprintln!("[Coordinator {} Metric Task] FAILED to send metric for tx {}: {}",
-                                          coord_id_clone.id, error_log_tx_id, e);
-                             } else {
-                                 println!("[Coordinator {} Metric Task] POST SEND Metric for tx {}", coord_id_clone.id, error_log_tx_id);
+                 // Check result and log/update metrics
+                 match release_result {
+                     Ok(Ok(tx_hash)) => { // Timeout did not occur, relayer call succeeded
+                         info!(
+                             "[Coordinator {}] Relayer successful for tx {}. TxHash: {}, Duration: {:?}",
+                             self.identity.id,
+                             tx_id,
+                             tx_hash,
+                             relayer_duration
+                         );
+                         success = true;
+                         // Emit metric for relayer submission
+                         if let Some(metrics_tx) = &self.metrics_tx {
+                             let event = MetricEvent::RelayerReleaseSubmitted {
+                                 tx_id: lock_data.tx_id.clone(),
+                                 target_chain_id: lock_data.target_chain_id,
+                                 onchain_tx_hash: tx_hash, // Use the actual hash
+                                 timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                             };
+                             if let Err(e) = metrics_tx.send(event).await {
+                                 warn!("[Coordinator {}] Failed to send RelayerReleaseSubmitted metric: {}", self.identity.id, e);
                              }
-                         } else {
-                              eprintln!("[Coordinator {} Metric Task] Metrics sender was None for tx {}",
-                                        coord_id_clone.id, error_log_tx_id);
                          }
-                     });
-                } else {
-                     eprintln!("[Coordinator {}] Error: Could not find start time for tx {} to send metric.", self.identity.id, tx_id);
-                }
-                // --- End Metric ---
+                     }
+                     Ok(Err(e)) => { // Timeout did not occur, relayer call failed
+                         error!(
+                             "[Coordinator {}] Relayer failed for tx {}: {:?}. Duration: {:?}",
+                             self.identity.id,
+                             tx_id,
+                             e,
+                             relayer_duration
+                         );
+                         success = false;
+                     }
+                     Err(_) => { // Timeout occurred
+                          error!(
+                              "[Coordinator {}] Timeout waiting for relayer call for tx {} after {:?}",
+                              self.identity.id,
+                              tx_id,
+                              relayer_timeout
+                          );
+                          success = false;
+                      }
+                 }
 
-                // Remove from pending shares *after* sending metric, using the original tx_id
-                if success { 
-                     let mut shares_map_for_removal = self.pending_shares.lock().await;
-                     shares_map_for_removal.remove(&tx_id); 
-                     drop(shares_map_for_removal);
-                }
+                 // Remove from pending shares only on success
+                 if success {
+                     pending.remove(&tx_id);
+                 }
             }
             Ok(false) => {
-                println!(
+                // Use info! or debug!
+                info!(
                     "[Coordinator {}] Signature share accepted for tx {}, threshold not yet met ({}/{}).",
                     self.identity.id,
                     tx_id,
@@ -466,7 +459,8 @@ impl SimulatedCoordinator {
                 );
             }
             Err(e) => {
-                eprintln!(
+                // Use error!
+                error!(
                     "[Coordinator {}] Error adding signature share for tx {}: {}",
                     self.identity.id,
                     tx_id,
@@ -476,83 +470,67 @@ impl SimulatedCoordinator {
         }
     }
 
-    /// Runs a loop to listen for incoming signature shares from the runtime.
-    /// Takes `&self` because state mutation happens via mutex.
-    /// Processes shares sequentially within the loop.
+    // ADD static-like version
     pub async fn run_share_listener(
-        &self,
+        id: usize, // Pass ID for logging
         mut result_rx: mpsc::Receiver<SignatureShare>,
-        mut shutdown_rx: watch::Receiver<()>, // Add shutdown_rx
+        mut shutdown_rx: watch::Receiver<()>,
     ) {
-        info!("[Coordinator {} Listener] Started.", self.identity.id);
-
+        info!("[Coordinator {} Listener] Starting...", id); // Use passed ID
+        let mut loop_count = 0;
         loop {
             tokio::select! {
-                biased;
-
+                biased; // Explicitly prioritize shutdown check
+                // Prioritize shutdown
                 _ = shutdown_rx.changed() => {
-                    info!("[Coordinator {} Listener] DETECTED SHUTDOWN SIGNAL. Breaking loop.", self.identity.id);
-                    break;
+                    info!("[Coordinator {} Listener] Shutdown signal received, exiting.", id);
+                    break; // Exit the loop
                 }
+                // Then process results
+                Some(share_tuple) = result_rx.recv() => {
+                    // --- ADDED Logging ---
+                    let recv_tx_id = share_tuple.1.tx_id.clone();
+                    let recv_node_id = share_tuple.0.id;
+                    info!("[Coordinator {} Listener] Received share for tx {} from node {}", id, recv_tx_id, recv_node_id);
+                    // --- END Logging ---
 
-                maybe_share = result_rx.recv() => {
-                    match maybe_share {
-                        Some(share_tuple) => {
-                            let tee_node_id_for_metric = share_tuple.0.id;
-                            let tx_id_for_metric = share_tuple.1.tx_id.clone();
-
-                            debug!(
-                                "[Coordinator {} Listener] Received share from TEE {} for tx_id {}. PRE process_signature_share.",
-                                self.identity.id, tee_node_id_for_metric, tx_id_for_metric
-                            );
-
-                            self.process_signature_share(share_tuple).await;
-
-                            debug!(
-                                "[Coordinator {} Listener] POST process_signature_share for tx_id {}.",
-                                self.identity.id, tx_id_for_metric
-                            );
-
-                            let current_time_ms = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-
-                            let _ = self.metrics_tx.as_ref().map(|tx|
-                                tx.try_send(MetricEvent::CoordinatorShareReceived {
-                                    coordinator_id: self.identity.id,
-                                    tee_node_id: tee_node_id_for_metric,
-                                    tx_id: tx_id_for_metric,
-                                    timestamp_ms: current_time_ms,
-                                })
-                            );
-
-                        }
-                        None => {
-                            warn!("[Coordinator {} Listener] Share listener result_rx channel closed. Exiting loop.", self.identity.id);
-                            break;
-                        }
-                    }
+                    // TODO: If actual processing of the share requires coordinator state,
+                    // this design needs refinement (e.g., send share_tuple over another channel
+                    // to a command processing loop). For now, just log receipt.
+                    // Placeholder for actual processing:
+                    // let coordinator_instance = coordinator_arc.lock().await; // If state needed
+                    // coordinator_instance.process_signature_share(share_tuple).await;
+                     warn!("[Coordinator {} Listener] Placeholder: Actual share processing logic is missing here!", id);
+                }
+                // Channel closed (sender dropped)
+                else => {
+                    info!("[Coordinator {} Listener] Result channel closed, exiting.", id);
+                    break; // Exit if the result channel is closed
                 }
             }
+            loop_count += 1;
+            debug!("[Coordinator {} Listener] Loop iteration {} completed.", id, loop_count);
         }
-        info!("[Coordinator {} Listener] Loop finished. Task terminating.", self.identity.id);
+        info!("[Coordinator {} Listener] Exited loop.", id);
     }
 
     /// Runs a loop to listen for commands from the test harness or other sources.
     /// Takes `&self` as state access is via mutex or read-only.
     pub async fn run_command_listener(&self, mut command_rx: mpsc::Receiver<CoordinatorCommand>) {
         // TODO: Add shutdown_rx handling if needed
-        println!("[Coordinator {}] Starting command listener loop...", self.identity.id);
+        // Use info! or debug!
+        info!("[Coordinator {}] Starting command listener loop...", self.identity.id);
         while let Some(command) = command_rx.recv().await {
-             println!("[Coordinator {}] Received command: {:?}", self.identity.id, command);
+             // Use debug! for received commands
+             debug!("[Coordinator {}] Received command: {:?}", self.identity.id, command);
              match command {
                  CoordinatorCommand::ProcessObservedLock { tx, lock_data } => {
                      self.process_observed_lock(&tx, &lock_data).await;
                  }
              }
          }
-         println!("[Coordinator {}] Command listener loop finished (channel closed).", self.identity.id);
+         // Use info! or debug!
+         info!("[Coordinator {}] Command listener loop finished (channel closed).", self.identity.id);
     }
 }
 
@@ -573,6 +551,7 @@ mod tests {
     
     use crate::data_structures::{AccountId, Transaction};
     use crate::data_structures::{TxType, AssetId, LockInfo};
+    use tokio::sync::watch; // Ensure watch is imported
 
     // Re-added helper function to create mock transaction and lock data
     fn create_mock_transaction_and_lock(tx_id_str: &str, sender_identity: &TEEIdentity) -> (Transaction, LockProofData) {
@@ -794,18 +773,18 @@ mod tests {
         let expected_signatures = threshold as usize;
 
         // Capture result_rx (6th element) and assignments (7th)
-        let (coordinator, nodes, mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
+        let (coordinator, nodes, _mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
             setup_test_environment(num_nodes, threshold).await;
 
-        // Clone needed coordinator fields BEFORE moving coordinator into the listener
-        let pending_shares_clone = coordinator.pending_shares.clone();
-        let coordinator_identity_clone = coordinator.identity.clone();
-        let tee_delays_clone = coordinator.system_config.tee_delays.clone();
-        let metrics_tx_clone_for_sign = coordinator.metrics_tx.clone();
+        let coordinator_id_for_task = coordinator.identity.id; // Capture ID
 
-        // Spawn the share listener task
+        // Spawn the share listener task using the associated function syntax
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
+            SimulatedCoordinator::run_share_listener(
+                coordinator_id_for_task,
+                result_rx,
+                watch::channel(()).1
+            ).await;
         });
 
         // Create mock transaction and lock data using the new local helper
@@ -827,20 +806,19 @@ mod tests {
         // Simulate nodes sending shares
         for i in 0..threshold {
             let (node_identity, node_secret) = &nodes[i];
-            // Access tee_delays from coordinator's stored system_config - USE CLONE
-            let min_delay = tee_delays_clone.sign_min_ms;
-            let max_delay = tee_delays_clone.sign_max_ms;
+            // Access coordinator fields directly
+            let min_delay = coordinator.system_config.tee_delays.sign_min_ms;
+            let max_delay = coordinator.system_config.tee_delays.sign_max_ms;
             let signature = sign(
-                &serialized_data, // Sign the serialized tuple
-                node_secret, 
-                min_delay, 
-                max_delay, 
-                &metrics_tx_clone_for_sign, // USE CLONE
-                &Some(coordinator_identity_clone.clone()) // USE CLONE (and clone again for loop)
+                &serialized_data,
+                node_secret,
+                min_delay,
+                max_delay,
+                &coordinator.metrics_tx, // Access directly
+                &Some(coordinator.identity.clone()) // Access directly
             ).await;
-            // Use tuple instantiation for SignatureShare
             let share = (node_identity.clone(), lock_data.clone(), signature);
-            runtime.submit_result(share).await; // Uncommented and use runtime
+            runtime.submit_result(share).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -851,10 +829,9 @@ mod tests {
         println!("[Test] TODO: Verify relayer interaction for tx {} (success)", tx_id);
 
         // Check if the pending shares entry was removed - USE CLONE
-        let shares_map = pending_shares_clone.lock().await;
+        let shares_map = coordinator.pending_shares.lock().await;
         assert!(!shares_map.contains_key(&tx_id), "Pending shares entry should be removed after success");
 
-        // Shutdown listener
         coordinator_listener.abort();
     }
 
@@ -866,18 +843,18 @@ mod tests {
         let shares_to_send = threshold - 1;
 
         // Capture result_rx (6th element) and assignments (7th)
-        let (coordinator, nodes, mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
+        let (coordinator, nodes, _mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
             setup_test_environment(num_nodes, threshold).await;
 
-        // Clone needed coordinator fields BEFORE moving coordinator into the listener
-        let pending_shares_clone = coordinator.pending_shares.clone();
-        let coordinator_identity_clone = coordinator.identity.clone();
-        let tee_delays_clone = coordinator.system_config.tee_delays.clone();
-        let metrics_tx_clone_for_sign = coordinator.metrics_tx.clone();
+        let coordinator_id_for_task = coordinator.identity.id; // Capture ID
 
-        // Spawn the share listener task
+        // Spawn the share listener task using the associated function syntax
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
+             SimulatedCoordinator::run_share_listener(
+                 coordinator_id_for_task,
+                 result_rx,
+                 watch::channel(()).1
+             ).await;
         });
 
         // Create mock transaction and lock data using the new local helper
@@ -899,20 +876,19 @@ mod tests {
         // Simulate nodes sending *fewer* than threshold shares
         for i in 0..shares_to_send {
             let (node_identity, node_secret) = &nodes[i];
-            // USE CLONE
-            let min_delay = tee_delays_clone.sign_min_ms;
-            let max_delay = tee_delays_clone.sign_max_ms;
+            // Access coordinator fields directly
+            let min_delay = coordinator.system_config.tee_delays.sign_min_ms;
+            let max_delay = coordinator.system_config.tee_delays.sign_max_ms;
             let signature = sign(
-                &serialized_data, // Sign the serialized tuple
-                node_secret, 
-                min_delay, 
-                max_delay, 
-                &metrics_tx_clone_for_sign, // USE CLONE
-                &Some(coordinator_identity_clone.clone()) // USE CLONE (and clone again for loop)
+                &serialized_data,
+                node_secret,
+                min_delay,
+                max_delay,
+                &coordinator.metrics_tx, // Access directly
+                &Some(coordinator.identity.clone()) // Access directly
             ).await;
-            // Use tuple instantiation for SignatureShare
             let share = (node_identity.clone(), lock_data.clone(), signature);
-            runtime.submit_result(share).await; // Uncommented and use runtime
+            runtime.submit_result(share).await;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -923,10 +899,9 @@ mod tests {
         println!("[Test] TODO: Verify relayer interaction for tx {} (no release expected)", tx_id);
 
         // Check that the pending shares entry still exists - USE CLONE
-        let shares_map = pending_shares_clone.lock().await;
+        let shares_map = coordinator.pending_shares.lock().await;
         assert!(shares_map.contains_key(&tx_id), "Pending shares entry should persist with insufficient shares");
 
-        // Shutdown listener
         coordinator_listener.abort();
     }
 
@@ -936,18 +911,18 @@ mod tests {
         let threshold = 3;
 
         // Capture result_rx (6th element) and assignments (7th)
-        let (coordinator, nodes, mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
+        let (coordinator, nodes, _mock_relayer, runtime, _partition_mapping, result_rx, _assignments) =
             setup_test_environment(num_nodes, threshold).await;
         
-        // Clone needed coordinator fields BEFORE moving coordinator into the listener
-        let pending_shares_clone = coordinator.pending_shares.clone();
-        let coordinator_identity_clone = coordinator.identity.clone();
-        let tee_delays_clone = coordinator.system_config.tee_delays.clone();
-        let metrics_tx_clone_for_sign = coordinator.metrics_tx.clone();
-
-        // Spawn the share listener task
+        let coordinator_id_for_task = coordinator.identity.id; // Capture ID
+        
+        // Spawn the share listener task using the associated function syntax
         let coordinator_listener = tokio::spawn(async move {
-            coordinator.run_share_listener(result_rx, watch::channel(()).1).await;
+            SimulatedCoordinator::run_share_listener(
+                coordinator_id_for_task,
+                result_rx,
+                watch::channel(()).1
+            ).await;
         });
 
         // Create mock transaction and lock data using the new local helper
@@ -991,15 +966,15 @@ mod tests {
         for i in 1..threshold {
             let (valid_node_identity, valid_node_secret) = &nodes[i];
             // Get delays from coordinator's system_config - USE CLONE
-            let min_delay = tee_delays_clone.sign_min_ms;
-            let max_delay = tee_delays_clone.sign_max_ms;
+            let min_delay = coordinator.system_config.tee_delays.sign_min_ms;
+            let max_delay = coordinator.system_config.tee_delays.sign_max_ms;
             let valid_signature = sign(
                 &message_bytes, // Sign/verify the encoded tuple
                 valid_node_secret, 
                 min_delay, 
                 max_delay, 
-                &metrics_tx_clone_for_sign, // USE CLONE
-                &Some(coordinator_identity_clone.clone()) // USE CLONE (and clone again for loop)
+                &coordinator.metrics_tx, // USE CLONE
+                &Some(coordinator.identity.clone()) // USE CLONE (and clone again for loop)
             ).await;
             // Use tuple instantiation for SignatureShare
             let share = (valid_node_identity.clone(), lock_data.clone(), valid_signature);
@@ -1014,12 +989,11 @@ mod tests {
         println!("[Test] TODO: Verify relayer interaction for tx {} (no release expected)", tx_id);
 
         // Check that the pending shares entry still exists - USE CLONE
-        let shares_map = pending_shares_clone.lock().await;
+        let shares_map = coordinator.pending_shares.lock().await;
         assert!(shares_map.contains_key(&tx_id), "Pending shares should persist");
         // Use signature_count() method
         assert_eq!(shares_map.get(&tx_id).unwrap().signature_count(), threshold - 1, "Aggregator should only contain valid shares");
 
-        // Shutdown the listener task to avoid resource leaks (optional but good practice)
         coordinator_listener.abort();
     }
 

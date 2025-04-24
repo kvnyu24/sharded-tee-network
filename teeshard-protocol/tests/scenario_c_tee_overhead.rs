@@ -28,6 +28,7 @@ use teeshard_protocol::{
     liveness::challenger::Challenger,
     liveness::types::LivenessConfig,
     tee_logic::types::LockProofData,
+    tee_logic::enclave_sim::TeeDelayConfig, // Add this import
 };
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::sync::Arc;
@@ -133,9 +134,20 @@ fn generate_scenario_c_transactions(
     transactions
 }
 
+// Helper function for percentile calculation
+fn calculate_percentile(data: &mut [Duration], percentile: f64) -> Option<Duration> {
+    if data.is_empty() {
+        return None;
+    }
+    data.sort_unstable();
+    // Calculate index (0-based)
+    let index = ((percentile / 100.0 * data.len() as f64).ceil() as usize).saturating_sub(1);
+    // Clamp index to bounds
+    let clamped_index = std::cmp::min(index, data.len() - 1);
+    Some(data[clamped_index])
+}
 
 #[tokio::test]
-#[ignore] // Ignore by default as it requires external analysis and has missing pieces
 async fn test_scenario_c_tee_overhead() -> Result<(), String> {
     println!("--- Starting Scenario C: TEE Overhead Profiling ---");
     let start_scenario = Instant::now();
@@ -152,15 +164,27 @@ async fn test_scenario_c_tee_overhead() -> Result<(), String> {
     let accounts_per_chain = 20;
     // TEE threshold 't' isn't directly configured in Raft/SimulatedNode here, assumed implicitly by logic using shares
 
-    let config = SystemConfig {
+    let mut sim_config = SimulationConfig::default(); // Make mutable
+    sim_config.tee_delays = TeeDelayConfig { 
+        sign_min_ms: 5, 
+        sign_max_ms: 10, 
+        verify_min_ms: 1, 
+        verify_max_ms: 2, 
+        attest_min_ms: 20, 
+        attest_max_ms: 30, 
+    };
+    sim_config.sync_system_config(); // Ensure SystemConfig within runtime gets updated delays
+
+    // --- ALSO update the standalone 'config' used for node creation --- 
+    let mut config = SystemConfig { // Make mutable
         num_shards,
         nodes_per_shard,
-        raft_election_timeout_min_ms: 1500, // Potentially longer base timeout
+        raft_election_timeout_min_ms: 1500, 
         raft_election_timeout_max_ms: 3000,
         raft_heartbeat_ms: 500,
         ..Default::default()
     };
-    let sim_config = SimulationConfig::default(); // No specific network variations needed here
+    config.tee_delays = sim_config.tee_delays.clone(); // <<< Copy delays here
 
     // --- Identities ---
     let identities: Vec<(TEEIdentity, SecretKey)> = (0..num_nodes).map(create_test_tee).collect();
@@ -176,7 +200,7 @@ async fn test_scenario_c_tee_overhead() -> Result<(), String> {
 
     // --- Simulation Runtime ---
     println!("[Setup] Initializing Simulation Runtime...");
-    let (runtime, mut result_rx, mut isolation_rx, metrics_handle) = SimulationRuntime::new(sim_config);
+    let (runtime, mut result_rx, mut isolation_rx, metrics_handle) = SimulationRuntime::new(sim_config.clone());
     let mut node_query_senders = HashMap::new();
     let mut proposal_txs = HashMap::new();
     let mut nodes_to_spawn = Vec::new();
@@ -362,9 +386,20 @@ async fn test_scenario_c_tee_overhead() -> Result<(), String> {
     println!("[Cleanup] Sending shutdown signal...");
     let _ = shutdown_tx.send(());
     for (id, handle) in node_handles {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await; // Wait briefly
-        println!("[Cleanup] Node {} finished.", id);
+        // Allow slightly longer for cleanup in case of hangs
+        if let Err(_) = tokio::time::timeout(Duration::from_secs(10), handle).await {
+             eprintln!("[Cleanup] WARN: Node {} task timed out during shutdown await.", id);
+             // Optionally, abort the handle if timeout occurs: handle.abort();
+        } else {
+            println!("[Cleanup] Node {} finished.", id);
+        }
     }
+
+    // --- Explicitly drop the runtime BEFORE awaiting metrics --- 
+    println!("[Cleanup] Dropping SimulationRuntime instance...");
+    drop(runtime);
+    println!("[Cleanup] SimulationRuntime instance dropped.");
+    // --- End Drop ---
 
     // Collect metrics from the handle by awaiting the JoinHandle
     let collected_metrics = match metrics_handle.await {
@@ -376,27 +411,43 @@ async fn test_scenario_c_tee_overhead() -> Result<(), String> {
     };
     println!("[Metrics] Collected {} metric events.", collected_metrics.len());
 
-    // --- Analyze Metrics (Placeholder) ---
+    // --- Analyze Metrics (Improved) ---
     let mut tee_function_times: HashMap<String, Vec<Duration>> = HashMap::new();
-    for event in collected_metrics {
+    println!("[Debug Metrics] Analyzing {} collected events...", collected_metrics.len()); // Add count log
+    for event in collected_metrics { // Use collected_metrics directly
+        // ---- ADD DEBUG PRINT ----
+        println!("[Debug Metrics] Event: {:?}", event); 
+        // ---- END DEBUG PRINT ----
         if let MetricEvent::TeeFunctionMeasured { node_id: _, function_name, duration } = event {
             tee_function_times.entry(function_name).or_default().push(duration);
         }
         // TODO: Collect other relevant metrics if needed (RaftCommit latency, etc.)
     }
 
-    println!("[Results] TEE Function Call Counts:");
-    for (name, times) in &tee_function_times {
-        println!("  - {}: {} calls", name, times.len());
-        // --- CHALLENGE: Analysis ---
-        // Calculating average/p95/p99 requires more code here or external tools.
-        // Example: Calculate average
-        if !times.is_empty() {
-            let total_duration: Duration = times.iter().sum();
-            let avg_duration = total_duration / times.len() as u32;
-            println!("    - Average Duration: {:?}", avg_duration);
+    println!("\n[Results] TEE Function Call Overheads:");
+    let mut function_names: Vec<String> = tee_function_times.keys().cloned().collect();
+    function_names.sort(); // Print in consistent order
+
+    for name in function_names {
+        if let Some(times) = tee_function_times.get_mut(&name) { // Get mutable slice for sorting
+             println!("  - {}: {} calls", name, times.len());
+            if !times.is_empty() {
+                let total_duration: Duration = times.iter().sum();
+                let avg_duration = total_duration / times.len() as u32;
+                let p95_duration = calculate_percentile(times, 95.0);
+                let p99_duration = calculate_percentile(times, 99.0); // times is already sorted by p95 calc
+                
+                println!("    - Avg: {:?}", avg_duration);
+                if let Some(p95) = p95_duration {
+                    println!("    - p95: {:?}", p95);
+                }
+                if let Some(p99) = p99_duration {
+                    println!("    - p99: {:?}", p99);
+                }
+            } else {
+                 println!("    - (No timing data collected)");
+            }
         }
-        // TODO: Implement percentile calculations if needed within the test.
     }
 
     // --- CHALLENGE: Instrumentation & Baseline ---
@@ -405,6 +456,6 @@ async fn test_scenario_c_tee_overhead() -> Result<(), String> {
     // TODO: Implement the non-TEE baseline scenario for comparison.
 
     let scenario_duration = start_scenario.elapsed();
-    println!("--- Scenario C Finished in {:?} ---", scenario_duration);
+    println!("\n--- Scenario C Finished in {:?} ---", scenario_duration);
     Ok(())
 }

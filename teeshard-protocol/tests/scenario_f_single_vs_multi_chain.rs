@@ -117,22 +117,35 @@ async fn run_scenario_f_trial(
     for i in 0..num_coordinators {
         let coord_identity = coordinator_identities[i].clone();
         let coord_signing_key = signing_keys.get(&coord_identity.id).unwrap().clone();
+        let coordinator_id_for_task = coord_identity.id; // Capture ID before move
+
         let (coord_network_tx, _coord_network_rx) = mpsc::channel(100);
         runtime.register_component(coord_identity.clone(), coord_network_tx).await;
         let coordinator_metrics_tx = runtime.get_metrics_sender();
-        let coordinator = SimulatedCoordinator::new(coord_identity.clone(), coord_signing_key, sim_config.system_config.clone(),
-            runtime.clone(), blockchain_interface.clone(), partition_mapping.clone(),
+        let coordinator = SimulatedCoordinator::new(
+            coord_identity.clone(),
+            coord_signing_key,
+            sim_config.system_config.clone(),
+            runtime.clone(),
+            blockchain_interface.clone(),
+            partition_mapping.clone(),
             coordinator_metrics_tx.clone(),
             shard_assignments.clone(), // Pass the local assignments map (Arg 8)
         );
+        // Keep Arc if other tasks need it
         let coordinator_arc = Arc::new(coordinator);
         if i == 0 {
              if let Some(rx_to_move) = opt_result_rx.take() {
                  let listener_handle = {
-                     let coordinator_clone = coordinator_arc.clone();
+                     // REMOVE: let coordinator_clone = coordinator_arc.clone();
                      let shutdown_rx_clone = shutdown_rx.clone(); // Clone receiver
-                     tokio::spawn(async move {
-                         coordinator_clone.run_share_listener(rx_to_move, shutdown_rx_clone).await;
+                     tokio::spawn(async move { // Only move required items
+                         // Call the associated function directly using :: syntax
+                         SimulatedCoordinator::run_share_listener(
+                            coordinator_id_for_task, // Pass captured ID
+                            rx_to_move,
+                            shutdown_rx_clone
+                         ).await;
                      })
                  };
                  coordinator_handles.push(listener_handle);
@@ -199,27 +212,31 @@ async fn run_scenario_f_trial(
     println!("[Scenario F] Shutdown signal sent.");
     // --- End Send ---
 
-    // --- Await Handles Gracefully ---
+    // --- Drop runtime BEFORE awaiting tasks ---
+    println!("[Scenario F] Dropping SimulationRuntime instance...");
+    drop(runtime); // Drop the SimulationRuntime instance
+    println!("[Scenario F] SimulationRuntime instance dropped.");
+    // --- End Drop ---
+
+    // --- Await Handles Gracefully (with Timeouts) ---
     println!("[Scenario F] Awaiting coordinator tasks...");
     for handle in coordinator_handles {
-        if let Err(e) = handle.await {
-            eprintln!("[Scenario F] Error awaiting coordinator handle: {}", e);
-        }
+        if let Err(_) = tokio::time::timeout(Duration::from_secs(10), handle).await {
+            eprintln!("[Scenario F] WARN: Coordinator task timed out during shutdown await.");
+        } // No else needed
     }
-    println!("[Scenario F] Coordinator tasks finished.");
+    println!("[Scenario F] Coordinator tasks finished (or timed out).");
 
     println!("[Scenario F] Awaiting node tasks...");
     for handle in node_handles {
-         if let Err(e) = handle.await {
-             eprintln!("[Scenario F] Error awaiting node handle: {}", e);
-         }
+         if let Err(_) = tokio::time::timeout(Duration::from_secs(10), handle).await {
+             eprintln!("[Scenario F] WARN: Node task timed out during shutdown await.");
+         } // No else needed
     }
-     println!("[Scenario F] Node tasks finished.");
+     println!("[Scenario F] Node tasks finished (or timed out).");
     // --- End Await ---
 
-    // Drop runtime AFTER awaiting tasks
-    drop(runtime);
-
+    println!("[Scenario F] Awaiting metrics handle..."); // Added log
     let collected_metrics = match metrics_handle.await {
         Ok(metrics) => metrics,
         Err(e) => { eprintln!("[Scenario F] Error awaiting metrics handle: {}", e); Vec::new() }
@@ -231,7 +248,7 @@ async fn run_scenario_f_trial(
 // --- Main Test Function ---
 
 #[tokio::test]
-#[ignore] // Ignore by default
+// #[ignore] // Ignore by default - REMOVED
 async fn test_scenario_f_single_vs_multi_chain() {
     println!("===== Running Scenario F: Single vs Multi-Chain Test =====");
     let nodes_per_shard = 7; // m value
@@ -239,7 +256,7 @@ async fn test_scenario_f_single_vs_multi_chain() {
     let coordinator_threshold = 3;
     let num_transactions = 5000; // Adjust as needed
     let target_tps = 200; // Adjust as needed
-    let num_trials = 1; // TODO: Increase
+    let num_trials = 3; // Increased from 1
 
     // Test configurations
     let test_configs = [

@@ -32,6 +32,7 @@ use hex; // Add hex import
 use crate::tee_logic::enclave_sim::EnclaveSim; // Corrected Import Path
 use log::{debug, error, info};
 use tokio::sync::watch; // Add watch
+use std::time::{Instant, SystemTime}; // Add Instant and SystemTime imports
 
 // Type for proposal requests received by the node's run loop
 pub type NodeProposalRequest = (Command, oneshot::Sender<Result<Vec<RaftEvent>, String>>);
@@ -299,13 +300,30 @@ impl SimulatedTeeNode {
                     self.process_state_machine_commands(commands).await;
                 }
                 RaftEvent::Noop => {}
+                RaftEvent::BecameLeader(leader_identity) => {
+                    info!(
+                        "[Node {}] Handling RaftEvent::BecameLeader. Reporting leader {} for shard {} to runtime.",
+                        self.identity.id, leader_identity.id, self.shard_id
+                    );
+                    // Ensure the reported leader is self (sanity check)
+                    if leader_identity.id == self.identity.id {
+                         // TODO: Implement report_leader in SimulationRuntime and uncomment this line
+                         // self.runtime.report_leader(self.shard_id, leader_identity).await;
+                         info!("[Node {}] Reported self as leader for shard {}. (Call to runtime commented out)", self.identity.id, self.shard_id);
+                    } else {
+                         warn!(
+                             "[Node {}] Received BecameLeader event for different node ID ({})! This should not happen.",
+                             self.identity.id, leader_identity.id
+                         );
+                    }
+                }
             }
         }
     }
 
     /// Processes commands applied to the state machine via Raft consensus.
     async fn process_state_machine_commands(&mut self, commands: Vec<Command>) {
-         for command in commands {
+        for command in commands {
             debug!("[Node {}] PRE apply_state_machine_command({:?}).await", self.identity.id, command);
             match self.apply_state_machine_command(command).await {
                 Ok(_) => {
@@ -320,58 +338,114 @@ impl SimulatedTeeNode {
     }
     
     async fn apply_state_machine_command(&mut self, command: Command) -> Result<(), String> {
-        println!("[Node {}][StateMachine] Processing command: {:?}", self.identity.id, command);
-        match command {
-            Command::ConfirmLockAndSign(lock_data) => {
-                if self.processed_commands.contains(&lock_data.tx_id) {
-                    println!("[Node {}][StateMachine] Command for tx_id {} already processed. Skipping.", self.identity.id, lock_data.tx_id);
+            println!("[Node {}][StateMachine] Processing command: {:?}", self.identity.id, command);
+            match command {
+                Command::ConfirmLockAndSign(lock_data) => {
+                    if self.processed_commands.contains(&lock_data.tx_id) {
+                        println!("[Node {}][StateMachine] Command for tx_id {} already processed. Skipping.", self.identity.id, lock_data.tx_id);
                     return Ok(());
-                }
-
-                let signable_data = (
-                    &lock_data.tx_id, 
-                    lock_data.source_chain_id, 
-                    lock_data.target_chain_id, 
-                    &lock_data.token_address, 
-                    lock_data.amount, 
-                    &lock_data.recipient
-                );
-
-                match bincode::encode_to_vec(&signable_data, standard()) {
-                    Ok(data_to_sign) => {
-                        println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
-                        println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
-                        
-                        println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
-                        let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
-                        let share = (self.identity.clone(), lock_data.clone(), signature);
-
-                        // --- Add PRE/POST logging for submit_result ---
-                        let tx_id_for_log = lock_data.tx_id.clone(); // Clone tx_id for logging
-                        println!("[Node {}][StateMachine] PRE runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
-                        self.runtime.submit_result(share).await;
-                        println!("[Node {}][StateMachine] POST runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
-                        // --- End Add ---
-
-                        self.processed_commands.insert(lock_data.tx_id.clone());
-                        Ok(())
                     }
-                    Err(e) => {
-                        let err_msg = format!("Error serializing LockProofData for signing: {}", e);
-                        eprintln!("[Node {}][StateMachine] {}", self.identity.id, err_msg);
-                        Err(err_msg)
+
+                    // --- Determine if cross-chain BEFORE serialization ---
+                    let is_cross_chain = lock_data.source_chain_id != lock_data.target_chain_id;
+                    let start_time = lock_data.start_time; // Capture start time
+
+                    let signable_data = (
+                        &lock_data.tx_id,
+                        lock_data.source_chain_id,
+                        lock_data.target_chain_id,
+                        &lock_data.token_address,
+                        lock_data.amount,
+                        &lock_data.recipient
+                    );
+
+                    match bincode::encode_to_vec(&signable_data, standard()) {
+                        Ok(data_to_sign) => {
+                            println!("[Node {}][SignDebug] Signing data hex: {}", self.identity.id, hex::encode(&data_to_sign));
+                            println!("[Node {}][SignDebug] Node PubKey: {:?}", self.identity.id, self.identity.public_key);
+
+                            println!("[Node {}][StateMachine] Signing data for tx_id: {}", self.identity.id, lock_data.tx_id);
+                            let signature: Signature = self.raft_node.enclave.sign(&data_to_sign).await;
+                            let share = (self.identity.clone(), lock_data.clone(), signature.clone()); // Clone signature for potential share sending
+
+                            // --- Send TransactionCompleted Metric ---
+                            let end_time_instant = Instant::now(); // Capture end time
+                            let duration = end_time_instant.duration_since(start_time);
+                            // Get epoch ms for the event, handling potential errors
+                            let end_time_ms = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis() as u64);
+                            // Approximate start_time_ms from end_time_ms and duration
+                            let start_time_ms = end_time_ms.saturating_sub(duration.as_millis() as u64);
+
+                            let event = MetricEvent::TransactionCompleted {
+                                 id: lock_data.tx_id.clone(),
+                                 start_time_ms,
+                                 end_time_ms,
+                                 duration,
+                                 is_cross_chain,
+                                 success: true, // Assuming success for now
+                            };
+                            debug!("[Node {} Apply] Sending TransactionCompleted metric: {:?}", self.identity.id, event);
+                            if let Err(e) = self.metrics_tx.send(event).await {
+                                 warn!("[Node {} Apply] Failed to send TransactionCompleted metric: {}", self.identity.id, e);
+                            }
+                            // --- End Metric Sending ---
+
+                            // --- Send share to Coordinator ONLY if cross-chain ---
+                            if is_cross_chain {
+                                let tx_id_for_log = lock_data.tx_id.clone(); // Clone tx_id for logging
+                                info!("[Node {}][StateMachine] Cross-chain tx {}. PRE runtime.submit_result", self.identity.id, tx_id_for_log);
+                                self.runtime.submit_result(share).await; // share was created earlier
+                                info!("[Node {}][StateMachine] POST runtime.submit_result for tx_id: {}", self.identity.id, tx_id_for_log);
+                            } else {
+                                 debug!("[Node {}][StateMachine] Single-chain tx {}. Not sending share to coordinator.", self.identity.id, lock_data.tx_id);
+                            }
+                            // --- End Conditional Share Sending ---
+
+                            self.processed_commands.insert(lock_data.tx_id.clone());
+                            Ok(())
+                        }
+                        Err(e) => {
+                            // --- Send Failure Metric ---
+                            let end_time_instant = Instant::now(); // Capture end time
+                            let duration = end_time_instant.duration_since(start_time);
+                            // Get epoch ms for the event, handling potential errors
+                            let end_time_ms = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis() as u64);
+                            // Approximate start_time_ms from end_time_ms and duration
+                            let start_time_ms = end_time_ms.saturating_sub(duration.as_millis() as u64);
+
+                             let event = MetricEvent::TransactionCompleted {
+                                 id: lock_data.tx_id.clone(),
+                                 start_time_ms,
+                                 end_time_ms,
+                                 duration,
+                                 is_cross_chain,
+                                 success: false, // Mark as failure
+                            };
+                            debug!("[Node {} Apply] Sending TransactionCompleted (Failure) metric: {:?}", self.identity.id, event);
+                             if let Err(e_send) = self.metrics_tx.send(event).await {
+                                 warn!("[Node {} Apply] Failed to send TransactionCompleted (Failure) metric: {}", self.identity.id, e_send);
+                             }
+                            // --- End Failure Metric ---
+
+                            let err_msg = format!("Error serializing LockProofData for signing: {}", e);
+                            eprintln!("[Node {}][StateMachine] {}", self.identity.id, err_msg);
+                            Err(err_msg)
+                        }
                     }
                 }
-            }
-            Command::Noop => {
-                println!("[Node {}][StateMachine] Processing Noop command.", self.identity.id);
+                Command::Noop => {
+                    println!("[Node {}][StateMachine] Processing Noop command.", self.identity.id);
                 Ok(())
-            }
-            #[cfg(test)]
-            Command::Dummy => {
-                 println!("Node {}: Applying Dummy command (test)", self.identity.id);
+                }
+                #[cfg(test)]
+                Command::Dummy => {
+                     println!("Node {}: Applying Dummy command (test)", self.identity.id);
                  Ok(())
-             }
+            }
         }
     }
 

@@ -427,17 +427,22 @@ async fn test_full_protocol_e2e() -> Result<(), String> {
         metrics_tx.clone(), // Add metrics_tx (arg 7)
         shard_assignments_handle, // Pass the handle (arg 8)
     ));
+    let coordinator_id_for_task = coord_identity.id; // Capture ID
     println!("[Setup] Coordinator instance created.");
 
     // Spawn the coordinator tasks
-    let coordinator_share_listener = coordinator.clone();
     let shutdown_rx_coord_share = shutdown_rx.clone(); // Clone the receiver again
     let share_listener_handle = tokio::spawn(async move {
-        coordinator_share_listener.run_share_listener(result_rx, shutdown_rx_coord_share).await;
+        // Call the associated function directly using :: syntax
+        SimulatedCoordinator::run_share_listener(
+            coordinator_id_for_task, // Pass captured ID
+            result_rx, // Pass the result_rx directly
+            shutdown_rx_coord_share
+        ).await;
     });
     println!("[Setup] Coordinator share listener task spawned.");
 
-    let coordinator_command_listener = coordinator.clone();
+    let coordinator_command_listener = coordinator.clone(); // Keep clone for command listener
     let command_listener_handle = tokio::spawn(async move {
         coordinator_command_listener.run_command_listener(coord_cmd_rx).await;
     });

@@ -1,0 +1,25 @@
+[tasks.deploy]
+workspace = false
+dependencies = ["deploy1", "deploy2"]
+
+[tasks.deploy1]
+workspace = false
+command = "forge"
+args = [
+    "script",
+    "script/Deploy.sol:Deploy",
+    "--fork-url",
+    "http://localhost:8545",
+    "--broadcast",
+]
+
+[tasks.deploy2]
+workspace = false
+command = "forge"
+args = [
+    "script",
+    "script/Deploy.sol:Deploy2",
+    "--fork-url",
+    "http://localhost:8546",
+    "--broadcast",
+]

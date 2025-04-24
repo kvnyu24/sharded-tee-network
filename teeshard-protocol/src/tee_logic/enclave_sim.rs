@@ -185,6 +185,9 @@ impl EnclaveSim {
 
     /// Helper to send TeeFunctionMeasured metric.
     async fn send_tee_metric(&self, function_name: String, duration: Duration) {
+        // ---- ADD DEBUG PRINT ----
+        println!("[EnclaveSim {} DEBUG] Attempting to send TeeFunctionMeasured metric for '{}' (duration: {:?})", self.identity.id, function_name, duration);
+        // ---- END DEBUG PRINT ----
         if let Some(metrics_tx) = self.metrics_tx.clone() {
             let event = MetricEvent::TeeFunctionMeasured {
                 node_id: self.identity.clone(),

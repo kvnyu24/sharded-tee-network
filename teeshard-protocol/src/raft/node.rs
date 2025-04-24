@@ -19,6 +19,7 @@ use std::{
 };
 use tokio::sync::mpsc; // Import mpsc
 use tokio::time::sleep; // Only import sleep
+use log::{trace, warn}; // Add this line
 
 // Define ShardId as usize for now within this module context
 // TODO: Define ShardId globally if needed, e.g., in data_structures.rs or types.rs
@@ -78,6 +79,7 @@ pub enum RaftEvent {
     BroadcastMessage(RaftMessage),
     ApplyToStateMachine(Vec<Command>), // Commands to apply
     Noop,
+    BecameLeader(TEEIdentity), // ADDED: New event variant
 }
 
 impl RaftNode {
@@ -761,26 +763,27 @@ mod tests {
         network: &mut HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>>,
     ) -> Vec<(TEEIdentity, TEEIdentity, RaftMessage)> { // Returns (sender, recipient, message)
         let mut outgoing_messages = Vec::new();
-        println!("[TestHarness] process_network_queue: Checking queue for Node {}", node_id.id);
+        // Use trace! for potentially very verbose logs
+        trace!("[TestHarness] process_network_queue: Checking queue for Node {}", node_id.id);
         if let Some(queue) = network.get_mut(node_id) {
             while let Some((sender_id, msg)) = queue.pop_front() {
-                println!("[TestHarness] process_network_queue: Processing msg for Node {} from {}: {:?}", node_id.id, sender_id.id, msg);
+                trace!("[TestHarness] process_network_queue: Processing msg for Node {} from {}: {:?}", node_id.id, sender_id.id, msg);
                 if let Some(node_arc) = nodes.get(node_id) {
-                    println!("[TestHarness] process_network_queue: Locking Node {}...", node_id.id);
+                    // trace!("[TestHarness] process_network_queue: Locking Node {}...", node_id.id);
                     let mut node = node_arc.lock().unwrap();
-                    println!("[TestHarness] process_network_queue: Locked Node {}. Calling handle_message...", node_id.id);
+                    // trace!("[TestHarness] process_network_queue: Locked Node {}. Calling handle_message...", node_id.id);
                     // handle_message expects TEEIdentity, sender_id is now TEEIdentity
-                    let events = node.handle_message(sender_id, msg);
-                    println!("[TestHarness] process_network_queue: Node {} handle_message returned {} events. Processing events...", node_id.id, events.len());
+                    let events = node.handle_message(sender_id.clone(), msg); // Clone sender_id here
+                    trace!("[TestHarness] process_network_queue: Node {} handle_message returned {} events. Processing events...", node_id.id, events.len());
                     for event in events {
                         match event {
                             RaftEvent::SendMessage(recipient, message) => {
-                                println!("[TestHarness] process_network_queue: Node {} generated SendMessage to {}: {:?}", node_id.id, recipient.id, message);
+                                trace!("[TestHarness] process_network_queue: Node {} generated SendMessage to {}: {:?}", node_id.id, recipient.id, message);
                                 // Sender is the current node processing the queue
                                 outgoing_messages.push((node_id.clone(), recipient, message));
                             }
                             RaftEvent::BroadcastMessage(message) => {
-                                println!("[TestHarness] process_network_queue: Node {} generated BroadcastMessage: {:?}", node_id.id, message);
+                                trace!("[TestHarness] process_network_queue: Node {} generated BroadcastMessage: {:?}", node_id.id, message);
                                 for peer_id in node.peers.iter().cloned() {
                                     if &peer_id != node_id { // Compare TEEIdentity directly
                                         // Sender is the current node
@@ -789,17 +792,23 @@ mod tests {
                                 }
                             }
                             RaftEvent::ApplyToStateMachine(commands) => {
-                                println!("[TestHarness] process_network_queue: Node {} generated ApplyToStateMachine ({} commands)", node_id.id, commands.len());
+                                trace!("[TestHarness] process_network_queue: Node {} generated ApplyToStateMachine ({} commands)", node_id.id, commands.len());
                                 // Use node_id.id which is usize
-                                println!("Node {}: Applying {} commands", node_id.id, commands.len());
+                                // debug!("Node {}: Applying {} commands", node_id.id, commands.len());
                             }
                             RaftEvent::Noop => {}
+                            // --- ADDED: Ignore BecameLeader in test harness ---
+                            RaftEvent::BecameLeader(leader_id) => {
+                                 trace!("[TestHarness] process_network_queue: Node {} Ignored BecameLeader event for leader {}", node_id.id, leader_id.id);
+                            }
+                            // --- END ADD ---
+                            // RaftEvent::IsLeaderResult { .. } => {} // Removed if not used
                         }
                     }
-                    println!("[TestHarness] process_network_queue: Unlocking Node {}...", node_id.id);
+                    // trace!("[TestHarness] process_network_queue: Unlocking Node {}...", node_id.id);
                     // Mutex automatically unlocked here when `node` goes out of scope
                 } else {
-                    println!("[TestHarness] process_network_queue: Node {} Arc not found in map!", node_id.id);
+                    warn!("[TestHarness] process_network_queue: Node {} Arc not found in map!", node_id.id);
                 }
             }
         }
@@ -811,7 +820,7 @@ mod tests {
     async fn test_leader_election_basic() {
         println!("[TestHarness START] test_leader_election_basic");
         // Use TEEIdentity
-        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(create_identity_with_key).collect();
+        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(|i| create_identity_with_key(i as u64)).collect(); // Ensure u64 ID
         let node_ids: Vec<TEEIdentity> = nodes_data.iter().map(|(id, _)| id.clone()).collect();
         let mut nodes: HashMap<TEEIdentity, Arc<Mutex<RaftNode>>> = HashMap::new();
         let mut network: HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>> = HashMap::new();
@@ -851,30 +860,31 @@ mod tests {
             println!("\n[TestHarness] Starting Loop Iteration {}", i);
             let mut current_tick_outgoing = Vec::new();
             
-            println!("[TestHarness] Step 1: deliver_messages ({} messages)", outgoing_messages.len());
+            // Use trace! for potentially very verbose logs
+            trace!("[TestHarness] Step 1: deliver_messages ({} messages)", outgoing_messages.len());
             deliver_messages(&mut nodes, outgoing_messages.drain(..).collect(), &mut network);
 
-            println!("[TestHarness] Step 2: process_network_queues for all nodes");
+            trace!("[TestHarness] Step 2: process_network_queues for all nodes");
             for id in &node_ids {
                 current_tick_outgoing.extend(process_network_queue(id, &mut nodes, &mut network));
             }
 
-            println!("[TestHarness] Step 3: Ticking all nodes");
+            trace!("[TestHarness] Step 3: Ticking all nodes");
             for id in &node_ids {
                 if let Some(node_arc) = nodes.get(id) {
-                    println!("[TestHarness] Ticking: Locking Node {}...", id.id);
+                    // trace!("[TestHarness] Ticking: Locking Node {}...", id.id);
                     let mut node = node_arc.lock().unwrap();
-                    println!("[TestHarness] Ticking: Locked Node {}. Calling tick()...", id.id);
+                    // trace!("[TestHarness] Ticking: Locked Node {}. Calling tick()...", id.id);
                     let events = node.tick();
-                    println!("[TestHarness] Ticking: Node {} tick() returned {} events. Processing...", id.id, events.len());
+                    // trace!("[TestHarness] Ticking: Node {} tick() returned {} events. Processing...", id.id, events.len());
                     for event in events {
                         match event {
                             RaftEvent::SendMessage(recipient, message) => {
-                                println!("[TestHarness] Ticking: Node {} generated SendMessage to {}: {:?}", id.id, recipient.id, message);
+                                trace!("[TestHarness] Ticking: Node {} generated SendMessage to {}: {:?}", id.id, recipient.id, message);
                                 current_tick_outgoing.push((id.clone(), recipient, message));
                             }
                             RaftEvent::BroadcastMessage(message) => {
-                                println!("[TestHarness] Ticking: Node {} generated BroadcastMessage: {:?}", id.id, message);
+                                trace!("[TestHarness] Ticking: Node {} generated BroadcastMessage: {:?}", id.id, message);
                                 for peer_id in node.peers.iter().cloned() {
                                     if &peer_id != id {
                                         current_tick_outgoing.push((id.clone(), peer_id, message.clone()));
@@ -882,24 +892,30 @@ mod tests {
                                 }
                             }
                             RaftEvent::ApplyToStateMachine(commands) => {
-                                println!("[TestHarness] Ticking: Node {} generated ApplyToStateMachine ({} commands)", id.id, commands.len());
+                                trace!("[TestHarness] Ticking: Node {} generated ApplyToStateMachine ({} commands)", id.id, commands.len());
                                 // Use id.id which is usize
-                                println!("Node {}: Applying {} commands", id.id, commands.len());
+                                // debug!("Node {}: Applying {} commands", id.id, commands.len());
                             }
                             RaftEvent::Noop => {}
+                             // --- ADDED: Ignore BecameLeader in test harness ---
+                             RaftEvent::BecameLeader(leader_id) => {
+                                 trace!("[TestHarness] Ticking: Node {} Ignored BecameLeader event for leader {}", id.id, leader_id.id);
+                             }
+                             // --- END ADD ---
+                            // RaftEvent::IsLeaderResult { .. } => {} // Removed if not used
                         }
                     }
-                    println!("[TestHarness] Ticking: Unlocking Node {}...", id.id);
+                    // trace!("[TestHarness] Ticking: Unlocking Node {}...", id.id);
                      // Mutex automatically unlocked here
                 } else {
-                    println!("[TestHarness] Ticking: Node {} Arc not found in map!", id.id);
+                    warn!("[TestHarness] Ticking: Node {} Arc not found in map!", id.id);
                 }
             }
 
-            println!("[TestHarness] Step 4: Collecting outgoing messages ({} new)", current_tick_outgoing.len());
+            trace!("[TestHarness] Step 4: Collecting outgoing messages ({} new)", current_tick_outgoing.len());
             outgoing_messages.extend(current_tick_outgoing);
 
-            println!("[TestHarness] Step 5: Checking for leader and potentially sleeping");
+            trace!("[TestHarness] Step 5: Checking for leader and potentially sleeping");
             let leader = find_leader(&nodes);
             if leader.is_some() {
                 println!("[TestHarness] Leader found: {:?}. Waiting to stabilize...", leader.as_ref().unwrap().id);
@@ -923,10 +939,10 @@ mod tests {
                      outgoing_messages.clear(); // Clear messages if leader lost
                 }
             }
-            println!("[TestHarness] Sleeping for 50ms...");
+            // trace!("[TestHarness] Sleeping for 50ms...");
             // Use tokio::time::sleep and qualify Duration
             sleep(tokio::time::Duration::from_millis(50)).await;
-            println!("[TestHarness] End Loop Iteration {}", i);
+            trace!("[TestHarness] End Loop Iteration {}", i);
         }
 
         let leader = find_leader(&nodes);
@@ -985,7 +1001,7 @@ mod tests {
     // Mark test as async tokio test
     #[tokio::test]
     async fn test_log_replication_and_commit() {
-        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(create_identity_with_key).collect();
+        let nodes_data: Vec<(TEEIdentity, SecretKey)> = (1..=3).map(|i| create_identity_with_key(i as u64)).collect(); // Ensure u64 ID
         let node_ids: Vec<TEEIdentity> = nodes_data.iter().map(|(id, _)| id.clone()).collect();
         let mut nodes: HashMap<TEEIdentity, Arc<Mutex<RaftNode>>> = HashMap::new();
         let mut network: HashMap<TEEIdentity, VecDeque<(TEEIdentity, RaftMessage)>> = HashMap::new();
@@ -1039,9 +1055,14 @@ mod tests {
                                 }
                             }
                             RaftEvent::ApplyToStateMachine(commands) => {
-                                println!("Node {}: Applied {} commands during election tick {}", id.id, commands.len(), tick);
+                                trace!("Node {}: Applied {} commands during election tick {}", id.id, commands.len(), tick);
                             }
                             RaftEvent::Noop => {}
+                            // --- ADDED: Ignore BecameLeader in test harness ---
+                            RaftEvent::BecameLeader(leader_id) => {
+                                 trace!("[TestHarness] Ticking: Node {} Ignored BecameLeader event for leader {}", id.id, leader_id.id);
+                            }
+                            // --- END ADD ---
                         }
                     }
                 }
@@ -1075,8 +1096,11 @@ mod tests {
                                              }
                                          }
                                           RaftEvent::ApplyToStateMachine(commands) => {
-                                              println!("Node {}: Applied {} commands during stabilization", id.id, commands.len());
+                                              trace!("Node {}: Applied {} commands during stabilization", id.id, commands.len());
                                           }
+                                           RaftEvent::BecameLeader(leader_id) => {
+                                               trace!("[TestHarness] Stabilizing: Node {} Ignored BecameLeader event for leader {}", id.id, leader_id.id);
+                                           }
                                          _ => {}
                                      }
                                  }
@@ -1126,9 +1150,14 @@ mod tests {
                     }
                     // ApplyToStateMachine shouldn't happen directly from propose, but handle defensively
                     RaftEvent::ApplyToStateMachine(commands) => {
-                         println!("Unexpected ApplyToStateMachine event from propose_command on node {}", leader_id.id);
+                         warn!("Unexpected ApplyToStateMachine event from propose_command on node {}", leader_id.id);
                     }
                     RaftEvent::Noop => {}
+                     // --- ADDED: Ignore BecameLeader in test harness ---
+                     RaftEvent::BecameLeader(leader_id_inner) => {
+                          trace!("[TestHarness] Propose: Node {} Ignored BecameLeader event for leader {}", leader_id.id, leader_id_inner.id);
+                     }
+                     // --- END ADD ---
                 }
             }
         } // Lock released here
@@ -1161,7 +1190,7 @@ mod tests {
                                  }
                              }
                              RaftEvent::ApplyToStateMachine(commands) => {
-                                 println!("Node {}: Applied {} commands during replication tick {}", id.id, commands.len(), tick);
+                                 trace!("Node {}: Applied {} commands during replication tick {}", id.id, commands.len(), tick);
                                   // Check if the specific command we sent is being applied
                                   if node.state.last_applied >= proposed_log_index {
                                        let applied_entry = &node.state.log[proposed_log_index as usize - 1];
@@ -1169,6 +1198,11 @@ mod tests {
                                   }
                              }
                              RaftEvent::Noop => {}
+                             // --- ADDED: Ignore BecameLeader in test harness ---
+                              RaftEvent::BecameLeader(leader_id_inner) => {
+                                  trace!("[TestHarness] ReplicationTick: Node {} Ignored BecameLeader event for leader {}", id.id, leader_id_inner.id);
+                              }
+                              // --- END ADD ---
                          }
                      }
                  }
