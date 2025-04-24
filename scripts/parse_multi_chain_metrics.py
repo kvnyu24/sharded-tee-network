@@ -11,23 +11,26 @@ import math # For checking NaN
 
 # --- Regexes ---
 
-# Captures the start of a Scenario B trial and its parameters
-SCENARIO_B_START_RE = re.compile(
-    # Use single backslashes for escapes: \(, \), \d, \.
-    r'--- Starting Scenario B Trial \(k=(?P<k>\d+), m=(?P<m>\d+), tx=\d+, tps=\d+, rho=(?P<rho>\d+\.?\d*)\) ---'
+# Captures the overall configuration being tested (number of chains)
+EXPERIMENT_CONFIG_RE = re.compile(
+    r'>>> Testing Configuration: n=(?P<n>\d+) <<<'
 )
 
-# Captures transaction "start" time (tv_sec) and details from the *embedded* data in ConfirmLockAndSign processing logs
+# Captures the start of a specific Scenario F trial and its parameters
+SCENARIO_F_START_RE = re.compile(
+    # Use single backslashes for escapes: \(, \), \d, \.
+    r'--- Starting Scenario F Trial \(n=(?P<n_trial>\d+), k=(?P<k>\d+), m=(?P<m>\d+), tx=\d+, tps=\d+, rho=(?P<rho>\d+\.?\d*)\) ---'
+)
+
+# Captures transaction "start" time (tv_sec) and details from ConfirmLockAndSign processing logs
 CONFIRM_CMD_RE = re.compile(
     # Use single backslashes for escapes: \[, \], \d, \s, \(, \), \{, \}
-    r'\[Node (?P<node_id>\d+)\]\[StateMachine\] Processing command: ConfirmLockAndSign\(LockProofData\s*\{.*?tx_id:\s*"(?P<tx_id>[a-f0-9]+)".*?source_chain_id:\s*(?P<source_chain>\d+).*?target_chain_id:\s*(?P<target_chain>\d+).*?shard_id:\s*(?P<shard_id>\d+).*?start_time:\s*Instant\s*\{\s*tv_sec:\s*(?P<tv_sec>\d+),\s*tv_nsec:\s*(?P<tv_nsec>\d+)\s*\}\}.*?\}\)\'',
-    re.DOTALL # Allow .* to match newlines if the log message wraps
+    r'\[Node (?P<node_id>\d+)\]\[StateMachine\] Processing command: ConfirmLockAndSign\(LockProofData\s*\{.*?tx_id:\s*"(?P<tx_id>[a-f0-9]+)".*?source_chain_id:\s*(?P<source_chain>\d+).*?target_chain_id:\s*(?P<target_chain>\d+).*?shard_id:\s*(?P<shard_id>\d+).*?start_time:\s*Instant\s*\{\s*tv_sec:\s*(?P<tv_sec>\d+),\s*tv_nsec:\s*(?P<tv_nsec>\d+)\s*\}\}.*?\}\)',
+    re.DOTALL
 )
 
 # Captures the *first* proposal time for a tx_id found within *any* AppendEntries log
 PROPOSAL_TIME_RE = re.compile(
-    # Use single backslashes for escapes: \s, \{, \}, \d, \(, \), \.
-    # Combined into a single raw string for clarity
     r'LogEntry\s*\{\s*'
     r'term:\s*\d+,\s*command:\s*ConfirmLockAndSign\(LockProofData\s*\{\s*tx_id:\s*"(?P<tx_id>[a-f0-9]+)".*?\}\),\s*'
     r'proposal_time_since_epoch:\s*(?P<proposal_time>\d+\.?\d*)s'
@@ -36,16 +39,16 @@ PROPOSAL_TIME_RE = re.compile(
 
 # Captures the runtime.submit_result call (proxy for cross-shard message count)
 SUBMIT_RESULT_RE = re.compile(
-    # Use single backslashes for escapes: \[, \], \d, \.
     r'\[Node \d+\]\[StateMachine\] (?:PRE|POST) runtime\.submit_result for tx_id: ([a-f0-9]+)'
 )
 
-# --- Helper Function to Save Block Data ---
-def save_current_block(all_results, current_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids):
-    if current_params and (confirm_cmd_data or pseudo_completion_times or submit_result_tx_ids):
-        print(f"  Saving data block for params: {current_params}")
+# --- Helper Function to Save Trial Block Data ---
+def save_current_trial_block(all_results, current_trial_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids):
+    # Only save if we have parameters and some data for the trial
+    if current_trial_params and (confirm_cmd_data or pseudo_completion_times or submit_result_tx_ids):
+        print(f"  Saving data for trial block: {current_trial_params}")
         all_results.append({
-            'params': current_params.copy(),
+            'params': current_trial_params.copy(), # Store n, k, m, rho
             'confirm_cmd_data': confirm_cmd_data.copy(),
             'pseudo_completion_times': pseudo_completion_times.copy(),
             'submit_result_tx_ids': submit_result_tx_ids.copy()
@@ -54,18 +57,20 @@ def save_current_block(all_results, current_params, confirm_cmd_data, pseudo_com
 # --- Main Parsing Function ---
 def parse_log_file(log_file_path):
     """
-    Parses the Scenario B log file containing multiple experimental blocks.
-    Extracts approximate transaction timings, details, and parameters (k, m, rho) for each block.
+    Parses the Scenario F log file containing multiple experiment configurations (n=1, n=4)
+    and potentially multiple trials within each configuration.
+    Extracts approximate transaction timings, details, and parameters (n, k, m, rho) for each trial block.
     WARNING: Uses embedded time fields (tv_sec, proposal_time_since_epoch) as proxies
              due to missing wall-clock timestamps on log lines. Results WILL BE INACCURATE.
     """
-    all_results = []            # List to store results for each block
-    current_params = None       # Dictionary for current block's params {k, m, rho}
-    confirm_cmd_data = []       # List to store (tx_id, tv_sec, tv_nsec, details) tuples for the current block
-    pseudo_completion_times = {}# tx_id -> float(proposal_time_since_epoch) for the current block
-    submit_result_tx_ids = set() # Tracks unique tx_ids for 'submit_result' in the current block
+    all_results = []            # List to store results for each completed trial block
+    current_n_config = None     # Stores the active 'n' from >>> Testing Configuration
+    current_trial_params = None # Dictionary for current trial block's params {n, k, m, rho}
+    confirm_cmd_data = []       # List to store (tx_id, tv_sec, tv_nsec, details) tuples for the current trial
+    pseudo_completion_times = {}# tx_id -> float(proposal_time_since_epoch) for the current trial
+    submit_result_tx_ids = set() # Tracks unique tx_ids for 'submit_result' in the current trial
 
-    print(f"Parsing Scenario B log file: {log_file_path} ... (Using embedded times - accuracy limitations apply)")
+    print(f"Parsing Scenario F log file: {log_file_path} ... (Using embedded times - accuracy limitations apply)")
     line_count = 0
 
     try:
@@ -73,32 +78,56 @@ def parse_log_file(log_file_path):
             for line in f:
                 line_count += 1
 
-                # --- Check for Start of a New Scenario B Block ---
-                match_start = SCENARIO_B_START_RE.search(line)
-                if match_start:
-                    # Save data from the previous block (if any) before starting new one
-                    save_current_block(all_results, current_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids)
-
-                    # Reset for the new block
+                # --- Check for Outer Experiment Configuration Start ---
+                match_config = EXPERIMENT_CONFIG_RE.search(line)
+                if match_config:
+                    # Save data from the previous trial (if any) before changing config
+                    save_current_trial_block(all_results, current_trial_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids)
+                    # Reset trial-specific data
+                    current_trial_params = None
+                    confirm_cmd_data = []
+                    pseudo_completion_times = {}
+                    submit_result_tx_ids = set()
+                    # Set the new outer config 'n'
                     try:
-                        current_params = {
-                            'k': int(match_start.group('k')),
-                            'm': int(match_start.group('m')),
-                            'rho': float(match_start.group('rho'))
-                        }
-                        print(f"\nDetected new block start: k={current_params['k']}, m={current_params['m']}, rho={current_params['rho']:.1f}")
-                        # Clear data collections for the new block
-                        confirm_cmd_data = []
-                        pseudo_completion_times = {}
-                        submit_result_tx_ids = set()
-                    except (ValueError, TypeError) as e:
-                        print(f"  Warning: Could not parse parameters from block start line {line_count}: {e}. Skipping block.")
-                        current_params = None # Invalidate current block if params are bad
+                        current_n_config = int(match_config.group('n'))
+                        print(f"\nDetected Experiment Configuration: n={current_n_config}")
+                    except (ValueError, TypeError):
+                        print(f"  Warning: Could not parse 'n' from config line {line_count}: {line.strip()}. Disabling parsing until next config.")
+                        current_n_config = None # Disable parsing if config line is bad
 
-                # --- Parse Data Lines only if we are within a valid block ---
-                if current_params:
+                # --- Check for Inner Trial Start --- (Only if we have a valid outer config 'n')
+                if current_n_config is not None:
+                    match_trial_start = SCENARIO_F_START_RE.search(line)
+                    if match_trial_start:
+                        # Save data from the previous trial block (if any)
+                        save_current_trial_block(all_results, current_trial_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids)
+
+                        # Reset for the new trial block
+                        try:
+                            n_trial = int(match_trial_start.group('n_trial'))
+                            # Sanity check: n from trial line should match current_n_config
+                            if n_trial != current_n_config:
+                                print(f"  Warning: Mismatch between config n={current_n_config} and trial line n={n_trial} at line {line_count}. Using n={current_n_config}.")
+
+                            current_trial_params = {
+                                'n': current_n_config, # Use n from the outer config line
+                                'k': int(match_trial_start.group('k')),
+                                'm': int(match_trial_start.group('m')),
+                                'rho': float(match_trial_start.group('rho'))
+                            }
+                            print(f"  Detected Trial Start: {current_trial_params}")
+                            # Clear data collections for the new trial block
+                            confirm_cmd_data = []
+                            pseudo_completion_times = {}
+                            submit_result_tx_ids = set()
+                        except (ValueError, TypeError) as e:
+                            print(f"  Warning: Could not parse parameters from trial start line {line_count}: {e}. Skipping trial block.")
+                            current_trial_params = None # Invalidate current trial block
+
+                # --- Parse Data Lines only if we are within a valid trial block ---
+                if current_trial_params: # Check if we have valid parameters for the current trial
                     # --- Check for ConfirmLockAndSign Processing (Extracts Pseudo Start Time) ---
-                    # Use finditer to catch multiple occurrences per line if log format changes
                     for match_confirm in CONFIRM_CMD_RE.finditer(line):
                         data = match_confirm.groupdict()
                         tx_id = data['tx_id']
@@ -113,28 +142,26 @@ def parse_log_file(log_file_path):
                             }
                             confirm_cmd_data.append((tx_id, tv_sec, tv_nsec, details))
                         except (ValueError, TypeError, KeyError) as e:
-                            print(f"  Warning (Block {current_params}): Could not parse ConfirmLockAndSign for tx {tx_id} on line {line_count}: {e}")
+                            print(f"  Warning (Trial {current_trial_params}): Could not parse ConfirmLockAndSign for tx {tx_id} on line {line_count}: {e}")
 
                     # --- Check for Proposal Time within AppendEntries (Pseudo Completion Time) ---
                     for match_proposal in PROPOSAL_TIME_RE.finditer(line):
                         data = match_proposal.groupdict()
                         tx_id = data['tx_id']
-                        # Only add if it's the first time we see this tx_id *within this block*
                         if tx_id not in pseudo_completion_times:
                             try:
                                 pseudo_completion_times[tx_id] = float(data['proposal_time'])
                             except (ValueError, TypeError) as e:
-                                print(f"  Warning (Block {current_params}): Could not parse proposal time for tx {tx_id} on line {line_count}: {e}")
-                                if tx_id in pseudo_completion_times: del pseudo_completion_times[tx_id] # Ensure partial parse doesn't stick
+                                print(f"  Warning (Trial {current_trial_params}): Could not parse proposal time for tx {tx_id} on line {line_count}: {e}")
+                                if tx_id in pseudo_completion_times: del pseudo_completion_times[tx_id]
 
                     # --- Check for submit_result call (Message proxy) ---
-                    # Use finditer although unlikely to have multiple on one line
                     for match_submit_result in SUBMIT_RESULT_RE.finditer(line):
                         tx_id = match_submit_result.group(1)
                         submit_result_tx_ids.add(tx_id)
 
-        # --- Save the last block's data after reaching EOF ---
-        save_current_block(all_results, current_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids)
+        # --- Save the last trial block's data after reaching EOF ---
+        save_current_trial_block(all_results, current_trial_params, confirm_cmd_data, pseudo_completion_times, submit_result_tx_ids)
 
     except FileNotFoundError:
         print(f"Error: Log file not found at {log_file_path}", file=sys.stderr)
@@ -143,9 +170,9 @@ def parse_log_file(log_file_path):
         print(f"An error occurred during parsing line ~{line_count}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nParsing Complete: Read {line_count} lines. Found {len(all_results)} experimental blocks.")
+    print(f"\nParsing Complete: Read {line_count} lines. Found {len(all_results)} trial blocks.")
 
-    # --- Post-process each block to calculate intervals ---
+    # --- Post-process each trial block to calculate intervals ---
     processed_results = []
     for block_data in all_results:
         params = block_data['params']
@@ -153,21 +180,19 @@ def parse_log_file(log_file_path):
         completions = block_data['pseudo_completion_times']
         submit_ids = block_data['submit_result_tx_ids']
 
-        print(f"\nProcessing data for block: {params}...")
+        print(f"\nProcessing data for trial block: {params}...")
 
-        # Process confirm_cmd_data: Remove duplicates, sort, calculate intervals
+        # Process confirm_cmd_data: Remove duplicates, sort
         processed_confirm_data = {}
         for tx_id, tv_sec, tv_nsec, details in confirm_cmd_raw:
-            # Keep the *first* timestamp encountered for a tx_id within this block
             if tx_id not in processed_confirm_data:
                 processed_confirm_data[tx_id] = (tv_sec, tv_nsec, details)
 
         sorted_confirm_list = sorted(
-            # Create list of (tx_id, sec, nsec, details_dict)
             [(tx_id, data[0], data[1], data[2]) for tx_id, data in processed_confirm_data.items()],
             key=lambda item: (item[1], item[2]) # Sort by tv_sec, then tv_nsec
         )
-        print(f"  Found {len(sorted_confirm_list)} unique ConfirmLockAndSign command processings with start_time.")
+        print(f"  Found {len(sorted_confirm_list)} unique ConfirmLockAndSign processings with start_time.")
 
         # Calculate inter-submission intervals for this block
         inter_submission_intervals = {}
@@ -183,23 +208,18 @@ def parse_log_file(log_file_path):
             duration = sec_diff + nsec_diff / 1_000_000_000.0
 
             if duration >= 0:
-                # Check if we already have an interval for this tx_id (shouldn't happen with processed_confirm_data logic)
-                # if tx_id_curr not in inter_submission_intervals:
                 inter_submission_intervals[tx_id_curr] = duration
                 valid_interval_tx_ids.add(tx_id_curr)
-                # Store details only for txs that start a valid interval
                 transaction_details[tx_id_curr] = details_curr
             else:
-                # Added more detailed warning for negative intervals
-                print(f"  Warning (Block {params}): Negative interval ({duration:.6f}s) calculated between tx {tx_id_curr} ({sec_curr}.{nsec_curr:09d}) and {tx_id_next} ({sec_next}.{nsec_next:09d}). Skipping.")
+                print(f"  Warning (Trial {params}): Negative interval ({duration:.6f}s) calculated between tx {tx_id_curr} ({sec_curr}.{nsec_curr:09d}) and {tx_id_next} ({sec_next}.{nsec_next:09d}). Skipping.")
 
         print(f"  Calculated {len(inter_submission_intervals)} inter-submission intervals.")
         print(f"  Found {len(completions)} unique TXs with embedded proposal_time_since_epoch.")
         print(f"  Found {len(submit_ids)} unique transaction IDs with a 'submit_result' call.")
 
         if not completions:
-             print("  WARNING: No pseudo-completion times (proposal_time_since_epoch from AppendEntries) could be extracted for this block. Throughput calculation impossible.")
-
+             print("  WARNING: No pseudo-completion times found for this trial block. Throughput calculation impossible.")
 
         processed_results.append({
             'params': params,
@@ -215,12 +235,13 @@ def parse_log_file(log_file_path):
 
 def analyze_results(params, inter_submission_intervals, pseudo_completion_times, transaction_details, valid_tx_ids, submit_result_count):
     """
-    Calculates and prints APPROXIMATE throughput and interval metrics for a specific Scenario B block
+    Calculates and prints APPROXIMATE throughput and interval metrics for a specific Scenario F trial block
     based on EMBEDDED log times.
     WARNING: Results derived from this function have SIGNIFICANT ACCURACY LIMITATIONS.
     """
-    param_string = f"k={params['k']}, m={params['m']}, rho={params['rho']:.1f}"
-    print(f"\n--- Analysis Results (Scenario B Block: {param_string}) (APPROXIMATE - Based on Embedded Log Times) ---")
+    # Create a more descriptive parameter string for Scenario F
+    param_string = f"n={params['n']}, k={params['k']}, m={params['m']}, rho={params['rho']:.1f}"
+    print(f"\n--- Analysis Results (Scenario F Trial: {param_string}) (APPROXIMATE - Based on Embedded Log Times) ---")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     print("!!! WARNING: Accuracy Limitations Apply!                                   !!!")
     print("!!! - 'Start Time' is tv_sec from log data (NOT true submission time).     !!!")
@@ -229,18 +250,17 @@ def analyze_results(params, inter_submission_intervals, pseudo_completion_times,
     print("!!! Results useful for relative comparison ONLY, not absolute performance. !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
-    print(f"\nApproximate Throughput (Based on Proposal Times for Block: {param_string}):")
+    print(f"\nApproximate Throughput (Based on Proposal Times for Trial: {param_string}):")
     if not pseudo_completion_times:
-        print("  - Average TPS: N/A (No pseudo-completion times found for this block).")
+        print("  - Average TPS: N/A (No pseudo-completion times found for this trial).")
     else:
         completion_times_list = list(pseudo_completion_times.values())
         num_total_completed_tx = len(completion_times_list)
 
         if num_total_completed_tx > 0:
-            # Filter out non-float values just in case
             valid_completion_times = [t for t in completion_times_list if isinstance(t, float)]
             if not valid_completion_times:
-                 print("  - Average TPS: Error - No valid float completion time values found for this block.")
+                 print("  - Average TPS: Error - No valid float completion time values found for this trial.")
             elif len(valid_completion_times) == 1:
                  print(f"  - Average TPS: N/A (Only 1 transaction found with proposal time: {valid_completion_times[0]})")
             else:
@@ -248,73 +268,69 @@ def analyze_results(params, inter_submission_intervals, pseudo_completion_times,
                     first_completion_time = min(valid_completion_times)
                     last_completion_time = max(valid_completion_times)
                     processing_duration = last_completion_time - first_completion_time
-                except ValueError: # Handle potential issues if list contains non-comparable items (though filtered)
+                except ValueError:
                     print("  - Average TPS: Error calculating time range.")
                     processing_duration = -1
 
-                # Use a small epsilon to avoid division by zero / instability with tiny durations
                 if processing_duration > 1e-9:
                     average_tps = len(valid_completion_times) / processing_duration
                     print(f"  - Average TPS: {average_tps:.2f}")
                     print(f"  - Calculated over {processing_duration:.2f} seconds (proposal time range)")
                     print(f"  - Based on {len(valid_completion_times)} transactions with valid proposal times (out of {num_total_completed_tx} total)")
                     try:
-                        # Added check for timestamp range before converting
                         if first_completion_time > 0 and last_completion_time > 0:
                              print(f"  - Pseudo-Completion Window: {datetime.fromtimestamp(first_completion_time, tz=timezone.utc).isoformat()} to {datetime.fromtimestamp(last_completion_time, tz=timezone.utc).isoformat()}")
                         else:
                              print("  - Pseudo-Completion Window: Timestamps are zero or negative, cannot convert.")
-                    except (ValueError, OverflowError): # Catch OverflowError for out-of-range timestamps
+                    except (ValueError, OverflowError):
                         print("  - Pseudo-Completion Window: Could not convert proposal times to datetime (likely out of range).")
-                elif len(valid_completion_times) > 1 and processing_duration >= 0: # Allow zero duration if multiple tx
+                elif len(valid_completion_times) > 1 and processing_duration >= 0:
                     print(f"  - Average TPS: Infinite? ({len(valid_completion_times)} transactions proposed in effectively zero time: {processing_duration:.2e}s)")
                 elif processing_duration < 0:
-                    pass # Error already printed
-                else: # Only 1 tx or other edge case
+                    pass
+                else:
                      print("  - Average TPS: N/A (Could not determine valid duration).")
         else:
-             print("  - Average TPS: N/A (No transactions with proposal times found for this block).")
+             print("  - Average TPS: N/A (No transactions with proposal times found for this trial).")
 
-    print(f"\n--- Approximate Inter-Submission Interval Analysis (Block: {param_string}) ---")
+    print(f"\n--- Approximate Inter-Submission Interval Analysis (Trial: {param_string}) ---")
     if not valid_tx_ids:
-        print("❌ APPROXIMATE INTERVALS CANNOT BE CALCULATED FOR THIS BLOCK.")
+        print("❌ APPROXIMATE INTERVALS CANNOT BE CALCULATED FOR THIS TRIAL.")
         print("  Reason: Could not find valid pairs of consecutive transactions with pseudo-start (tv_sec) times.")
     else:
-        # Pass only the intervals and details relevant to this block
+        # Use the interval analysis logic consistent with other scripts
         analyze_intervals(inter_submission_intervals, transaction_details, valid_tx_ids)
 
-    # Report proxy for cross-shard message volume
-    print(f"\nCross-Shard Message Volume Proxy (Block: {param_string}):")
+    # Report proxy for cross-shard message volume (might be less relevant in n=1 case)
+    print(f"\nCross-Shard Message Volume Proxy (Trial: {param_string}):")
     print(f"  - Unique Txs with 'submit_result' call: {submit_result_count}")
 
-    print("\n--- End of Analysis for Block ---")
+    print("\n--- End of Analysis for Trial Block ---")
     print("!!! REMINDER: Results are approximate due to reliance on embedded, non-standard time fields. !!!")
 
-
+# Use the same interval analysis logic as other scripts
 def analyze_intervals(intervals_data, transaction_details, valid_tx_ids):
     """
-    Calculates statistics on the provided inter-submission intervals for a specific block,
+    Calculates statistics on the provided inter-submission intervals for a specific trial block,
     mimicking the logic from parse_scalability_metrics.py.
     """
     intervals = []
     cross_chain_intervals = []
     intra_chain_intervals = []
 
-    print(f"\nCalculating interval statistics for {len(valid_tx_ids)} potential intervals in this block...")
+    print(f"\nCalculating interval statistics for {len(valid_tx_ids)} potential intervals in this trial...")
     skipped_missing_data = 0
 
     for tx_id in valid_tx_ids:
         interval = intervals_data.get(tx_id)
 
-        # First, check if the interval itself is valid
         if interval is not None and isinstance(interval, float) and interval >= 0:
-            intervals.append(interval) # Add to overall list if valid
-
-            # Now, try to get details for categorization
+            intervals.append(interval)
             details = transaction_details.get(tx_id)
             if details:
                 try:
-                    # Define cross-chain: source != target AND target is not 0
+                    # Define cross-chain: source != target AND target != 0
+                    # Note: For n=1, target_chain should always be 0, so this should always be False.
                     is_cross_chain = (details['source_chain'] != details['target_chain']) and (details['target_chain'] != 0)
                     if is_cross_chain:
                         cross_chain_intervals.append(interval)
@@ -322,18 +338,15 @@ def analyze_intervals(intervals_data, transaction_details, valid_tx_ids):
                         intra_chain_intervals.append(interval)
                 except KeyError:
                     print(f"  Warning: Missing chain details for tx {tx_id}", file=sys.stderr)
-                    skipped_missing_data += 1 # Count txs where details failed categorization
+                    skipped_missing_data += 1
             else:
                 print(f"  Warning: Missing details struct for tx {tx_id}", file=sys.stderr)
-                skipped_missing_data += 1 # Count txs where details were missing entirely
-        # else: tx_id from valid_tx_ids didn't have a valid interval in intervals_data (should not happen)
-        # or interval was negative (already warned during calculation). Do nothing.
+                skipped_missing_data += 1
 
-    # Report skipped count (now reflects missing details for categorization)
     if skipped_missing_data > 0:
         print(f"  Note: {skipped_missing_data} valid intervals could not be categorized as cross/intra-chain due to missing details.")
 
-    # --- Calculate and Print Overall Stats --- (Matching parse_scalability_metrics.py format)
+    # --- Calculate and Print Overall Stats ---
     if intervals:
         try:
             avg_interval = statistics.mean(intervals)
@@ -342,7 +355,6 @@ def analyze_intervals(intervals_data, transaction_details, valid_tx_ids):
             max_interval = max(intervals)
             p95_interval = float('nan')
             p99_interval = float('nan')
-            # Use try-except for quantiles as parse_scalability_metrics.py doesn't handle errors
             try:
                 if len(intervals) >= 20: p95_interval = statistics.quantiles(intervals, n=100)[94]
                 if len(intervals) >= 100: p99_interval = statistics.quantiles(intervals, n=100)[98]
@@ -360,79 +372,75 @@ def analyze_intervals(intervals_data, transaction_details, valid_tx_ids):
 
         except statistics.StatisticsError as e:
             print(f"\nError calculating overall interval statistics: {e}")
-        except ValueError as e: # Catch if min/max called on empty list
+        except ValueError as e:
             print(f"\nError calculating overall interval statistics (potentially empty list): {e}")
 
     else:
-        print("\nNo valid positive inter-submission intervals recorded for this block.")
+        print("\nNo valid positive inter-submission intervals recorded for this trial.")
 
-    # --- Calculate and Print Cross-Chain Stats --- (Mean/Median only, like parse_scalability_metrics.py)
+    # --- Calculate and Print Cross-Chain Stats (Mean/Median only) ---
     if cross_chain_intervals:
         try:
             avg_cc_interval = statistics.mean(cross_chain_intervals)
             median_cc_interval = statistics.median(cross_chain_intervals)
-            # min_cc_interval = min(cross_chain_intervals) # Not reported in target script
-            # max_cc_interval = max(cross_chain_intervals) # Not reported in target script
             print(f"\nApproximate Cross-Chain Inter-Submission Interval ({len(cross_chain_intervals)} intervals):")
             print(f"  - Average: {avg_cc_interval:.4f} seconds")
             print(f"  - Median:  {median_cc_interval:.4f} seconds")
-            # print(f"  - Min:     {min_cc_interval:.4f} seconds") # Not reported in target script
-            # print(f"  - Max:     {max_cc_interval:.4f} seconds") # Not reported in target script
         except statistics.StatisticsError as e:
              print(f"\nError calculating cross-chain interval statistics: {e}")
         except ValueError as e:
              print(f"\nError calculating cross-chain interval statistics (potentially empty list): {e}")
     else:
-        print("\nNo cross-chain transactions with valid interval data found for this block.")
+        # For n=1, we expect no cross-chain txs
+        if params and params.get('n') == 1:
+             print("\nNo cross-chain intervals found (as expected for n=1).")
+        else:
+             print("\nNo cross-chain transactions with valid interval data found for this trial.")
 
-    # --- Calculate and Print Intra-Chain Stats --- (Mean/Median only, like parse_scalability_metrics.py)
+    # --- Calculate and Print Intra-Chain Stats (Mean/Median only) ---
     if intra_chain_intervals:
         try:
             avg_ic_interval = statistics.mean(intra_chain_intervals)
             median_ic_interval = statistics.median(intra_chain_intervals)
-            # min_ic_interval = min(intra_chain_intervals) # Not reported in target script
-            # max_ic_interval = max(intra_chain_intervals) # Not reported in target script
             print(f"\nApproximate Intra-Chain Inter-Submission Interval ({len(intra_chain_intervals)} intervals):")
             print(f"  - Average: {avg_ic_interval:.4f} seconds")
             print(f"  - Median:  {median_ic_interval:.4f} seconds")
-            # print(f"  - Min:     {min_ic_interval:.4f} seconds") # Not reported in target script
-            # print(f"  - Max:     {max_ic_interval:.4f} seconds") # Not reported in target script
         except statistics.StatisticsError as e:
              print(f"\nError calculating intra-chain interval statistics: {e}")
         except ValueError as e:
              print(f"\nError calculating intra-chain interval statistics (potentially empty list): {e}")
     else:
-        print("\nNo intra-chain transactions with valid interval data found for this block.")
+        print("\nNo intra-chain transactions with valid interval data found for this trial.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Scenario B (Cross-Chain Ratio) log files with multiple blocks using embedded time fields (APPROXIMATE RESULTS).")
-    parser.add_argument("log_file", help="Path to the Scenario B output log file")
+    parser = argparse.ArgumentParser(description="Analyze Scenario F (Single vs Multi-Chain) log files with multiple trials using embedded time fields (APPROXIMATE RESULTS).")
+    parser.add_argument("log_file", help="Path to the Scenario F output log file")
     args = parser.parse_args()
 
-    # Parse log file into separate blocks
-    all_block_results = parse_log_file(args.log_file)
+    # Parse log file into separate trial blocks
+    all_trial_results = parse_log_file(args.log_file)
 
-    if not all_block_results:
-        print("\nNo valid Scenario B experimental blocks found in the log file.")
+    if not all_trial_results:
+        print("\nNo valid Scenario F trial blocks found in the log file.")
         return
 
-    print(f"\n\n{'='*20} SUMMARY OF ANALYSIS ACROSS {len(all_block_results)} BLOCKS {'='*20}")
+    print(f"\n\n{'='*20} SUMMARY OF ANALYSIS ACROSS {len(all_trial_results)} TRIAL BLOCKS {'='*20}")
 
-    # Analyze each block's results
-    for block_result in all_block_results:
+    # Analyze each trial block's results
+    for trial_result in all_trial_results:
         analyze_results(
-            block_result['params'],
-            block_result['inter_submission_intervals'],
-            block_result['pseudo_completion_times'],
-            block_result['transaction_details'],
-            block_result['valid_interval_tx_ids'],
-            block_result['submit_result_count']
+            trial_result['params'],
+            trial_result['inter_submission_intervals'],
+            trial_result['pseudo_completion_times'],
+            trial_result['transaction_details'],
+            trial_result['valid_interval_tx_ids'],
+            trial_result['submit_result_count']
         )
-        print(f"\n{'-'*70}\n") # Separator between block analyses
+        print(f"\n{'-'*70}\n") # Separator between trial analyses
 
     print(f"{'='*20} END OF SUMMARY {'='*20}")
 
 
 if __name__ == "__main__":
-    main()
+    main() 
